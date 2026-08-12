@@ -4,105 +4,121 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-This is the LambdaMOO server: a C implementation of a MOO (MUD, Object-Oriented) virtual machine and
-network server, originally from Xerox PARC (Pavel Curtis et al.). The server loads an object-oriented
-database (`.db` file), compiles and executes MOO-language verbs (methods) against it, and serves
-players over a network connection (typically telnet/TCP). `LambdaCore.db` in the repo root is the
-core LambdaMOO database used with this server.
+ODINMOO is a from-scratch rewrite, in [Odin](https://odin-lang.org/), of the LambdaMOO server — the
+1990s C virtual machine, object database, MOO-language compiler, and network server originally
+written by Pavel Curtis et al. at Xerox PARC. It loads and runs real LambdaMOO `.db` files with the
+same on-disk format, the same MOO language, and the same built-in function library, over real
+TCP/telnet. It adds ANSI color markup, which the original never had.
 
 There is no separate application layer here — the "product" behavior of a running MOO (rooms, exits,
-commands, etc.) lives inside the compiled-in `.db` file as MOO-language verb code, not in the C source.
-The C source in `src/` is the VM, compiler, network layer, and built-in function library.
+commands) lives inside the `.db` file as MOO-language verb code, not in the Odin source. The Odin
+source is the VM, compiler, object store, network layer, and builtin library underneath it.
 
-## Build
+`README.md` is the user-facing document and covers the *why* of each subsystem's port-vs-redesign
+decision at length; this file is the operational summary. Read `README.md` before making
+architectural changes, and read a package's own top-of-file `//` header before changing it — every
+divergence from the C original is explained at the point in the code where it matters.
 
-```sh
-cd src
-sh configure          # only needed once, or after configure.in changes; probes the OS/toolchain
-# edit options.h to choose NETWORK_PROTOCOL / NETWORK_STYLE / MPLEX_STYLE for this platform
-make                   # builds ./moo
-make clean             # remove object files and the moo binary
-make distclean         # clean plus remove configure-generated files
-```
-
-`configure` prints which `NETWORK_PROTOCOL`/`NETWORK_STYLE` combinations are valid for the current
-platform; `options.h` must be edited to select one of them (and other server-wide compile-time
-options — execution limits, string/list size limits, etc.) before `make`. `GNUmakefile` just wraps
-`Makefile` to regenerate `version_src.h` on each build; plain `make` uses `Makefile`.
-
-There is no automated test suite in this repository — verification is by building and running the
-server against a database (see below), or interactively via emergency wizard mode.
-
-## Running the server
+## Build, run, test
 
 ```sh
-./src/moo <initial-db-file> <checkpoint-db-file> [port]
+odin build server -out:bin/moo -extra-linker-flags:"-lcrypt"   # build
+./run.sh [port]                                                # run against bundled LambdaCore.db
+odin test <package> -extra-linker-flags:"-lcrypt"              # test one package
 ```
 
-or via the top-level convenience script:
-
-```sh
-./run.sh   # runs ~/LambdaMOO/src/moo against LambdaCore.db, checkpointing to LambdaCoreUpdated.db
-```
-
-Never point the checkpoint file at the same path as the initial DB — a crash mid-write would corrupt
-the only copy. The `src/restart` / `src/restart.sh` scripts wrap startup with old-checkpoint rotation
-and background compression; prefer them over invoking `moo` directly for anything long-lived.
-
-`./moo -e <db-file>` starts in **emergency wizard mode** (stdin/stdout, no network) for recovering a
-database that has been broken by bad verb code — `help` at that prompt lists available commands.
-
-Runtime signals: `SIGINT`/`SIGTERM`/`SIGUSR1` shut down cleanly, `SIGUSR2` schedules an immediate
-checkpoint, `SIGHUP`/`SIGILL`/`SIGQUIT`/`SIGSEGV`/`SIGBUS` panic the server.
+- **`-lcrypt` is required** on every build or test that touches `objdb` (directly or transitively —
+  nearly all of them). glibc keeps `crypt()`, used by the `crypt()` builtin behind `@password`, in
+  `libcrypt` rather than `libc`. Omit it and you get a late `undefined reference to 'crypt'` at link
+  time rather than anything clearer.
+- **Always invoke from the repo root.** Several tests (`dbfile/db_test.odin`,
+  `dbfile/roundtrip_test.odin`, `compiler/corpus_test.odin`, `objdb/lambdacore_test.odin`,
+  `netio/real_core_test.odin`) and everything under `cmd/` open the bundled `LambdaCore.db` by
+  relative path. From anywhere else they just fail to find it.
+- Testable packages: `values`, `dbfile`, `compiler`, `vm`, `objdb`, `builtins`, `ansi`, `regex`,
+  `tasks`, `netio`. `server` and `cmd/*` have no tests. There is no aggregate "run everything"
+  target — test per package. No package needs flags beyond `-lcrypt`; in particular `tasks`
+  serializes its own concurrency tests internally (`tasks_test.odin`'s `serial_tests` mutex) and no
+  longer needs `-define:ODIN_TEST_THREADS=1`.
+- The Odin compiler ships as rolling nightly source builds, so it may not be on `PATH`; use the path
+  to your own checkout's `./odin` if `odin` is not found.
+- `./bin/moo <core.db> <checkpoint.db> [port]` runs the server directly (default port 7777). Never
+  point the checkpoint at the same file as the initial DB — a crash mid-write destroys the only
+  copy. `./bin/moo -e <core.db>` is emergency wizard mode: a local stdin/stdout MOO-expression REPL
+  with no network, for recovering a database broken by bad verb code. `SIGINT`/`SIGTERM` shut down
+  cleanly (checkpointing first); `SIGUSR2` checkpoints immediately without stopping.
+- `bin/` and `*.db` are gitignored except the three bundled cores (`LambdaCore.db`, `jhcore.db`,
+  `Minimal.db`). Checkpoint output is regenerated runtime state — never commit it.
 
 ## Architecture
 
-The codebase is organized as compiler → VM → object store → network, with a built-in-function layer
-bridging MOO code to C:
+Packages, in dependency order (each depends only on those above it; the graph is strictly
+one-directional and worth keeping that way):
 
-- **Lexer/parser/compiler**: `parser.y` (yacc grammar) drives `ast.c` (AST construction), which
-  `code_gen.c` compiles to bytecode (opcodes defined in `opcode.h`). `decompile.c`/`unparse.c` go the
-  other direction (bytecode/AST back to MOO source text), used for `verb code` listings.
-- **VM / execution**: `execute.c` is the bytecode interpreter loop; `eval_vm.c`/`eval_env.c` manage
-  the execution environment/stack frames; `tasks.c` manages MOO tasks (queued/forked/suspended
-  executions, `fork`/`suspend`/ticks-and-seconds resource limits); `exceptions.c` implements
-  MOO's `try/except` machinery.
-- **Value system**: `structures.h` defines `Var` (the tagged-union MOO value) and `Objid`; `numbers.c`,
-  `list.c`, `str_intern.c`, `utils.c` implement operations per type. Adding a new MOO value type
-  touches many of these files at once — see `AddingNewMOOTypes.txt` for the authoritative checklist
-  before attempting it.
-- **Object database**: `db_objects.c`, `db_properties.c`, `db_verbs.c` implement the object model
-  (objects, inherited properties, verbs-as-methods with permission bits); `db.h`/`db_private.h`
-  declare the in-memory representation; `db_file.c`/`db_io.c` handle reading/writing the `.db` file
-  format (format is versioned — see `version.h`'s `DB_Version` enum and `version_src.txt`).
-  `objects.c`, `property.c`, `verbs.c`, `quota.c` are the MOO-level builtins/primitives layered on top.
-- **Built-in functions**: `functions.c` plus `bf_register.h` register the MOO built-in function table;
-  individual builtins live alongside the subsystem they wrap (e.g. list builtins in `list.c`, string/
-  number builtins in `numbers.c`). `extensions.c` is the hook point for site-local additions.
-- **Networking**: `network.c`/`network.h` define a protocol-independent interface; `net_proto.c`
-  dispatches to a concrete implementation selected by the `options.h` `NETWORK_PROTOCOL`/
-  `NETWORK_STYLE` choice (`net_bsd_tcp.c`, `net_sysv_tcp.c`, `net_sysv_lcl.c`, `net_single.c`, plus
-  local-client variants `client_bsd.c`/`client_sysv.c`). Multiplexing over the chosen I/O mechanism
-  (`select`/`poll`) is abstracted similarly via `net_mplex.c` dispatching to `net_mp_selct.c`/
-  `net_mp_poll.c`. Command parsing off the wire is in `parse_cmd.c`; player-name matching is
-  `match.c`.
-- **Server/top level**: `server.c` is the main loop and MOO-visible server configuration
-  (`$server_options`); `log.c` is logging; `storage.c`/`malloc.c`/`gnu-malloc.c` are memory allocation
-  (with `ref_count.c` implementing refcounting for shared `Var` data like strings/lists).
-- **Regex/pattern matching**: `regexpr.c` (a bundled regex engine) backs `pattern.c` for MOO's
-  string-matching builtins.
+| Package | Ports from (C) | Contents |
+|---|---|---|
+| `values/` | `structures.h`, `utils.c`, `list.c`, `str_intern.c` | `Var`, `Objid`, `Error`, refcounted string/list/float, `Stream`, interning |
+| `regex/`, `ansi/` | `regexpr.c` / nothing (new) | MOO's `%`-escaped pattern dialect; `%`-code and `\|NN` color markup → ANSI SGR |
+| `dbfile/` | `db_file.c`, `db_io.c` | `.db` text-format reader/writer, all 5 format versions, task-queue and connection trailers |
+| `compiler/` | `parser.y`, `ast.c`, `unparse.c` | lexer, recursive-descent/precedence-climbing parser → AST, decompiler/unparser |
+| `vm/` | `execute.c`, `eval_vm.c`, `eval_env.c` | tree-walking interpreter over the AST, activation stack, `World` interface |
+| `builtins/` | `functions.c` and friends | the pure, DB-independent half of the builtin library |
+| `tasks/` | `tasks.c` | scheduler: `fork`/`suspend`/`resume`/`kill_task` |
+| `objdb/` | `db_objects.c`, `db_verbs.c`, `db_properties.c`, `parse_cmd.c`, `match.c` | object graph, inheritance, permissions, quota, command parser/dispatcher, the DB-dependent builtins |
+| `netio/` | `network.c`, `net_bsd_tcp.c` | TCP server, login state machine, command dispatch, `.program` editor, `PREFIX`/`SUFFIX` |
+| `server/` | `server.c` | `main()`, CLI, signals, `fork()`-based checkpointing, emergency mode |
 
-Compile-time behavior (execution limits, string/list size caps, network protocol/style, optional
-features like command logging) is controlled entirely through `options.h`; runtime-tunable versions
-of some of the same limits can be overridden from within the database via `$server_options`.
+Two structural points that are easy to violate by accident:
 
-### Reference docs in `src/`
+- **Builtins are split across two packages on purpose.** `builtins/` holds only functions with the
+  signature `proc(args: values.Var) -> vm.Call_Result` — no `Eval_Context`, no database — which is
+  what keeps it testable in isolation. Anything needing the object DB, connections, or the scheduler
+  lives next to `objdb/world.odin`'s `call_builtin`, which consults `builtins.table` first and falls
+  through to its own object-aware set. Adding a DB-dependent builtin to `builtins/` would mean a
+  dependency cycle back to `objdb`; put it in `objdb/` instead.
+- **`vm` does not know about `objdb`.** It reaches the database through the `World` interface, which
+  `objdb` implements and `vm/mock_world_test.odin` implements independently for tests.
 
-- `README`, `README.Minimal`, `README.rX` — build/setup and bootstrapping a database from `Minimal.db`.
-- `HACKING` — pointers into `version_src.txt`, `AddingNewMOOTypes.txt`, `MOOCodeSequences.txt` for
-  anyone modifying the VM itself.
-- `ChangeLog.txt` — historical changes, including DB-format upgrade notes (check before changing
-  `db_file.c`/`db_io.c` or bumping `DB_Version`).
-- Root-level `LambdaCoreProgMan.pdf`, `LambdaCoreUserMan.pdf`, `ProgrammersManual.pdf` — the MOO
-  language and core-database reference manuals (for understanding in-database verb code, not the
-  C server itself).
+### Divergences from the C server that constrain changes
+
+- **The tree-walking interpreter replaces the bytecode layer.** There is no `code_gen.c` equivalent
+  and no opcode table. Every task has its own native Odin call stack, which is what makes the next
+  point possible.
+- **Tasks are real OS threads, not a cooperative single-threaded loop with snapshotted activation
+  stacks.** A single `Scheduler.big_lock` mutex guarantees only one task actively touches the object
+  DB at a time, preserving the original's effective single-writer semantics. Anything touching the
+  DB must hold it. The visible cost: `queued_tasks()`/`task_stack()` see only genuinely-suspended
+  tasks and report one frame rather than a full chain.
+- **Each connection gets its own thread with a blocking socket**, instead of one `select()`/`poll()`
+  multiplexing loop. There is no event loop to add a descriptor to.
+- **Enum ordinals in `values/` are DB-format-visible** (`Var_Type`, `Error`) — they are stored as
+  raw integers in `.db` files. Never reorder or insert into them.
+- **List copy-on-write is MOO-visible aliasing behavior**, not an optimization: mutate in place only
+  when `refcount == 1`, otherwise rebuild. Refcounts use an explicit `rc` field in an allocation
+  header, not the original's `((int*)ptr)[-1]` pointer arithmetic.
+- Deliberate, documented gaps: outbound `open_network_connection()` is disabled (matching the
+  original's default non-`OUTBOUND_NETWORK` build); some `set_connection_option()` flags (`binary`,
+  `disable-oob`) are stored but inert. Databases at format version 5+ (e.g. HellCore) are rejected
+  cleanly at load — stock LambdaMOO's `DB_Version` stops at 4, and so does this.
+
+## Working in this codebase
+
+- **The original C source is the ground truth for semantics** and is *not* in this repo. Comments
+  reference it by C filename (`db_verbs.c`, `execute.c`, `tasks.c`). When a comment says "ports X"
+  without qualification, the C behavior is the spec — especially in `objdb/` and `vm/`, where a
+  subtly wrong edge case surfaces much later inside real verb code.
+- `docs/` has the three original manuals. `ProgrammersManual.pdf` is the specification this port is
+  written against — one entry per builtin, and the fastest way to check what a builtin should do.
+  `LambdaCoreProgMan.pdf` covers in-database conventions (`$string_utils`, `:tell`/`:look_self`);
+  `LambdaCoreUserMan.pdf` covers player commands, useful for driving a running server by hand.
+- To investigate a misbehaving builtin against a real database, write a small standalone program in
+  a scratch directory that imports `dbfile`/`objdb`/`compiler`/`vm`, loads the `.db`, and dumps a
+  verb or runs a snippet through `vm.run` with `this`/`player`/`caller` bound manually. Much faster
+  than rebuilding the whole server to add print statements. `cmd/dumpverb`, `cmd/loadcheck`, and
+  `cmd/replserver` already exist for the common cases (`odin run cmd/replserver ...` from the root).
+- **Test-reported allocator leaks are real bugs.** `core:testing`'s tracking allocator runs on every
+  test; a package that starts reporting leaks or double-frees after a change has regressed, and
+  should not be treated as noise.
+- The parser is regression-tested against the whole real corpus (parse → unparse → reparse → diff
+  the AST across all 1727 `LambdaCore.db` verbs, plus JHCore's 2729). Any change to `compiler/` must
+  keep `odin test compiler` green — that corpus is the main defense against silent grammar drift.
