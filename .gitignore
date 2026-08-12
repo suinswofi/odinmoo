@@ -5,3 +5,4 @@ bin/
 *.db
 !LambdaCore.db
 !jhcore.db
+!Minimal.db

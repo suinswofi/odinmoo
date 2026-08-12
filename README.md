@@ -122,12 +122,18 @@ The short version, subsystem by subsystem:
 
 A LambdaMOO core database is **already included**: `LambdaCore.db` at the repo root is the
 standard LambdaMOO starting database, bundled here so the repo is runnable straight from a clone.
-(If you'd rather bootstrap from something smaller/emptier, a `Minimal.db` also exists in the wider
-LambdaMOO community — swap it in the same way.)
 
-A second community core, `jhcore.db` (JHCore), is bundled alongside it as a larger, more
-demanding corpus: format version 4, 237 objects / 2729 verb programs, against LambdaCore's
-97 / 1727.
+Two more databases sit alongside it, at opposite ends of the size range — pass either one in place
+of `LambdaCore.db` on the command line:
+
+- `jhcore.db` — JHCore, format version 4, 237 objects / 2729 verb programs (against LambdaCore's
+  97 / 1727). A second, larger corpus for the parse/unparse regression tests.
+- `Minimal.db` — the stock bootstrapping database that ships with the original C server: format
+  version 1, four objects (`#0` System Object, `#1` Root Class, `#2` The First Room, `#3` Wizard)
+  and a single verb, in 321 bytes. Too bare to be a usable MOO — it has no `$string_utils`, no
+  command verbs, barely a `do_login_command` — but exactly right for building a core from scratch,
+  or for isolating a server bug away from LambdaCore's 1727 verbs. It also happens to be the only
+  bundled file exercising the version-1 reader path.
 
 Not every community core will load. Databases at format version 5 and above (HellCore, for
 instance) come from extended-server forks that postdate stock LambdaMOO, whose `DB_Version` enum
@@ -231,6 +237,7 @@ cmd/            small standalone dev tools (dumpverb, loadcheck, replserver) -- 
 docs/           the original LambdaMOO/LambdaCore reference manuals (see below)
 LambdaCore.db   the bundled starting database (see Prerequisites, above)
 jhcore.db       JHCore -- a second, larger core that also loads and runs here
+Minimal.db      the stock 4-object bootstrapping database (see Prerequisites, above)
 run.sh          quick-start script: runs bin/moo against LambdaCore.db
 ```
 
