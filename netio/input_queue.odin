@@ -192,7 +192,7 @@ send_telnet_echo_negotiation :: proc(conn: ^Connection, echo_on: bool) {
 
 // ---- Connection_Hooks implementations (wired in login.odin's wire_connection_hooks) ----
 
-@(private = "file")
+// Not file-private: login.odin's hook_output_delimiters uses this too.
 find_conn :: proc(s: ^Server, player: values.Objid) -> (^Connection, bool) {
 	sync.mutex_lock(&s.players_lock)
 	defer sync.mutex_unlock(&s.players_lock)

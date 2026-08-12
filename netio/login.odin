@@ -108,6 +108,21 @@ hook_notify :: proc(user_data: rawptr, player: values.Objid, text: string) -> bo
 	return true
 }
 
+// hook_notify_raw backs notify_raw() -- see objdb/connection_io.odin's header for why this
+// exists alongside notify().
+@(private = "file")
+hook_notify_raw :: proc(user_data: rawptr, player: values.Objid, text: string) -> bool {
+	s := (^Server)(user_data)
+	sync.mutex_lock(&s.players_lock)
+	conn, ok := s.players[player]
+	sync.mutex_unlock(&s.players_lock)
+	if !ok {
+		return false
+	}
+	send_line_raw(conn, text)
+	return true
+}
+
 @(private = "file")
 hook_connection_name :: proc(user_data: rawptr, player: values.Objid) -> (name: string, found: bool) {
 	s := (^Server)(user_data)
@@ -193,6 +208,20 @@ hook_connected_seconds :: proc(user_data: rawptr, player: values.Objid) -> (secs
 	return i64(time.duration_seconds(time.since(conn.connect_time))), true
 }
 
+// hook_output_delimiters backs output_delimiters() -- see command.odin's
+// handle_intrinsic_command (PREFIX/SUFFIX) for where conn.output_prefix/output_suffix are
+// actually set. Returned strings are cloned copies (owned per Connection_Hooks' contract),
+// not the connection's own live storage, since that could change concurrently.
+@(private = "file")
+hook_output_delimiters :: proc(user_data: rawptr, player: values.Objid) -> (prefix: string, suffix: string, found: bool) {
+	s := (^Server)(user_data)
+	conn, ok := find_conn(s, player)
+	if !ok {
+		return "", "", false
+	}
+	return strings.clone(conn.output_prefix), strings.clone(conn.output_suffix), true
+}
+
 // wire_connection_hooks points an Object_World's notify/connection_name/boot_player/
 // connected_players/connected_seconds at this server's connection registry. Call once, after
 // object_world_init() and before server_start() -- server/main.odin does this at startup.
@@ -200,6 +229,7 @@ wire_connection_hooks :: proc(ow: ^objdb.Object_World, s: ^Server) {
 	ow.conn = objdb.Connection_Hooks{
 		user_data          = s,
 		notify             = hook_notify,
+		notify_raw         = hook_notify_raw,
 		connection_name    = hook_connection_name,
 		boot_player        = hook_boot_player,
 		connected_players  = hook_connected_players,
@@ -212,6 +242,7 @@ wire_connection_hooks :: proc(ow: ^objdb.Object_World, s: ^Server) {
 		set_connection_option = hook_set_connection_option,
 		connection_option  = hook_connection_option,
 		connection_options = hook_connection_options,
+		output_delimiters  = hook_output_delimiters,
 	}
 }
 

@@ -51,7 +51,7 @@ known_builtin_functions := map[string]bool {
 	"verbs" = true,
 
 	// Phase 9 additions: ANSI color markup, not present in the original server.
-	"ansi_strip" = true, "ansi_len" = true, "ansify" = true,
+	"ansi_strip" = true, "ansi_len" = true, "ansify" = true, "notify_raw" = true,
 }
 
 is_known_builtin :: proc(name: string) -> bool {

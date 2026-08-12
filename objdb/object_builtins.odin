@@ -33,6 +33,8 @@ object_builtin :: proc(w: ^Object_World, name: string, args: values.Var, ctx: ^v
 		return bf_caller_perms(args, ctx), true
 	case "notify":
 		return bf_notify(w, args), true
+	case "notify_raw":
+		return bf_notify_raw(w, args, ctx), true
 	case "connection_name":
 		return bf_connection_name(w, args), true
 	case "boot_player":
@@ -297,6 +299,31 @@ bf_notify :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 	}
 	if w.conn.notify != nil {
 		w.conn.notify(w.conn.user_data, player.data.obj, text.data.str.s)
+	}
+	return ok_result(values.int_val(1))
+}
+
+// bf_notify_raw ports this port's own notify_raw() (not a real MOO builtin -- see
+// connection_io.odin's header): sends text to `player` byte-for-byte, with no color-code
+// translation, for tools that need to show stored text verbatim rather than rendered game
+// output. Same permission rule as notify() itself (db_verb_allows-style: wizard or the
+// player being notified). Not file-private: connection_io_test.odin exercises it directly.
+bf_notify_raw :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
+	defer values.free_var(args)
+	if values.list_len(args) != 2 {
+		return err_result_local(.E_ARGS, "Incorrect number of arguments")
+	}
+	player := values.list_get(args, 1)
+	text := values.list_get(args, 2)
+	if player.type != .Obj || text.type != .Str {
+		return err_result_local(.E_TYPE, "Type mismatch")
+	}
+	progr := ctx.activation.programmer
+	if player.data.obj != progr && !is_wizard(w.db, progr) {
+		return err_result_local(.E_PERM, "Permission denied")
+	}
+	if w.conn.notify_raw != nil {
+		w.conn.notify_raw(w.conn.user_data, player.data.obj, text.data.str.s)
 	}
 	return ok_result(values.int_val(1))
 }

@@ -3,7 +3,26 @@ package objdb
 // Connection I/O built-ins: read()/force_input()/flush_input()/set_connection_option()/
 // connection_option(s)()/output_delimiters() (all via Connection_Hooks -- see
 // netio/input_queue.odin's header for the queue design these call into), eval() (verbs.c,
-// pure compiler+VM, no netio dependency), open_network_connection() (server.c).
+// pure compiler+VM, no netio dependency), open_network_connection() (server.c), and
+// notify_raw() -- NOT part of the original MOO builtin set (like ansi_strip/ansi_len/ansify,
+// a Phase 9 addition of this port's own).
+//
+// notify_raw() exists because of a real gap: every notify() call goes through exactly one
+// choke point (netio/connection.odin's send_line), which unconditionally runs the text
+// through ansi.translate() -- turning any `%r`/`|15`-shaped substring into a real color
+// escape. That's correct for ordinary game text, but wrong for text a wizard is reviewing
+// or editing verbatim: a tool built on verb_code() that notify()'s a verb's decompiled
+// source (or a property's raw string value) back to the wizard would have any literal
+// color-code-shaped substrings in that TEXT silently eaten and replaced with color, showing
+// something other than what's actually stored. This was always a latent risk with %-codes;
+// it becomes a routine one once |NN pipe codes are the normal way this MOO's own verb code
+// writes colored player-facing messages, since then most interesting verbs legitimately
+// contain `|NN`-shaped string literals. notify_raw(player, text) sends text to the socket
+// unchanged, byte for byte -- the tool doing the reviewing/editing calls this instead of
+// notify() specifically when displaying stored text, not when displaying rendered game
+// output. The `.program` intrinsic editor (command.odin) uses the equivalent raw send
+// directly at the netio layer for the same reason, when it echoes back a verb's existing
+// source before you start typing over it.
 
 import "../compiler"
 import "../tasks"
@@ -211,10 +230,9 @@ bf_connection_options :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_
 }
 
 // bf_output_delimiters ports tasks.c's bf_output_delimiters(): (player) -> {prefix, suffix}
-// set by the PREFIX/SUFFIX intrinsic commands. Those intrinsic commands aren't implemented in
-// this port (see server/main.odin's emergency-mode header note on scope), so any currently-
-// connected player always reports {"", ""} -- the same value the original reports for any
-// player who has never issued PREFIX/SUFFIX, which in practice is every player here.
+// set by the PREFIX/OUTPUTPREFIX/SUFFIX/OUTPUTSUFFIX intrinsic commands (netio/command.odin),
+// via Connection_Hooks.output_delimiters -- empty strings if that player has never issued
+// either.
 bf_output_delimiters :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	defer values.free_var(args)
 	if values.list_len(args) != 1 {
@@ -228,17 +246,16 @@ bf_output_delimiters :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_C
 	if v.data.obj != progr && !is_wizard(w.db, progr) {
 		return err_result_local(.E_PERM, "Permission denied")
 	}
-	if w.conn.connection_name == nil {
+	if w.conn.output_delimiters == nil {
 		return err_result_local(.E_INVARG, "Not a connected player")
 	}
-	name, found := w.conn.connection_name(w.conn.user_data, v.data.obj)
+	prefix, suffix, found := w.conn.output_delimiters(w.conn.user_data, v.data.obj)
 	if !found {
 		return err_result_local(.E_INVARG, "Not a connected player")
 	}
-	delete(name)
 	fields := make([]values.Var, 2)
-	fields[0] = values.str_val(strings.clone(""))
-	fields[1] = values.str_val(strings.clone(""))
+	fields[0] = values.str_val(prefix)
+	fields[1] = values.str_val(suffix)
 	return ok_result(values.list_val(fields))
 }
 

@@ -1,17 +1,14 @@
 package netio
 
 // The real post-login command loop, ported from tasks.c's do_command_task(): parse the typed
-// line (objdb.parse_command), give #0:do_command first refusal, then fall back to matching a
-// verb on the player/their location/the parsed dobj/the parsed iobj (in that order), or
-// location:huh, or else "I couldn't understand that." -- exactly what makes typed commands
-// like `look`, `news`, `help`, `get sword from chest` work against the real database, instead
-// of only raw MOO-expression evaluation (which was never the real interaction model; see
+// line (objdb.parse_command), check for an intrinsic command (`.program`/PREFIX/SUFFIX/
+// OUTPUTPREFIX/OUTPUTSUFFIX -- see do_intrinsic_command()/program_editor.odin), give
+// #0:do_command first refusal, then fall back to matching a verb on the player/their
+// location/the parsed dobj/the parsed iobj (in that order), or location:huh, or else "I
+// couldn't understand that." -- exactly what makes typed commands like `look`, `news`,
+// `help`, `get sword from chest` work against the real database, instead of only raw
+// MOO-expression evaluation (which was never the real interaction model; see
 // connection.odin's header note on what's left of that as a `.eval` debugging escape hatch).
-//
-// Scope cut: the original's intrinsic editor commands (`.program`, `PREFIX`/`OUTPUTPREFIX`/
-// `SUFFIX`/`OUTPUTSUFFIX`, do_intrinsic_command in tasks.c) aren't ported -- those are for
-// in-line verb programming over the raw connection and MCP-style output delimiters, a
-// separate, materially sized feature or two of their own that don't block ordinary play.
 
 import "../objdb"
 import "../tasks"
@@ -19,6 +16,41 @@ import "../values"
 import "../vm"
 import "core:strings"
 import "core:sync"
+
+// handle_intrinsic_command ports do_intrinsic_command(): checks the parsed command's verb
+// against the small, fixed set of server-level (not database) commands, matching
+// case-insensitively rather than the original's verbcasecmp-with-wildcard-abbreviation
+// (".pr*ogram" etc.) -- a documented simplification; ".program"/"PREFIX"/etc. typed in full
+// is the overwhelmingly common case. Returns true iff handled (caller does nothing further
+// for this line); `.program` specifically falls through (returns false) for a non-programmer,
+// exactly like the original -- PREFIX/SUFFIX have no such restriction.
+@(private = "file")
+handle_intrinsic_command :: proc(conn: ^Connection, ow: ^objdb.Object_World, pc: ^objdb.Parsed_Command) -> bool {
+	switch {
+	case strings.equal_fold(pc.verb, ".program"):
+		sync.mutex_lock(&conn.server.scheduler.big_lock)
+		is_programmer := objdb.is_programmer(ow.db, conn.player)
+		sync.mutex_unlock(&conn.server.scheduler.big_lock)
+		if !is_programmer {
+			return false
+		}
+		if len(pc.args) != 1 {
+			send_line(conn, "Usage:  .program object:verb")
+		} else {
+			start_programming(conn, ow, pc.args[0])
+		}
+		return true
+	case strings.equal_fold(pc.verb, "PREFIX"), strings.equal_fold(pc.verb, "OUTPUTPREFIX"):
+		delete(conn.output_prefix)
+		conn.output_prefix = strings.clone(pc.argstr)
+		return true
+	case strings.equal_fold(pc.verb, "SUFFIX"), strings.equal_fold(pc.verb, "OUTPUTSUFFIX"):
+		delete(conn.output_suffix)
+		conn.output_suffix = strings.clone(pc.argstr)
+		return true
+	}
+	return false
+}
 
 // dispatch_command parses `line` and runs the real command dispatch algorithm against
 // `conn.player`. All visible output happens via the dispatched verb's own notify() calls
@@ -32,6 +64,24 @@ dispatch_command :: proc(conn: ^Connection, line: string) {
 	defer objdb.parsed_command_destroy(&pc)
 	if !pc.ok {
 		return
+	}
+
+	if handle_intrinsic_command(conn, ow, &pc) {
+		return
+	}
+
+	// PREFIX/OUTPUTPREFIX and SUFFIX/OUTPUTSUFFIX bracket every ORDINARY command's output
+	// (not an intrinsic command's own reply, which already returned above) -- matches
+	// do_command_task() sending output_prefix before and output_suffix after everything
+	// else, unconditionally, regardless of which of #0:do_command/verb-dispatch/"I couldn't
+	// understand that" ends up handling the line below.
+	if len(conn.output_prefix) > 0 {
+		send_line(conn, conn.output_prefix)
+	}
+	defer {
+		if len(conn.output_suffix) > 0 {
+			send_line(conn, conn.output_suffix)
+		}
 	}
 
 	task_id := tasks.new_task_id(s.scheduler)

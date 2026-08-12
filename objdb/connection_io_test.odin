@@ -19,10 +19,13 @@ import "core:time"
 
 @(private = "file")
 Fake_Conn :: struct {
-	reader_task_id: int,
-	pending:        [dynamic]string,
-	options:        map[string]values.Var,
-	scheduler:      ^tasks.Scheduler,
+	reader_task_id:    int,
+	pending:           [dynamic]string,
+	options:           map[string]values.Var,
+	scheduler:         ^tasks.Scheduler,
+	output_prefix:     string,
+	output_suffix:     string,
+	last_raw_notified: string, // last text handed to fake_notify_raw, for assertions
 }
 
 @(private = "file")
@@ -119,10 +122,25 @@ fake_connection_name :: proc(user_data: rawptr, player: values.Objid) -> (name: 
 }
 
 @(private = "file")
+fake_notify_raw :: proc(user_data: rawptr, player: values.Objid, text: string) -> bool {
+	fc := (^Fake_Conn)(user_data)
+	delete(fc.last_raw_notified)
+	fc.last_raw_notified = strings.clone(text)
+	return true
+}
+
+@(private = "file")
+fake_output_delimiters :: proc(user_data: rawptr, player: values.Objid) -> (prefix: string, suffix: string, found: bool) {
+	fc := (^Fake_Conn)(user_data)
+	return strings.clone(fc.output_prefix), strings.clone(fc.output_suffix), true
+}
+
+@(private = "file")
 wire_fake_conn :: proc(ow: ^Object_World, fc: ^Fake_Conn) {
 	ow.conn = Connection_Hooks{
 		user_data          = fc,
 		connection_name    = fake_connection_name,
+		notify_raw         = fake_notify_raw,
 		try_dequeue_input  = fake_try_dequeue,
 		register_reader    = fake_register_reader,
 		unregister_reader  = fake_unregister_reader,
@@ -130,6 +148,7 @@ wire_fake_conn :: proc(ow: ^Object_World, fc: ^Fake_Conn) {
 		flush_input        = fake_flush_input,
 		set_connection_option = fake_set_option,
 		connection_option  = fake_get_option,
+		output_delimiters  = fake_output_delimiters,
 	}
 }
 
@@ -143,6 +162,7 @@ fake_conn_destroy :: proc(fc: ^Fake_Conn) {
 		values.free_var(v)
 	}
 	delete(fc.options)
+	delete(fc.last_raw_notified)
 }
 
 @(test)
@@ -422,4 +442,51 @@ test_eval_success_parse_error_and_permission :: proc(t: ^testing.T) {
 	testing.expect(t, denied.raised && denied.code == .E_PERM)
 	delete(denied.msg)
 	values.free_var(denied.rvalue)
+}
+
+@(test)
+test_notify_raw_sends_text_unmodified_and_checks_permission :: proc(t: ^testing.T) {
+	db := build_crud_world()
+	defer crud_world_destroy(&db)
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := object_world_init(&db, &sched)
+	defer object_world_destroy(&ow)
+	world := make_world(&ow)
+	fc := Fake_Conn{scheduler = &sched}
+	defer fake_conn_destroy(&fc)
+	wire_fake_conn(&ow, &fc)
+
+	// #2 (Fertile Parent) notifying itself: allowed even though not a wizard.
+	act := crud_root_activation(2)
+	ctx := vm.Eval_Context{activation = &act, world = &world}
+	args := make([]values.Var, 2)
+	args[0] = values.obj_val(2)
+	args[1] = values.str_val(strings.clone("|15raw text with a literal pipe code|07"))
+	r := bf_notify_raw(&ow, values.list_val(args), &ctx)
+	testing.expect(t, !r.raised)
+	values.free_var(r.value)
+	testing.expect(t, fc.last_raw_notified == "|15raw text with a literal pipe code|07")
+
+	// #3 (Room, unprivileged) trying to notify #2: denied.
+	nact := crud_root_activation(3)
+	nctx := vm.Eval_Context{activation = &nact, world = &world}
+	dargs := make([]values.Var, 2)
+	dargs[0] = values.obj_val(2)
+	dargs[1] = values.str_val(strings.clone("nope"))
+	denied := bf_notify_raw(&ow, values.list_val(dargs), &nctx)
+	testing.expect(t, denied.raised && denied.code == .E_PERM)
+	delete(denied.msg)
+	values.free_var(denied.rvalue)
+
+	// A wizard (#1) notifying someone else: allowed.
+	wact := crud_root_activation(1)
+	wctx := vm.Eval_Context{activation = &wact, world = &world}
+	wargs := make([]values.Var, 2)
+	wargs[0] = values.obj_val(2)
+	wargs[1] = values.str_val(strings.clone("from a wizard"))
+	wr := bf_notify_raw(&ow, values.list_val(wargs), &wctx)
+	testing.expect(t, !wr.raised)
+	values.free_var(wr.value)
+	testing.expect(t, fc.last_raw_notified == "from a wizard")
 }

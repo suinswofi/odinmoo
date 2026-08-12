@@ -22,6 +22,7 @@ import "core:strings"
 Connection_Hooks :: struct {
 	user_data:        rawptr,
 	notify:           proc(user_data: rawptr, player: values.Objid, text: string) -> bool,
+	notify_raw:       proc(user_data: rawptr, player: values.Objid, text: string) -> bool, // backs notify_raw() -- see connection_io.odin
 	connection_name:  proc(user_data: rawptr, player: values.Objid) -> (name: string, found: bool), // name owned if found
 	boot_player:      proc(user_data: rawptr, player: values.Objid),
 	connected_players: proc(user_data: rawptr, include_all: bool) -> []values.Objid, // owned slice
@@ -37,6 +38,10 @@ Connection_Hooks :: struct {
 	set_connection_option: proc(user_data: rawptr, player: values.Objid, option: string, value: values.Var) -> bool,
 	connection_option:    proc(user_data: rawptr, player: values.Objid, option: string) -> (value: values.Var, found: bool), // owned if found
 	connection_options:   proc(user_data: rawptr, player: values.Objid) -> (list: values.Var, found: bool), // owned if found
+
+	// output_delimiters backs output_delimiters() -- the PREFIX/SUFFIX intrinsic commands
+	// set these (netio/command.odin), owned strings returned empty ("") if never set.
+	output_delimiters: proc(user_data: rawptr, player: values.Objid) -> (prefix: string, suffix: string, found: bool),
 }
 
 // Server_Hooks is how shutdown()/dump_database() reach the actual process-level server loop:

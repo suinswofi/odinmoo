@@ -41,6 +41,7 @@ add_verb :: proc(db: ^dbfile.Database, o: ^dbfile.Object, name: string, owner: v
 		name           = dbfile.intern_name(&db.name_intern, name),
 		owner          = owner,
 		perms          = perms,
+		prep           = objdb.PREP_NONE, // "no preposition" -- 0 (the zero value) is a real prep_table index, not none
 		program_source = strings.clone(src),
 		has_program    = true,
 	})
@@ -73,7 +74,16 @@ build_login_db :: proc() -> dbfile.Database {
 	`)
 
 	wizard := mkobj(&db, 1, values.NOTHING, 1, "Wizard")
-	wizard.flags = 1 << uint(objdb.Object_Flag.User) | 1 << uint(objdb.Object_Flag.Wizard)
+	wizard.flags = 1 << uint(objdb.Object_Flag.User) | 1 << uint(objdb.Object_Flag.Wizard) | 1 << uint(objdb.Object_Flag.Programmer)
+	// A directly-typeable command (dobj/prep/iobj all "none") on the wizard itself, reachable
+	// via ordinary command dispatch -- used to exercise PREFIX/SUFFIX, which only wrap real
+	// dispatch_command()-routed commands, not the `.eval` debug hatch.
+	add_verb(&db, wizard, "greet", 1, int(1<<uint(objdb.Verb_Flag.Read)) | int(1<<uint(objdb.Verb_Flag.Write)) | int(1<<uint(objdb.Verb_Flag.Exec)), `notify(player, "hello there");`)
+
+	// A small programmable object for `.program` tests: a "widget" with one pre-existing verb
+	// ("look"), owned by the wizard, that .program's own permission check (VF_WRITE) accepts.
+	widget := mkobj(&db, 2, values.NOTHING, 1, "widget")
+	add_verb(&db, widget, "look", 1, int(1<<uint(objdb.Verb_Flag.Read)) | int(1<<uint(objdb.Verb_Flag.Write)) | int(1<<uint(objdb.Verb_Flag.Exec)), `return "before";`)
 
 	return db
 }
@@ -314,4 +324,126 @@ test_server_stop_closes_listener :: proc(t: ^testing.T) {
 	time.sleep(10 * time.Millisecond)
 	_, derr := net.dial_tcp_from_endpoint(endpoint)
 	testing.expect(t, derr != nil)
+}
+
+@(test)
+test_program_intrinsic_command_edits_a_real_verb :: proc(t: ^testing.T) {
+	db := build_login_db()
+	defer dbfile.database_destroy(&db)
+
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := objdb.object_world_init(&db, &sched)
+	defer objdb.object_world_destroy(&ow)
+	world := objdb.make_world(&ow)
+
+	s: Server
+	wire_connection_hooks(&ow, &s)
+	err := server_start(&s, 0, &sched, &world)
+	testing.expectf(t, err == nil, "server_start: %v", err)
+	defer server_stop(&s)
+
+	endpoint, _ := net.bound_endpoint(s.listener)
+	sock, derr := net.dial_tcp_from_endpoint(endpoint)
+	testing.expectf(t, derr == nil, "dial: %v", derr)
+	defer net.close(sock)
+	client := client_init(sock)
+	defer client_destroy(&client)
+
+	banner := recv_line(t, &client)
+	defer delete(banner)
+	log_in(t, &client)
+
+	// By object number: `widget` isn't placed anywhere in the player's environment (no
+	// location/inventory in this minimal fixture), so name-matching wouldn't find it --
+	// exactly why `.program` (like most MOO object-spec syntax) also accepts `#N` directly.
+	send_cmd(&client, ".program #2:look")
+	confirm := recv_line(t, &client)
+	defer delete(confirm)
+	testing.expect(t, confirm == `Now programming widget (#2):look.  Use "." to end.`)
+
+	// The verb's EXISTING source is echoed back next (raw, uncolored) before capture starts.
+	existing := recv_line(t, &client)
+	defer delete(existing)
+	testing.expect(t, strings.contains(existing, "before"))
+
+	send_cmd(&client, `return "|15after|07";`)
+	send_cmd(&client, ".")
+	errcount := recv_line(t, &client)
+	defer delete(errcount)
+	testing.expect(t, errcount == "0 error(s).")
+	installed := recv_line(t, &client)
+	defer delete(installed)
+	testing.expect(t, installed == "Verb programmed.")
+
+	// Confirm the NEW body actually took effect, and that the pipe codes inside the string
+	// literal survived being typed through the raw-capture editor unmangled -- checked via
+	// length(), not the string's displayed form, since .eval's OWN result display legitimately
+	// goes through the normal translated send_line path (it's showing a live expression
+	// result, not stored source) and would otherwise turn |15/|07 into real color escapes
+	// here too, same as any other command output -- correct for .eval, and exactly why this
+	// checks the underlying stored value instead. A mangled storage round-trip (the pipe
+	// codes silently eaten, as they would be had capture gone through send_line/
+	// ansi.translate instead of send_line_raw) would show up as the wrong length: `|15after|07`
+	// is 11 characters; losing either pipe code would leave 8.
+	send_cmd(&client, ".eval length(#2:look())")
+	length_result := recv_line(t, &client)
+	defer delete(length_result)
+	testing.expect(t, length_result == "11")
+}
+
+@(test)
+test_prefix_suffix_wrap_command_output :: proc(t: ^testing.T) {
+	db := build_login_db()
+	defer dbfile.database_destroy(&db)
+
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := objdb.object_world_init(&db, &sched)
+	defer objdb.object_world_destroy(&ow)
+	world := objdb.make_world(&ow)
+
+	s: Server
+	wire_connection_hooks(&ow, &s)
+	err := server_start(&s, 0, &sched, &world)
+	testing.expectf(t, err == nil, "server_start: %v", err)
+	defer server_stop(&s)
+
+	endpoint, _ := net.bound_endpoint(s.listener)
+	sock, derr := net.dial_tcp_from_endpoint(endpoint)
+	testing.expectf(t, derr == nil, "dial: %v", derr)
+	defer net.close(sock)
+	client := client_init(sock)
+	defer client_destroy(&client)
+
+	banner := recv_line(t, &client)
+	defer delete(banner)
+	log_in(t, &client)
+
+	send_cmd(&client, "PREFIX >>>")
+	send_cmd(&client, "SUFFIX <<<")
+	send_cmd(&client, "greet")
+	before := recv_line(t, &client)
+	defer delete(before)
+	testing.expect(t, before == ">>>")
+	middle := recv_line(t, &client)
+	defer delete(middle)
+	testing.expect(t, middle == "hello there")
+	after := recv_line(t, &client)
+	defer delete(after)
+	testing.expect(t, after == "<<<")
+
+	// output_delimiters() reports back what was set.
+	send_cmd(&client, ".eval output_delimiters(player)")
+	delims := recv_line(t, &client)
+	defer delete(delims)
+	testing.expect(t, delims == `{">>>", "<<<"}`)
+
+	// Clearing with an empty argument turns delimiters back off.
+	send_cmd(&client, "PREFIX")
+	send_cmd(&client, "SUFFIX")
+	send_cmd(&client, "greet")
+	only := recv_line(t, &client)
+	defer delete(only)
+	testing.expect(t, only == "hello there")
 }

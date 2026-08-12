@@ -49,15 +49,41 @@ Connection :: struct {
 	reader_task_id: int, // 0 = no task currently parked in read() on this connection
 	pending_lines:  [dynamic]string, // queued while "hold-input" is set, or awaiting a non-blocking read()
 	options:        map[string]values.Var, // connection-option store, see input_queue.odin's option_defaults
+
+	// `.program` intrinsic editor state (see program_editor.odin). Only ever touched by this
+	// connection's own recv-loop thread, so unlike the fields above it needs no lock.
+	programming:        bool,
+	program_obj:        values.Objid, // the verb's DEFINER (h.definer from find_defined_verb), not necessarily the object named in ".program obj:verb"
+	program_verb_name:  string, // owned; the verb name as typed, re-resolved against program_obj when programming ends
+	program_lines:      [dynamic]string, // owned strings; raw body lines accumulated so far
+
+	// PREFIX/OUTPUTPREFIX and SUFFIX/OUTPUTSUFFIX intrinsic commands (see command.odin's
+	// handle_intrinsic_command): text sent immediately before/after every ordinary command's
+	// output. Empty string ("") means unset, matching the original's NULL-slot convention.
+	output_prefix: string, // owned
+	output_suffix: string, // owned
 }
 
-// send_line translates conn's %-code markup per its current ansi_enabled setting, then
-// writes text + "\r\n" to the socket. Not file-private: login.odin's connection hooks and
-// finish_login() also write directly to a connection's socket.
+// send_line translates conn's %-code/pipe-code markup per its current ansi_enabled setting,
+// then writes text + "\r\n" to the socket. Not file-private: login.odin's connection hooks
+// and finish_login() also write directly to a connection's socket.
 send_line :: proc(conn: ^Connection, text: string) {
 	colored := ansi.translate(text, conn.ansi_enabled)
 	defer delete(colored)
 	msg := strings.concatenate({colored, "\r\n"})
+	defer delete(msg)
+	net.send_tcp(conn.socket, transmute([]byte)msg)
+}
+
+// send_line_raw writes text + "\r\n" straight to the socket with NO color translation at
+// all -- for displaying text that must be shown byte-for-byte as typed, like a verb's
+// source or a property's raw value while it's being reviewed/edited, where a `%r` or `|15`
+// occurring as ordinary characters inside the text must not be silently eaten and replaced
+// with a color escape (see notify_raw()'s header in objdb/connection_io.odin for the full
+// story). Not file-private: also used directly by the `.program` intrinsic editor to echo
+// back existing verb source before editing.
+send_line_raw :: proc(conn: ^Connection, text: string) {
+	msg := strings.concatenate({text, "\r\n"})
 	defer delete(msg)
 	net.send_tcp(conn.socket, transmute([]byte)msg)
 }
@@ -69,6 +95,7 @@ connection_handler :: proc(data: rawptr) {
 	defer unregister_player(conn.server, conn.player)
 	defer sync.wait_group_done(&conn.server.conns_done)
 	defer connection_io_destroy(conn)
+	defer program_state_destroy(conn)
 	conn.ansi_enabled = true
 	conn.options = init_option_defaults()
 	conn.player = allocate_connection_id(conn.server, conn)
@@ -134,6 +161,13 @@ login_dispatch :: proc(conn: ^Connection, line: string) {
 
 // Not file-private: input_queue.odin's dispatch_now() calls this too.
 handle_line :: proc(conn: ^Connection, line: string) {
+	if conn.programming {
+		// Checked before ANYTHING else, including the blank-line discard below: a blank
+		// line is legitimate verb-body text while `.program`-ing, not "nothing to do."
+		handle_programming_line(conn, line)
+		return
+	}
+
 	trimmed := strings.trim_space(line)
 	if len(trimmed) == 0 {
 		return
