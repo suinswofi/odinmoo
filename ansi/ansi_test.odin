@@ -81,9 +81,41 @@ test_translate_pipe_code_sticky_until_changed :: proc(t: ^testing.T) {
 
 @(test)
 test_translate_pipe_code_out_of_range_is_literal :: proc(t: ^testing.T) {
-	s := translate("|24nope |9x |1 |", true)
+	s := translate("|32nope |9x |1 | |DZ", true)
 	defer delete(s)
-	testing.expect(t, s == "|24nope |9x |1 |")
+	testing.expect(t, s == "|32nope |9x |1 | |DZ")
+}
+
+@(test)
+test_translate_pipe_code_bright_background :: proc(t: ^testing.T) {
+	s := translate("|24dark grey bg|31white bg", true)
+	defer delete(s)
+	testing.expect(t, s == "\x1b[100mdark grey bg\x1b[107mwhite bg")
+}
+
+@(test)
+test_translate_pipe_code_default_fg_and_bg :: proc(t: ^testing.T) {
+	s := translate("|15White |DFback to default, |17blue bg |DBdefault bg again", true)
+	defer delete(s)
+	testing.expect(t, s == "\x1b[97mWhite \x1b[39mback to default, \x1b[44mblue bg \x1b[49mdefault bg again")
+}
+
+@(test)
+test_translate_pipe_code_default_case_insensitive :: proc(t: ^testing.T) {
+	upper := translate("|DFx", true)
+	defer delete(upper)
+	lower := translate("|dfx", true)
+	defer delete(lower)
+	mixed := translate("|Dfx", true)
+	defer delete(mixed)
+	testing.expect(t, upper == "\x1b[39mx" && lower == upper && mixed == upper)
+}
+
+@(test)
+test_translate_pipe_code_default_disabled_strips_to_plain_text :: proc(t: ^testing.T) {
+	s := translate("|15White |DFdefault |DBagain", false)
+	defer delete(s)
+	testing.expect(t, s == "White default again")
 }
 
 @(test)

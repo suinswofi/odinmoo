@@ -11,12 +11,23 @@ package moo_ansi
 //     convention), `|` followed by exactly two digits: `|00`-`|15` set the foreground to one
 //     of the 16 standard colors (dark 00-07, bright 08-15, same hue pairs -- e.g. |00/|08 are
 //     both "black-family", the bright one is dark grey), `|16`-`|23` set the background to
-//     one of the 8 non-bright colors. Unlike %h, there's no separate bright modifier --
-//     brightness is baked into which of the 16 codes you pick. Neither markup style
-//     auto-resets: a color set by either stays in effect (both across the string and, once
-//     sent to a real terminal, across subsequent lines) until an explicit reset (%n) or
-//     another color code changes it -- exactly matching how real ANSI SGR state behaves, so
-//     this needs no extra bookkeeping here.
+//     one of the 8 non-bright colors, `|24`-`|31` set the background to the bright version of
+//     those same 8 hues (this MOO's own extension -- the classic convention stops at |23,
+//     since real BBS-door displays never had bright backgrounds). Unlike %h, there's no
+//     separate bright modifier -- brightness is baked into which code you pick.
+//   - `|DF`/`|DB` (case-insensitive): reset the foreground/background to the connecting
+//     terminal's own default color -- NOT a specific color like white or black, genuinely
+//     "whatever this user's terminal is configured to show," so it looks right regardless of
+//     whether they're on a light or dark theme. This is also this MOO's own extension: SGR 39
+//     (default fg) and SGR 49 (default bg) exist in real ANSI but the classic pipe-code set
+//     has no code for them. Deliberately separate from `%n` (full reset -- also clears bold
+//     and whichever OTHER color you didn't just set): `|15Hi |DFthere` resets only the
+//     foreground, leaving any background color from an earlier `|1X`/`|2X`/`|DB` alone.
+//
+//     None of these markup styles auto-reset: a color set by any of them stays in effect
+//     (both across the string and, once sent to a real terminal, across subsequent lines)
+//     until an explicit reset (`%n`/`|DF`/`|DB`) or another color code changes it -- exactly
+//     matching how real ANSI SGR state behaves, so this needs no extra bookkeeping here.
 //
 // Verb authors (and the server's own system messages) write these directly in ordinary
 // strings; translate() turns them into real ANSI SGR escape sequences, or strips them to
@@ -81,26 +92,55 @@ pipe_fg_sgr := [16]string{
 	"90", "94", "92", "96", "91", "95", "93", "97", // 08-15: bright versions of the same 8
 }
 
-// pipe_bg_sgr: |16-|23 -> SGR param (40-47) -- backgrounds only come in the 8 non-bright
-// flavors in the classic pipe-code convention (no bright-background codes exist to map).
+// pipe_bg_sgr: |16-|23 -> SGR param (40-47), the 8 standard-intensity backgrounds.
 @(private = "file")
 pipe_bg_sgr := [8]string{
 	"40", "44", "42", "46", "41", "45", "43", "47", // 16-23: black,blue,green,cyan,red,magenta,brown,grey
 }
 
-// parse_pipe_code recognizes a `|NN` sequence at the start of s (NN = exactly two decimal
-// digits, 00-23): returns the parsed number, how many bytes it occupies (always 3: `|` + 2
-// digits), and ok. Anything else -- `|` at end of string, `|` followed by fewer than two
-// digits, non-digit characters, or a number outside 00-23 -- is NOT a pipe code and falls
-// through to being treated as a literal `|`, the same graceful-degradation policy the %-code
-// handler already uses for an unrecognized `%X`.
+// pipe_bg_bright_sgr: |24-|31 -> SGR param, the bright version of the same 8 background
+// hues, via the aixterm high-intensity background range (100-107) -- this MOO's own
+// extension to the classic pipe-code set, same hue order as pipe_bg_sgr.
+@(private = "file")
+pipe_bg_bright_sgr := [8]string{
+	"100", "104", "102", "106", "101", "105", "103", "107", // 24-31: black,blue,green,cyan,red,magenta,brown(yellow),grey(white)
+}
+
+// Sentinel values parse_pipe_code returns for `|DF`/`|DB` -- outside the 0-31 real-color
+// range, so emit_pipe_code can tell them apart from an actual table index.
+@(private = "file")
+PIPE_DEFAULT_FG :: -1
+@(private = "file")
+PIPE_DEFAULT_BG :: -2
+
+// parse_pipe_code recognizes a pipe-code sequence at the start of s: either `|NN` (NN = two
+// decimal digits, 00-31) or `|DF`/`|DB` (case-insensitive, default-foreground/background
+// reset). Returns the parsed value (a 0-31 table index, or a PIPE_DEFAULT_* sentinel), how
+// many bytes it occupies (always 3: `|` + 2 more), and ok. Anything else -- `|` at end of
+// string, `|` followed by fewer than two characters, digits outside 00-31, or two letters
+// that aren't "DF"/"DB" -- is NOT a pipe code and falls through to being treated as a literal
+// `|`, the same graceful-degradation policy the %-code handler already uses for an
+// unrecognized `%X`.
 @(private = "file")
 parse_pipe_code :: proc(s: string) -> (n: int, consumed: int, ok: bool) {
-	if len(s) < 3 || s[1] < '0' || s[1] > '9' || s[2] < '0' || s[2] > '9' {
+	if len(s) < 3 {
 		return 0, 0, false
 	}
-	n = int(s[1]-'0')*10 + int(s[2]-'0')
-	if n > 23 {
+	c1, c2 := s[1], s[2]
+	if c1 == 'D' || c1 == 'd' {
+		switch c2 {
+		case 'F', 'f':
+			return PIPE_DEFAULT_FG, 3, true
+		case 'B', 'b':
+			return PIPE_DEFAULT_BG, 3, true
+		}
+		return 0, 0, false
+	}
+	if c1 < '0' || c1 > '9' || c2 < '0' || c2 > '9' {
+		return 0, 0, false
+	}
+	n = int(c1-'0')*10 + int(c2-'0')
+	if n > 31 {
 		return 0, 0, false
 	}
 	return n, 3, true
@@ -111,10 +151,17 @@ emit_pipe_code :: proc(b: ^strings.Builder, n: int, enable: bool) {
 	if !enable {
 		return
 	}
-	if n < 16 {
+	switch {
+	case n == PIPE_DEFAULT_FG:
+		strings.write_string(b, ESC + "39m")
+	case n == PIPE_DEFAULT_BG:
+		strings.write_string(b, ESC + "49m")
+	case n < 16:
 		fmt.sbprintf(b, "%s%sm", ESC, pipe_fg_sgr[n])
-	} else {
+	case n < 24:
 		fmt.sbprintf(b, "%s%sm", ESC, pipe_bg_sgr[n - 16])
+	case:
+		fmt.sbprintf(b, "%s%sm", ESC, pipe_bg_bright_sgr[n - 24])
 	}
 }
 
