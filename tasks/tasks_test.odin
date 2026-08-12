@@ -28,8 +28,15 @@ import "core:time"
 // IMPORTANT: this package's do_fork wiring (make_do_fork -> fork.odin's scheduler_for_fork)
 // and this file's scheduler_from_test global both assume a single active Scheduler, matching
 // production (one server process, one scheduler). Odin's test runner runs tests in parallel
-// by default, which would make independent tests here stomp on each other's global and
-// deadlock/misbehave -- these tests must run with ODIN_TEST_THREADS=1.
+// by default, which would make independent tests here stomp on each other's globals: one
+// test's forks would run against another test's (possibly already-destroyed) scheduler, its
+// wait group would never finish, and the whole run would hang rather than fail. ODIN_TEST_*
+// knobs are compile-time defines, not env vars, so "remember the right flag" proved
+// unreliable in practice (it locked up real sessions twice) -- instead every test below
+// takes `serial_tests` for its whole body, so a plain `odin test tasks` is safe at any
+// runner thread count.
+@(private = "file")
+serial_tests: sync.Mutex
 @(private = "file")
 counter_target: ^int
 @(private = "file")
@@ -84,6 +91,8 @@ scheduler_from_test: ^Scheduler
 
 @(test)
 test_fork_runs_independently_and_does_not_block_caller :: proc(t: ^testing.T) {
+	sync.mutex_lock(&serial_tests)
+	defer sync.mutex_unlock(&serial_tests)
 	s := scheduler_init()
 	defer scheduler_destroy(&s)
 	counter := 0
@@ -104,6 +113,8 @@ test_fork_runs_independently_and_does_not_block_caller :: proc(t: ^testing.T) {
 
 @(test)
 test_big_lock_serializes_concurrent_tasks :: proc(t: ^testing.T) {
+	sync.mutex_lock(&serial_tests)
+	defer sync.mutex_unlock(&serial_tests)
 	s := scheduler_init()
 	defer scheduler_destroy(&s)
 	counter := 0
@@ -129,6 +140,8 @@ test_big_lock_serializes_concurrent_tasks :: proc(t: ^testing.T) {
 
 @(test)
 test_suspend_blocks_until_resumed_from_another_thread :: proc(t: ^testing.T) {
+	sync.mutex_lock(&serial_tests)
+	defer sync.mutex_unlock(&serial_tests)
 	s := scheduler_init()
 	defer scheduler_destroy(&s)
 	world := make_test_world(&s)
@@ -191,6 +204,8 @@ test_suspend_blocks_until_resumed_from_another_thread :: proc(t: ^testing.T) {
 
 @(test)
 test_suspend_with_timeout :: proc(t: ^testing.T) {
+	sync.mutex_lock(&serial_tests)
+	defer sync.mutex_unlock(&serial_tests)
 	s := scheduler_init()
 	defer scheduler_destroy(&s)
 	world := make_test_world(&s)
@@ -209,6 +224,8 @@ test_suspend_with_timeout :: proc(t: ^testing.T) {
 
 @(test)
 test_kill_task_raises_in_suspended_task :: proc(t: ^testing.T) {
+	sync.mutex_lock(&serial_tests)
+	defer sync.mutex_unlock(&serial_tests)
 	s := scheduler_init()
 	defer scheduler_destroy(&s)
 	world := make_test_world(&s)
@@ -268,6 +285,8 @@ test_kill_task_raises_in_suspended_task :: proc(t: ^testing.T) {
 
 @(test)
 test_task_id_builtin :: proc(t: ^testing.T) {
+	sync.mutex_lock(&serial_tests)
+	defer sync.mutex_unlock(&serial_tests)
 	s := scheduler_init()
 	defer scheduler_destroy(&s)
 	world := make_test_world(&s)

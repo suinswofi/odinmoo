@@ -184,15 +184,11 @@ odin test <package> -extra-linker-flags:"-lcrypt"
 ```
 
 Run per-package (`values`, `dbfile`, `compiler`, `vm`, `objdb`, `builtins`, `ansi`, `regex`,
-`tasks`, `netio` — `server` and `cmd/*` have no tests of their own). One package needs an extra
-flag: `tasks`' concurrency tests share package-level state across test functions and must run
-single-threaded —
-
-```sh
-odin test tasks -extra-linker-flags:"-lcrypt" -define:ODIN_TEST_THREADS=1
-```
-
-— running it with Odin's default parallel test runner will hang, not fail cleanly.
+`tasks`, `netio` — `server` and `cmd/*` have no tests of their own). No package needs special
+flags beyond `-lcrypt`: `tasks`' concurrency tests share package-level state across test
+functions, but they serialize themselves internally (see `tasks_test.odin`'s `serial_tests`
+mutex), so the default parallel test runner is safe. (Historically they required
+`-define:ODIN_TEST_THREADS=1` and would hang — not fail cleanly — without it.)
 
 A handful of tests (`dbfile/db_test.odin`, `dbfile/roundtrip_test.odin`,
 `compiler/corpus_test.odin`, `objdb/lambdacore_test.odin`, `netio/real_core_test.odin`) load the
