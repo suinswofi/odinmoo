@@ -218,6 +218,7 @@ server/         main(), CLI, signal handling, checkpoint (fork()-based), emergen
 cmd/            small standalone dev tools (dumpverb, loadcheck, replserver) -- like the
                 tests above, these load `LambdaCore.db` via a relative path, so run them
                 from the repo root (`odin run cmd/replserver`, etc.)
+docs/           the original LambdaMOO/LambdaCore reference manuals (see below)
 LambdaCore.db   the bundled starting database (see Prerequisites, above)
 run.sh          quick-start script: runs bin/moo against LambdaCore.db
 ```
@@ -233,6 +234,17 @@ run.sh          quick-start script: runs bin/moo against LambdaCore.db
   says "ports X" without further qualification — worth having open side by side if you're working
   on `objdb/` or `vm/` specifically, where getting an edge case subtly wrong tends to surface only
   much later, in real verb code that depends on it.
+- `docs/` has the three original manuals, which between them cover both halves of "how do I use
+  this" — the server and the database it ships with:
+  - `ProgrammersManual.pdf` — Pavel Curtis's *LambdaMOO Programmer's Manual* (1.8.0p6, 1997): the
+    MOO language, value types, and the built-in function library, one entry per builtin. This is
+    the specification the port is written against, and the fastest way to check what a builtin is
+    supposed to do before reading either implementation.
+  - `LambdaCoreProgMan.pdf` — *LambdaCore Database Programmer's Manual* (1.3, 1991): the verb and
+    property conventions inside `LambdaCore.db` itself (`$string_utils`, the `$root_class`
+    hierarchy, `:tell`/`:look_self`/... protocols) rather than the server underneath it.
+  - `LambdaCoreUserMan.pdf` — *LambdaCore Database User's Manual* (1.3, 1991): the player-facing
+    commands, useful mainly for driving a running server by hand to exercise a change.
 - For tracking down a specific missing or misbehaving built-in against a real database: write a
   small standalone program under a scratch directory that imports `dbfile`/`objdb`/`compiler`/`vm`
   directly, loads the real `.db`, and either dumps a verb's source or runs a snippet through
