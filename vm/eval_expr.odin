@@ -39,8 +39,25 @@ propagate :: proc(ctx: ^Eval_Context, r: Op_Result) -> Expr_Result {
 	return ok_expr(r.value)
 }
 
-call_to_expr :: proc(r: Call_Result) -> Expr_Result {
+// call_to_expr turns a World callback's Call_Result into an Expr_Result, applying the same
+// raise-vs-inline-error policy as raise_or_value above. The original routes every one of
+// these through PUSH_ERROR (execute.c:774-780 -- property fetch/store at 1434/1464/1499,
+// verb-call dispatch failure at 1635, built-in BI_RAISE at 1684-1695), and PUSH_ERROR only
+// raises when RUN_ACTIV.debug is set; in a non-debug verb the error becomes the value of the
+// expression and execution continues. That is not a legacy curiosity: core code uses it
+// deliberately to probe for a verb or property without paying for try/except (JHCore's
+// $code_utils:verb_or_property is `if ((r = o:(v)(@rest)) == E_VERBNF)` and nothing else).
+//
+// An error unwinding out of a verb body that already started running is NOT subject to the
+// caller's flag -- unwind_stack (execute.c:200-320) only consults the debug flag of the
+// activation whose own built-in raised, never of the frames it unwinds past.
+call_to_expr :: proc(ctx: ^Eval_Context, r: Call_Result) -> Expr_Result {
 	if r.raised {
+		if !ctx.activation.debug && !r.unwinding {
+			delete(r.msg)
+			values.free_var(r.rvalue)
+			return ok_expr(values.err_val(r.code))
+		}
 		return Expr_Result{raised = true, err = Error_Info{code = r.code, msg = r.msg, value = r.rvalue}}
 	}
 	return ok_expr(r.value)
@@ -149,7 +166,7 @@ eval_prop_get :: proc(ctx: ^Eval_Context, obj_e, prop_e: compiler.Expr) -> Expr_
 	if obj_r.value.type != .Obj || prop_r.value.type != .Str {
 		return raise_or_value(ctx, .E_TYPE)
 	}
-	return call_to_expr(ctx.world.get_prop(ctx.world, obj_r.value.data.obj, prop_r.value.data.str.s, ctx))
+	return call_to_expr(ctx, ctx.world.get_prop(ctx.world, obj_r.value.data.obj, prop_r.value.data.str.s, ctx))
 }
 
 @(private = "file")
@@ -175,7 +192,7 @@ eval_verb_call :: proc(ctx: ^Eval_Context, obj_e, verb_e: compiler.Expr, arg_exp
 		values.free_var(args_r.value)
 		return raise_or_value(ctx, .E_TYPE)
 	}
-	return call_to_expr(ctx.world.call_verb(ctx.world, obj_r.value.data.obj, verb_r.value.data.str.s, args_r.value, ctx))
+	return call_to_expr(ctx, ctx.world.call_verb(ctx.world, obj_r.value.data.obj, verb_r.value.data.str.s, args_r.value, ctx))
 }
 
 @(private = "file")
@@ -184,7 +201,7 @@ eval_call :: proc(ctx: ^Eval_Context, name: string, is_known: bool, arg_exprs: [
 	if args_r.raised {
 		return args_r
 	}
-	return call_to_expr(ctx.world.call_builtin(ctx.world, name, is_known, args_r.value, ctx))
+	return call_to_expr(ctx, ctx.world.call_builtin(ctx.world, name, is_known, args_r.value, ctx))
 }
 
 // eval_args_as_list evaluates a call/list-literal argument list into a single MOO list,

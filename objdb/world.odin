@@ -43,6 +43,22 @@ Connection_Hooks :: struct {
 	// output_delimiters backs output_delimiters() -- the PREFIX/SUFFIX intrinsic commands
 	// set these (netio/command.odin), owned strings returned empty ("") if never set.
 	output_delimiters: proc(user_data: rawptr, player: values.Objid) -> (prefix: string, suffix: string, found: bool),
+
+	// listening_points backs listeners(); the netio server owns the actual socket, so it
+	// reports what it has bound. Owned slice.
+	listening_points: proc(user_data: rawptr) -> []Listening_Point,
+}
+
+// Listening_Point is one entry of what listeners() reports, ported from server.c's
+// `slistener` (the oid/desc/print_messages triple, server.c:75-90). This port has exactly
+// one listening point -- the command-line port, created by the original as
+// new_slistener(SYSTEM_OBJECT, port, 1, 0) at server.c:1250 -- because listen()/unlisten()
+// aren't implemented (they'd need runtime-created listening sockets and per-listener login
+// dispatch); see object_builtins.odin's bf_listeners.
+Listening_Point :: struct {
+	object:         values.Objid,
+	port:           int, // the TCP listener's canonical `desc`, an INT for this protocol
+	print_messages: bool,
 }
 
 // Server_Hooks is how shutdown()/dump_database() reach the actual process-level server loop:
@@ -236,7 +252,7 @@ MAX_VERB_DEPTH :: 50
 // wrongly rejected as E_VERBNF by a second, stricter search here if this function re-searched
 // on its own; passing the already-resolved handle through keeps the two searches from
 // disagreeing.
-call_verb_from :: proc(w: ^Object_World, vw: ^vm.World, this_obj, search_from: values.Objid, name: string, args: values.Var, ctx: ^vm.Eval_Context, cmd: ^Parsed_Command = nil, vh_hint: Verb_Handle = {}) -> vm.Call_Result {
+call_verb_from :: proc(w: ^Object_World, vw: ^vm.World, this_obj, search_from: values.Objid, name: string, args: values.Var, ctx: ^vm.Eval_Context, cmd: ^Parsed_Command = nil, vh_hint: Verb_Handle = {}, via_builtin: string = "") -> vm.Call_Result {
 	defer values.free_var(args)
 	if ctx.activation.depth + 1 >= MAX_VERB_DEPTH {
 		return err_result(.E_MAXREC, "Too many verb calls")
@@ -278,6 +294,7 @@ call_verb_from :: proc(w: ^Object_World, vw: ^vm.World, this_obj, search_from: v
 	// the wrong string and silently dead-end with E_VERBNF.
 	act.verb_name = name
 	act.debug = (vd.perms & (1 << uint(Verb_Flag.Debug))) != 0
+	act.bi_func_name = via_builtin // non-empty only when a built-in dispatched this verb
 
 	if cmd != nil {
 		act.dobj = cmd.dobj
@@ -334,7 +351,9 @@ call_verb_from :: proc(w: ^Object_World, vw: ^vm.World, this_obj, search_from: v
 	case .Return:
 		return vm.call_ok(r.value)
 	case .Raised:
-		return vm.Call_Result{raised = true, code = r.err.code, msg = r.err.msg, rvalue = r.err.value}
+		// The verb body ran and raised: this unwinds through the caller regardless of the
+		// caller's `d` flag (execute.c's unwind_stack), unlike a dispatch failure above.
+		return vm.Call_Result{raised = true, code = r.err.code, msg = r.err.msg, rvalue = r.err.value, unwinding = true}
 	case .Normal, .Break, .Continue:
 		return vm.call_ok(values.int_val(0))
 	}

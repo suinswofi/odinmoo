@@ -379,7 +379,9 @@ bf_eval :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 		items[1] = result.value
 		return ok_result(values.list_val(items))
 	case .Raised:
-		return vm.Call_Result{raised = true, code = result.err.code, msg = result.err.msg, rvalue = result.err.value}
+		// Like a verb call, eval()'d code runs in its own activation, so a raise inside it
+		// unwinds through eval()'s caller rather than becoming that caller's inline value.
+		return vm.Call_Result{raised = true, code = result.err.code, msg = result.err.msg, rvalue = result.err.value, unwinding = true}
 	case .Normal, .Break, .Continue:
 		items := make([]values.Var, 2)
 		items[0] = values.int_val(1)

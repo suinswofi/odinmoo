@@ -35,7 +35,7 @@ assign_to_lvalue :: proc(ctx: ^Eval_Context, target: compiler.Expr, new_value: v
 			values.free_var(new_value)
 			return raise_or_value(ctx, .E_TYPE)
 		}
-		return call_to_expr(ctx.world.set_prop(ctx.world, obj_r.value.data.obj, prop_r.value.data.str.s, new_value, ctx))
+		return call_to_expr(ctx, ctx.world.set_prop(ctx.world, obj_r.value.data.obj, prop_r.value.data.str.s, new_value, ctx))
 
 	case ^compiler.Expr_Index:
 		return assign_indexed(ctx, target, new_value)
@@ -130,7 +130,7 @@ assign_indexed :: proc(ctx: ^Eval_Context, target: compiler.Expr, new_value: val
 			values.free_var(obj_r.value)
 			values.free_var(name_r.value)
 			values.free_var(new_value)
-			return call_to_expr(get_r)
+			return call_to_expr(ctx, get_r)
 		}
 		root_is_prop = true
 		prop_obj = obj_r.value
@@ -256,7 +256,7 @@ assign_indexed :: proc(ctx: ^Eval_Context, target: compiler.Expr, new_value: val
 		values.free_var(prop_name)
 		if set_r.raised {
 			values.free_var(result_value)
-			return call_to_expr(set_r)
+			return call_to_expr(ctx, set_r)
 		}
 		values.free_var(set_r.value)
 	}

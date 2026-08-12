@@ -30,6 +30,14 @@ Activation :: struct {
 	verb_loc:   values.Objid, // object the verb is defined on
 	verb_name:  string, // borrowed
 	debug:      bool, // controls whether operator errors raise (catchable) or become inline ERR values
+	// bi_func_name is set when a BUILT-IN dispatched this verb (move() calling :enterfunc,
+	// create() calling :initialize, ...), naming that built-in. It exists so callers()
+	// can report the synthetic frame the original inserts for exactly this case --
+	// activation.bi_func_id/bi_func_pc in the C server, emitted by make_stack_list
+	// (execute.c:431-447) as {#-1, "<builtin>", #-1, #-1, player}. Core code tests for it:
+	// $perm_utils:invoked_by_function("move") is how a room's :enterfunc verifies it was
+	// called by move() and not by a player, so an absent frame turns every move into E_PERM.
+	bi_func_name: string, // "" for an ordinary verb-to-verb call; never owned (static name)
 	task_id:    int, // identifies the enclosing task (Phase 6); shared by every nested verb call within it
 	depth:      int, // 0 = this activation is a task's root call (invoked directly by the
 	// server, not by another verb); N = N verb calls deep. Lets callers() (see
@@ -136,6 +144,11 @@ Call_Result :: struct {
 	code:   values.Error,
 	msg:    string, // owned iff raised
 	rvalue: values.Var, // owned iff raised
+	// unwinding marks a raise that came out of a verb body that actually started running,
+	// as opposed to one produced by the calling activation's own operation (a built-in
+	// returning an error, a verb call that couldn't be dispatched, a property that isn't
+	// there). Only the latter is subject to the caller's `d` flag -- see call_to_expr.
+	unwinding: bool,
 }
 
 call_ok :: proc(v: values.Var) -> Call_Result {return Call_Result{value = v}}

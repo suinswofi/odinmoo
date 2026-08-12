@@ -20,7 +20,10 @@ add_test_verb :: proc(db: ^dbfile.Database, oid: values.Objid, name: string, src
 	append(&o.verbdefs, dbfile.Verbdef {
 		name           = dbfile.intern_name(&db.name_intern, name),
 		owner          = 1,
-		perms          = int(1 << uint(Verb_Flag.Exec)) | int(1 << uint(Verb_Flag.Read)),
+		// "rxd" -- the Debug bit matters: without it this is a non-debug verb, where a
+		// failed dispatch (E_MAXREC here) becomes the call expression's inline value
+		// instead of raising, exactly as the original does (see vm's call_to_expr).
+		perms          = int(1 << uint(Verb_Flag.Exec)) | int(1 << uint(Verb_Flag.Read)) | int(1 << uint(Verb_Flag.Debug)),
 		prep           = PREP_NONE,
 		program_source = strings.clone(src),
 		has_program    = true,
