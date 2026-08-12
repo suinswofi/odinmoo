@@ -8,6 +8,7 @@ import "../objdb"
 import "../tasks"
 import "../values"
 import "../vm"
+import "core:fmt"
 import "core:net"
 import "core:strings"
 import "core:sync"
@@ -222,6 +223,26 @@ hook_output_delimiters :: proc(user_data: rawptr, player: values.Objid) -> (pref
 	return strings.clone(conn.output_prefix), strings.clone(conn.output_suffix), true
 }
 
+// hook_listening_points reports this server's single listening point, backing listeners().
+// The original's initial listener is new_slistener(SYSTEM_OBJECT, <port>, 1, 0)
+// (server.c:1250), so the object is #0 and print_messages is on; listen()/unlisten() would
+// add and remove further points, and aren't implemented here (see objdb's bf_listeners).
+@(private = "file")
+hook_listening_points :: proc(user_data: rawptr) -> []objdb.Listening_Point {
+	s := (^Server)(user_data)
+	endpoint, err := net.bound_endpoint(s.listener)
+	if err != nil {
+		return {}
+	}
+	points := make([]objdb.Listening_Point, 1)
+	points[0] = objdb.Listening_Point{
+		object         = values.SYSTEM_OBJECT,
+		port           = int(endpoint.port),
+		print_messages = true,
+	}
+	return points
+}
+
 // wire_connection_hooks points an Object_World's notify/connection_name/boot_player/
 // connected_players/connected_seconds at this server's connection registry. Call once, after
 // object_world_init() and before server_start() -- server/main.odin does this at startup.
@@ -243,6 +264,7 @@ wire_connection_hooks :: proc(ow: ^objdb.Object_World, s: ^Server) {
 		connection_option  = hook_connection_option,
 		connection_options = hook_connection_options,
 		output_delimiters  = hook_output_delimiters,
+		listening_points   = hook_listening_points,
 	}
 }
 
@@ -268,6 +290,11 @@ finish_login :: proc(s: ^Server, conn: ^Connection, player: values.Objid) {
 	task_id := tasks.new_task_id(s.scheduler)
 	result := call_root_verb(s.world, SYSTEM_OBJECT, "user_connected", args, player, task_id)
 	if result.raised {
+		// An uncaught error here is not cosmetic: #0:user_connected is what moves a
+		// connecting player into the world, so a raise leaves them wherever the DB left
+		// them with no working commands. The original logs a full traceback for a failed
+		// server task; log at least the error rather than swallowing it silently.
+		fmt.printfln("ERROR: #0:user_connected raised %v: %s", result.code, result.msg)
 		delete(result.msg)
 		values.free_var(result.rvalue)
 	} else {
