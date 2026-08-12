@@ -148,6 +148,18 @@ resync_one :: proc(db: ^dbfile.Database, oid: values.Objid, default_owner: value
 		surviving[key] = obj.propvals[i]
 	}
 
+	// For a slot this object is picking up by inheritance, the permissions come from the
+	// parent's own slot for that property, not from nowhere: db_properties.c's fix_props
+	// (:588-593) copies the parent's Pval wholesale, sets the value to CLEAR, and replaces
+	// the owner with this object's owner only when PF_CHOWN is set. Defaulting to perms 0
+	// instead makes every inherited property unreadable by anyone but its owner -- which
+	// silently breaks utility code that reads a property off a freshly created object
+	// (JHCore's $quota_utils:charge_quota reads <new object>.object_size, defined "r" on an
+	// ancestor, and gets E_PERM -- aborting the whole create, and with it the connect path
+	// that creates an MCP session).
+	parent_slots := parent_propval_index(db, oid)
+	defer delete(parent_slots)
+
 	new_layout := prop_layout(db, oid)
 	defer delete(new_layout)
 	new_propvals := make([dynamic]dbfile.Propval, 0, len(new_layout))
@@ -156,7 +168,7 @@ resync_one :: proc(db: ^dbfile.Database, oid: values.Objid, default_owner: value
 			append(&new_propvals, pv)
 			delete_key(&surviving, key)
 		} else {
-			append(&new_propvals, dbfile.Propval{value = values.clear_val(), owner = default_owner, perms = 0})
+			append(&new_propvals, fresh_propval(db, obj, key, parent_slots, default_owner))
 		}
 	}
 
@@ -168,4 +180,57 @@ resync_one :: proc(db: ^dbfile.Database, oid: values.Objid, default_owner: value
 
 	delete(obj.propvals)
 	obj.propvals = new_propvals
+}
+
+// parent_propval_index maps each property in `oid`'s parent's layout to that parent's
+// propval slot, so fresh_propval can find the Pval to inherit permissions from. Empty map
+// when there's no (valid) parent.
+@(private = "file")
+parent_propval_index :: proc(db: ^dbfile.Database, oid: values.Objid) -> map[Prop_Key]int {
+	index := make(map[Prop_Key]int)
+	obj, ok := db.objects[oid]
+	if !ok || obj.parent == values.NOTHING {
+		return index
+	}
+	parent, pok := db.objects[obj.parent]
+	if !pok {
+		return index
+	}
+	layout := prop_layout(db, obj.parent)
+	defer delete(layout)
+	for key, i in layout {
+		if i < len(parent.propvals) {
+			index[key] = i
+		}
+	}
+	return index
+}
+
+// fresh_propval builds the Pval for a slot this object is newly inheriting, following
+// fix_props (db_properties.c:588-593): the parent's Pval with a CLEAR value, re-owned to
+// this object's owner only if the property is PF_CHOWN ("c"). With no parent slot to copy --
+// a propdef defined on this object itself -- there is nothing to inherit, so the caller's
+// default owner and no permission bits stand, as before.
+@(private = "file")
+fresh_propval :: proc(
+	db: ^dbfile.Database,
+	obj: ^dbfile.Object,
+	key: Prop_Key,
+	parent_slots: map[Prop_Key]int,
+	default_owner: values.Objid,
+) -> dbfile.Propval {
+	slot, found := parent_slots[key]
+	if !found {
+		return dbfile.Propval{value = values.clear_val(), owner = default_owner, perms = 0}
+	}
+	parent, pok := db.objects[obj.parent]
+	if !pok || slot >= len(parent.propvals) {
+		return dbfile.Propval{value = values.clear_val(), owner = default_owner, perms = 0}
+	}
+	src := parent.propvals[slot]
+	owner := src.owner
+	if src.perms & (1 << uint(Prop_Flag.Chown)) != 0 {
+		owner = obj.owner
+	}
+	return dbfile.Propval{value = values.clear_val(), owner = owner, perms = src.perms}
 }
