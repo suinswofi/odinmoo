@@ -181,6 +181,18 @@ run_emergency_mode :: proc(db: ^dbfile.Database, world: ^vm.World) {
 	fmt.println("EMERGENCY_MODE: leaving.")
 }
 
+// find_any_wizard returns the lowest-numbered object with the wizard bit set (in stock
+// LambdaCore, #2), or SYSTEM_OBJECT if the database somehow has none.
+@(private = "file")
+find_any_wizard :: proc(db: ^dbfile.Database) -> values.Objid {
+	for oid := values.Objid(0); oid <= db.max_oid; oid += 1 {
+		if objdb.valid(db, oid) && objdb.is_wizard(db, oid) {
+			return oid
+		}
+	}
+	return values.SYSTEM_OBJECT
+}
+
 @(private = "file")
 trim_line :: proc(s: string) -> string {
 	i := len(s)
@@ -212,6 +224,13 @@ eval_and_print :: proc(db: ^dbfile.Database, world: ^vm.World, line: string, tas
 	defer vm.activation_destroy(&act)
 	act.task_id = task_id
 	act.debug = true
+	// Emergency mode runs with WIZARD permissions (the original's emergency_mode() picks a
+	// wizard to execute as) -- without this, `programmer` would default to #0, which isn't a
+	// wizard in stock LambdaCore, and the property permission checks would turn the recovery
+	// tool into a spectator (E_PERM on exactly the fix-broken-things writes it exists for).
+	wiz := find_any_wizard(db)
+	act.programmer = wiz
+	act.player = wiz
 
 	result := vm.run(r.body, &r.names, world, &act)
 	switch result.signal {

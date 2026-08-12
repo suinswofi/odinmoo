@@ -85,7 +85,7 @@ test_add_set_code_verb_roundtrip :: proc(t: ^testing.T) {
 	pos_args := make([]values.Var, 2)
 	pos_args[0] = values.obj_val(2)
 	pos_args[1] = values.int_val(pos)
-	pos_result := bf_verb_info(&ow, values.list_val(pos_args))
+	pos_result := bf_verb_info(&ow, values.list_val(pos_args), &ctx)
 	testing.expect(t, !pos_result.raised)
 	if pos_result.raised {
 		delete(pos_result.msg)

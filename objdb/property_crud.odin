@@ -11,7 +11,7 @@ import "core:strings"
 
 // bf_properties ports property.c's bf_properties(): the names of the propdefs `oid` defines
 // directly on itself (not inherited ones).
-bf_properties :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
+bf_properties :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	defer values.free_var(args)
 	if values.list_len(args) != 1 {
 		return err_result_local(.E_ARGS, "Incorrect number of arguments")
@@ -23,6 +23,11 @@ bf_properties :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 	obj, ok := w.db.objects[v.data.obj]
 	if !ok {
 		return err_result_local(.E_INVARG, "Invalid argument")
+	}
+	// Ports property.c's bf_properties(): reading the propdef list needs the object
+	// readable-by-progr.
+	if !object_allows(w.db, v.data.obj, ctx.activation.programmer, .Read) {
+		return err_result_local(.E_PERM, "Permission denied")
 	}
 	items := make([]values.Var, len(obj.propdefs))
 	for pd, i in obj.propdefs {

@@ -42,7 +42,9 @@ Token :: struct {
 }
 
 // Keyword -> (token kind, minimum DB_Version, error value if kind == .Error). Ported
-// verbatim from keywords.gperf; a keyword whose version exceeds the program's DB version is
+// verbatim from keywords.gperf. Keys are stored lowercase and looked up case-folded
+// (lexer.odin), because the original's gperf table tolower()s everything -- MOO keywords
+// are case-insensitive; a keyword whose version exceeds the program's DB version is
 // lexed as a plain identifier instead (see lexer.odin), matching the original's "renaming
 // old use of new keyword" behavior for programs written before that keyword existed.
 Keyword_Info :: struct {
@@ -68,25 +70,25 @@ keywords := map[string]Keyword_Info {
 	"except"   = {.Except, DBV_Exceptions, .E_NONE},
 	"finally"  = {.Finally, DBV_Exceptions, .E_NONE},
 	"endtry"   = {.Endtry, DBV_Exceptions, .E_NONE},
-	"ANY"      = {.Any, DBV_Exceptions, .E_NONE},
+	"any"      = {.Any, DBV_Exceptions, .E_NONE},
 	"break"    = {.Break, DBV_BreakCont, .E_NONE},
 	"continue" = {.Continue, DBV_BreakCont, .E_NONE},
-	"E_NONE"    = {.Error, DBV_Prehistory, .E_NONE},
-	"E_TYPE"    = {.Error, DBV_Prehistory, .E_TYPE},
-	"E_DIV"     = {.Error, DBV_Prehistory, .E_DIV},
-	"E_PERM"    = {.Error, DBV_Prehistory, .E_PERM},
-	"E_PROPNF"  = {.Error, DBV_Prehistory, .E_PROPNF},
-	"E_VERBNF"  = {.Error, DBV_Prehistory, .E_VERBNF},
-	"E_VARNF"   = {.Error, DBV_Prehistory, .E_VARNF},
-	"E_INVIND"  = {.Error, DBV_Prehistory, .E_INVIND},
-	"E_RECMOVE" = {.Error, DBV_Prehistory, .E_RECMOVE},
-	"E_MAXREC"  = {.Error, DBV_Prehistory, .E_MAXREC},
-	"E_RANGE"   = {.Error, DBV_Prehistory, .E_RANGE},
-	"E_ARGS"    = {.Error, DBV_Prehistory, .E_ARGS},
-	"E_NACC"    = {.Error, DBV_Prehistory, .E_NACC},
-	"E_INVARG"  = {.Error, DBV_Prehistory, .E_INVARG},
-	"E_QUOTA"   = {.Error, DBV_Prehistory, .E_QUOTA},
-	"E_FLOAT"   = {.Error, DBV_Float, .E_FLOAT},
+	"e_none"    = {.Error, DBV_Prehistory, .E_NONE},
+	"e_type"    = {.Error, DBV_Prehistory, .E_TYPE},
+	"e_div"     = {.Error, DBV_Prehistory, .E_DIV},
+	"e_perm"    = {.Error, DBV_Prehistory, .E_PERM},
+	"e_propnf"  = {.Error, DBV_Prehistory, .E_PROPNF},
+	"e_verbnf"  = {.Error, DBV_Prehistory, .E_VERBNF},
+	"e_varnf"   = {.Error, DBV_Prehistory, .E_VARNF},
+	"e_invind"  = {.Error, DBV_Prehistory, .E_INVIND},
+	"e_recmove" = {.Error, DBV_Prehistory, .E_RECMOVE},
+	"e_maxrec"  = {.Error, DBV_Prehistory, .E_MAXREC},
+	"e_range"   = {.Error, DBV_Prehistory, .E_RANGE},
+	"e_args"    = {.Error, DBV_Prehistory, .E_ARGS},
+	"e_nacc"    = {.Error, DBV_Prehistory, .E_NACC},
+	"e_invarg"  = {.Error, DBV_Prehistory, .E_INVARG},
+	"e_quota"   = {.Error, DBV_Prehistory, .E_QUOTA},
+	"e_float"   = {.Error, DBV_Float, .E_FLOAT},
 }
 
 // DB_Version thresholds, duplicated from dbfile's (to avoid a compiler->dbfile package

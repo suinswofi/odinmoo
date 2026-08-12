@@ -19,10 +19,9 @@ package netio
 // server_new_connection()/do_login_task() do, which is what makes $login:welcome's
 // notify()-based banner appear without netio hardcoding any welcome text of its own. Each
 // subsequent line is word-split and re-dispatched the same way until a valid player object
-// comes back, at which point the connection is registered (see `players` below) and ordinary
-// command lines are evaluated as MOO expressions -- a REPL, not the original's full
-// preposition/verb-matching command parser (parse_command() in parse_cmd.c), which is a
-// materially larger, separate piece of work.
+// comes back, at which point the connection is registered (see `players` below) and every
+// ordinary command line runs through the real preposition/verb-matching command dispatch
+// (command.odin, porting parse_cmd.c/do_command_task()).
 //
 // server_stop() *does* wait for every connection thread to actually exit (see its own
 // comment) -- unlike the original, which lets already-open connections linger past shutdown.
@@ -62,8 +61,11 @@ Server :: struct {
 // tasks.scheduler_init/objdb.object_world_init), then spawns the accept loop on its own
 // thread. Returns immediately; the caller can read back the actual bound port via
 // net.bound_endpoint(s.listener).
-server_start :: proc(s: ^Server, port: int, scheduler: ^tasks.Scheduler, world: ^vm.World) -> net.Network_Error {
-	endpoint := net.Endpoint{address = net.IP4_Loopback, port = port}
+// bind_address defaults to all interfaces (the original's listener is a plain INADDR_ANY
+// bind -- a MOO is a network service, remote players connecting is the point); tests pass
+// net.IP4_Loopback explicitly to avoid poking a hole anywhere while running.
+server_start :: proc(s: ^Server, port: int, scheduler: ^tasks.Scheduler, world: ^vm.World, bind_address: net.Address = net.IP4_Any) -> net.Network_Error {
+	endpoint := net.Endpoint{address = bind_address, port = port}
 	listener := net.listen_tcp(endpoint) or_return
 	s.listener = listener
 	s.scheduler = scheduler

@@ -41,6 +41,11 @@ Activation :: struct {
 	// activ_stack[top_activ_stack-1].progr; see world_call_verb's `act.caller_programmer =
 	// ctx.activation.programmer`.
 
+	parent: ^Activation, // the CALLING activation (nil for a task's root), giving callers()
+	// the real frame chain to walk -- the explicit-pointer equivalent of the original's
+	// activ_stack array indexing. Only valid while the callee is executing (each Activation
+	// lives on its caller's native stack frame), which is exactly callers()'s window.
+
 	// The rest mirror execute.c's SLOT_DOBJ/SLOT_IOBJ/SLOT_DOBJSTR/SLOT_IOBJSTR/
 	// SLOT_PREPSTR/SLOT_ARGSTR environment slots -- the parsed-command context a typed
 	// command line produces. An ordinary nested verb call (call_verb2 in the original)
@@ -143,9 +148,16 @@ call_ok :: proc(v: values.Var) -> Call_Result {return Call_Result{value = v}}
 // don't have to wait on those later phases.
 World :: struct {
 	user_data:    rawptr,
-	get_prop:     proc(w: ^World, obj: values.Objid, name: string) -> Call_Result,
-	set_prop:     proc(w: ^World, obj: values.Objid, name: string, value: values.Var) -> Call_Result,
+	// get_prop/set_prop receive the Eval_Context so the implementation can enforce the
+	// original's property permission rules (execute.c's OP_GET_PROP/OP_PUT_PROP read
+	// RUN_ACTIV.progr) -- same reason call_verb/call_builtin already take it.
+	get_prop:     proc(w: ^World, obj: values.Objid, name: string, ctx: ^Eval_Context) -> Call_Result,
+	set_prop:     proc(w: ^World, obj: values.Objid, name: string, value: values.Var, ctx: ^Eval_Context) -> Call_Result,
 	call_verb:    proc(w: ^World, obj: values.Objid, name: string, args: values.Var, ctx: ^Eval_Context) -> Call_Result,
 	call_builtin: proc(w: ^World, name: string, is_known: bool, args: values.Var, ctx: ^Eval_Context) -> Call_Result,
-	do_fork:      proc(w: ^World, delay: values.Var, body: []compiler.Stmt, names: ^compiler.Name_Table, ctx: ^Eval_Context),
+	// var_id is the `fork ident (...)` variable slot, or -1 for a plain `fork (...)`: the
+	// implementation must bind the new task's id there in the CALLING activation's locals
+	// before snapshotting them, so both the parent and the forked task see it (tasks.c's
+	// enqueue_forked_task2 mutates the shared rt_env before copy_rt_env).
+	do_fork:      proc(w: ^World, delay: values.Var, body: []compiler.Stmt, names: ^compiler.Name_Table, var_id: int, ctx: ^Eval_Context),
 }

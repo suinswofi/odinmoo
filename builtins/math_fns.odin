@@ -105,6 +105,12 @@ math1 :: proc(args: values.Var, fn: proc(f64) -> f64) -> vm.Call_Result {
 		return arg_type_error()
 	}
 	d := fn(f)
+	// Ports numbers.c's MATH_FUNC error split: a domain error (errno == EDOM there; a NaN
+	// result here -- sqrt(-1.0), asin(2.0), log(-1.0)) is E_INVARG, while a range overflow
+	// (errno == ERANGE / !IS_REAL, e.g. exp(1000.0) or log(0.0)'s -inf) is E_FLOAT.
+	if d != d { // NaN
+		return raise_err(.E_INVARG, "Invalid argument")
+	}
 	if !(d >= -max(f64) && d <= max(f64)) {
 		return raise_err(.E_FLOAT, "Floating-point arithmetic error")
 	}

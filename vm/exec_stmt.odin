@@ -78,9 +78,27 @@ exec_stmt :: proc(ctx: ^Eval_Context, s: compiler.Stmt) -> Stmt_Result {
 		return exec_while(ctx, v)
 
 	case ^compiler.Stmt_Fork:
-		if ctx.world.do_fork != nil {
-			ctx.world.do_fork(ctx.world, values.int_val(0), v.body, nil, ctx)
+		// Ports OP_FORK/OP_FORK_WITH_ID (execute.c:1579-1604): the delay expression is
+		// evaluated NOW, must be a non-negative INT (E_TYPE / E_INVARG respectively), and the
+		// optional `fork ident (...)` variable is bound -- in both the parent and the forked
+		// task's snapshot -- by do_fork itself (tasks.c's enqueue_forked_task2 assigns the new
+		// task id into the shared rt_env before copying it).
+		delay_r := eval_expr(ctx, v.time)
+		if delay_r.raised {
+			return raised_from_expr(delay_r)
 		}
+		if delay_r.value.type != .Int {
+			values.free_var(delay_r.value)
+			return raised_stmt(.E_TYPE, "Type mismatch")
+		}
+		if delay_r.value.data.num < 0 {
+			values.free_var(delay_r.value)
+			return raised_stmt(.E_INVARG, "Invalid argument")
+		}
+		if ctx.world.do_fork != nil {
+			ctx.world.do_fork(ctx.world, delay_r.value, v.body, ctx.names, v.var_id, ctx)
+		}
+		values.free_var(delay_r.value)
 		return normal_result()
 
 	case ^compiler.Stmt_Expr:
@@ -149,7 +167,10 @@ exec_list_loop :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_List_Loop) -> Stmt_
 		if list_r.value.type == .List {
 			item = values.var_ref(values.list_get(list_r.value, i))
 		} else {
-			item = values.str_val(list_r.value.data.str.s[i - 1:i])
+			// str_val takes OWNERSHIP and free_var will delete() the string -- handing it
+			// a borrowed slice into the loop subject corrupts the heap (freeing an interior
+			// pointer, or the subject's own buffer for i == 1). Must clone.
+			item = values.str_val(strings.clone(list_r.value.data.str.s[i - 1:i]))
 		}
 		values.free_var(ctx.activation.locals[v.var_id])
 		ctx.activation.locals[v.var_id] = item

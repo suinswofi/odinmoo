@@ -321,11 +321,13 @@ bf_eval :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	act.player = ctx.activation.player
 	act.caller = ctx.activation.this
 	act.programmer = progr
+	act.caller_programmer = ctx.activation.programmer // caller_perms() inside eval'd code sees the eval() caller's perms
 	act.verb_loc = values.NOTHING
 	act.verb_name = "Input to EVAL"
 	act.debug = true
 	act.task_id = ctx.activation.task_id
 	act.depth = ctx.activation.depth + 1
+	act.parent = ctx.activation
 	defer vm.activation_destroy(&act)
 
 	// Bind the context locals (player/this/caller/verb/args/dobj/...) the same way

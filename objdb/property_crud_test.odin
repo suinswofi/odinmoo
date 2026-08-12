@@ -64,7 +64,7 @@ test_add_delete_clear_property_roundtrip :: proc(t: ^testing.T) {
 	// fixture) and now "score" too.
 	pargs := make([]values.Var, 1)
 	pargs[0] = values.obj_val(2)
-	presult := bf_properties(&ow, values.list_val(pargs))
+	presult := bf_properties(&ow, values.list_val(pargs), &ctx)
 	testing.expect(t, !presult.raised)
 	defer values.free_var(presult.value)
 	testing.expect(t, values.list_len(presult.value) == 2)

@@ -58,6 +58,8 @@ is_alpha :: proc(b: byte) -> bool {return (b >= 'a' && b <= 'z') || (b >= 'A' &&
 is_alnum :: proc(b: byte) -> bool {return is_alpha(b) || is_digit(b)}
 @(private = "file")
 is_space :: proc(b: byte) -> bool {return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\v' || b == '\f'}
+@(private = "file")
+lower :: proc(b: byte) -> byte {return b >= 'A' && b <= 'Z' ? b + 32 : b}
 
 @(private = "file")
 lex_error :: proc(l: ^Lexer, msg: string) {
@@ -328,11 +330,22 @@ lex_identifier_or_keyword :: proc(l: ^Lexer, line: int) -> Token {
 	}
 	text := l.src[start:l.pos]
 
-	if kw, found := keywords[text]; found && kw.version <= l.version {
-		if kw.kind == .Error {
-			return Token{kind = .Error, line = line, err_val = kw.err}
+	// Keyword lookup is CASE-INSENSITIVE, matching the original exactly: keywords.c's
+	// gperf-generated hash and comparison both tolower() every character, so `If`, `WHILE`,
+	// `e_perm`, and lowercase `any` are all keywords in real MOO source. (A previous version
+	// used a case-sensitive map lookup here, silently turning any non-canonically-cased
+	// keyword into an identifier.)
+	lower_buf: [16]byte // longest keyword is "endwhile"/"E_RECMOVE" (9 chars)
+	if len(text) <= len(lower_buf) {
+		for i in 0 ..< len(text) {
+			lower_buf[i] = lower(text[i])
 		}
-		return Token{kind = kw.kind, line = line}
+		if kw, found := keywords[string(lower_buf[:len(text)])]; found && kw.version <= l.version {
+			if kw.kind == .Error {
+				return Token{kind = .Error, line = line, err_val = kw.err}
+			}
+			return Token{kind = kw.kind, line = line}
+		}
 	}
 	return Token{kind = .Id, line = line, str_val = strings.clone(text)}
 }

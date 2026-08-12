@@ -15,7 +15,7 @@ import "core:time"
 
 // make_do_fork returns a vm.World-compatible do_fork hook bound to this scheduler. objdb's
 // Object_World wiring passes this in place of the nil stub from earlier phases.
-make_do_fork :: proc(s: ^Scheduler) -> proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^compiler.Name_Table, ctx: ^vm.Eval_Context) {
+make_do_fork :: proc(s: ^Scheduler) -> proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^compiler.Name_Table, var_id: int, ctx: ^vm.Eval_Context) {
 	scheduler_for_fork = s
 	return do_fork
 }
@@ -31,8 +31,8 @@ scheduler_for_fork: ^Scheduler
 Fork_Job :: struct {
 	s:          ^Scheduler,
 	w:          ^vm.World,
-	body:       []compiler.Stmt,
-	names:      ^compiler.Name_Table,
+	body:       []compiler.Stmt, // owned deep copy (see do_fork) -- freed by fork_thread_proc
+	names:      compiler.Name_Table, // owned copy, same lifetime story
 	locals:     []values.Var,
 	delay_secs: f64,
 	this:       values.Objid,
@@ -46,7 +46,7 @@ Fork_Job :: struct {
 }
 
 @(private = "file")
-do_fork :: proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^compiler.Name_Table, ctx: ^vm.Eval_Context) {
+do_fork :: proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^compiler.Name_Table, var_id: int, ctx: ^vm.Eval_Context) {
 	s := scheduler_for_fork
 	delay_secs := 0.0
 	#partial switch delay.type {
@@ -54,6 +54,15 @@ do_fork :: proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^
 		delay_secs = f64(delay.data.num)
 	case .Float:
 		delay_secs = delay.data.fnum
+	}
+
+	// `fork ident (...)`: bind the new task's id into the PARENT's environment first, so the
+	// snapshot below carries it into the forked task too -- exactly enqueue_forked_task2's
+	// order (assign into the shared rt_env, then copy_rt_env).
+	task_id := new_task_id(s)
+	if var_id >= 0 && var_id < len(ctx.activation.locals) {
+		values.free_var(ctx.activation.locals[var_id])
+		ctx.activation.locals[var_id] = values.int_val(i32(task_id))
 	}
 
 	// The forked task gets its OWN independent copy of the current variable bindings --
@@ -65,11 +74,17 @@ do_fork :: proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^
 		locals[i] = values.var_ref(v)
 	}
 
+	// Deep-copy the fork body and name table: the original refcounts the enclosing Program
+	// (enqueue_forked_task2's program_ref()) so a queued fork survives whatever happens to
+	// the code that spawned it -- set_verb_code() swapping the verb out from under it,
+	// eval()'s program being freed when eval() returns. This port's ASTs aren't refcounted,
+	// so the fork takes its own copy instead; without this, the fork thread would race the
+	// AST owner's teardown and run freed memory.
 	job := Fork_Job{
 		s          = s,
 		w          = w,
-		body       = body,
-		names      = names,
+		body       = compiler.clone_stmts(body),
+		names      = names != nil ? compiler.name_table_clone(names) : compiler.Name_Table{},
 		locals     = locals,
 		delay_secs = delay_secs,
 		this       = ctx.activation.this,
@@ -79,7 +94,7 @@ do_fork :: proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^
 		verb_loc   = ctx.activation.verb_loc,
 		verb_name  = ctx.activation.verb_name,
 		debug      = ctx.activation.debug,
-		task_id    = new_task_id(s),
+		task_id    = task_id,
 	}
 
 	sync.wait_group_add(&s.active_forks, 1)
@@ -103,6 +118,8 @@ fork_thread_proc :: proc(data: rawptr) {
 	job := (^Fork_Job)(data)
 	defer free(job)
 	defer sync.wait_group_done(&job.s.active_forks)
+	defer compiler.free_stmts(job.body)
+	defer compiler.name_table_destroy(&job.names)
 	// This thread exists only to run one forked task, so reclaim its scratch arena on the way
 	// out -- context.temp_allocator is per-thread and only ever reclaimed explicitly, so
 	// without this every forked task would leave its scratch memory behind for good.
@@ -128,7 +145,7 @@ fork_thread_proc :: proc(data: rawptr) {
 	}
 	defer vm.activation_destroy(&act)
 
-	r := vm.run(job.body, job.names, job.w, &act)
+	r := vm.run(job.body, &job.names, job.w, &act)
 	switch r.signal {
 	case .Return:
 		values.free_var(r.value)

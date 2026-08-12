@@ -42,7 +42,7 @@ scheduler_builtin :: proc(s: ^Scheduler, name: string, args: values.Var, ctx: ^v
 @(private = "file")
 bf_suspend :: proc(s: ^Scheduler, args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	n := values.list_len(args)
-	seconds := -1.0
+	seconds := -1.0 // no argument = wait forever for an explicit resume()
 	if n >= 1 {
 		v := values.list_get(args, 1)
 		#partial switch v.type {
@@ -53,6 +53,12 @@ bf_suspend :: proc(s: ^Scheduler, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 		case:
 			values.free_var(args)
 			return raise_err(.E_TYPE, "Type mismatch")
+		}
+		// An EXPLICIT negative delay is E_INVARG (bf_suspend's `seconds < 0` check in the
+		// original) -- only the no-argument form means "forever".
+		if seconds < 0 {
+			values.free_var(args)
+			return raise_err(.E_INVARG, "Invalid argument")
 		}
 	}
 	values.free_var(args)

@@ -11,6 +11,7 @@ import "../dbfile"
 import "../tasks"
 import "../values"
 import "../vm"
+import "core:fmt"
 import "core:strings"
 
 // Connection_Hooks is how notify()/connection_name()/boot_player() reach an actual network
@@ -73,7 +74,7 @@ object_world_destroy :: proc(w: ^Object_World) {
 }
 
 make_world :: proc(w: ^Object_World) -> vm.World {
-	do_fork: proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^compiler.Name_Table, ctx: ^vm.Eval_Context)
+	do_fork: proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^compiler.Name_Table, var_id: int, ctx: ^vm.Eval_Context)
 	if w.scheduler != nil {
 		do_fork = tasks.make_do_fork(w.scheduler)
 	}
@@ -93,7 +94,7 @@ err_result :: proc(code: values.Error, msg: string) -> vm.Call_Result {
 }
 
 @(private = "file")
-world_get_prop :: proc(vw: ^vm.World, obj: values.Objid, name: string) -> vm.Call_Result {
+world_get_prop :: proc(vw: ^vm.World, obj: values.Objid, name: string, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	w := (^Object_World)(vw.user_data)
 	if !valid(w.db, obj) {
 		return err_result(.E_INVIND, "Invalid indirection")
@@ -102,18 +103,32 @@ world_get_prop :: proc(vw: ^vm.World, obj: values.Objid, name: string) -> vm.Cal
 	if !h.found {
 		return err_result(.E_PROPNF, "Property not found")
 	}
-	// Permission checks need a `programmer` identity, which isn't threaded through the
-	// vm.World interface yet (Eval_Context has the Activation, not exposed here) --
-	// deferred until Phase 5/6 wire real task/permission context through. For now every
-	// read succeeds, matching a wizard-level caller.
-	//
+	// Ports OP_GET_PROP's permission check (execute.c:1443-1446): built-in pseudo-properties
+	// are always readable (bi_prop_protected() only bites when $server_options.protect_* is
+	// set, which this port -- like a stock LambdaCore -- never has), regular properties need
+	// PF_READ / ownership / wizardliness.
+	if h.builtin == .None && !prop_allows(w.db, h.value_perms, h.value_owner, ctx.activation.programmer, .Read) {
+		return err_result(.E_PERM, "Permission denied")
+	}
 	// property_value already returns an owned value (see its own comment) -- no extra
 	// var_ref here.
 	return vm.call_ok(property_value(w.db, obj, h))
 }
 
+// world_set_prop ports OP_PUT_PROP (execute.c:1483-1577), including the per-built-in-property
+// permission/type matrix, verbatim:
+//   regular property        PF_WRITE / owner / wizard, else E_PERM
+//   .name                   E_TYPE unless STR; wizards always; owners only for NON-player
+//                           objects (renaming a player is a wizard-only act)
+//   .owner                  E_TYPE unless OBJ; wizard-only
+//   .programmer, .wizard    wizard-only (wizard-bit changes are logged: "WIZARDED:")
+//   .r/.w/.f                owner or wizard
+//   .location, .contents    E_PERM always (they change via move(), never plain assignment)
+// (An earlier version skipped ALL of this -- every read and write succeeded "matching a
+// wizard-level caller", which let any code set .wizard on anything. That was a placeholder
+// from before Eval_Context was threaded through, not a documented scope cut.)
 @(private = "file")
-world_set_prop :: proc(vw: ^vm.World, obj: values.Objid, name: string, value: values.Var) -> vm.Call_Result {
+world_set_prop :: proc(vw: ^vm.World, obj: values.Objid, name: string, value: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	w := (^Object_World)(vw.user_data)
 	if !valid(w.db, obj) {
 		values.free_var(value)
@@ -124,11 +139,53 @@ world_set_prop :: proc(vw: ^vm.World, obj: values.Objid, name: string, value: va
 		values.free_var(value)
 		return err_result(.E_PROPNF, "Property not found")
 	}
-	// set_property_value silently no-ops on a read-only built-in (location/contents/etc)
-	// and otherwise consumes `value` (storing it for a regular property, or extracting a
-	// scalar/string and freeing the wrapper for a writable built-in like .name/.wizard --
-	// see its own comment). Take our own reference for the return value BEFORE calling it,
-	// since by the time it returns `value` may already be gone.
+	progr := ctx.activation.programmer
+	owner := w.db.objects[obj].owner
+	err := values.Error.E_NONE
+	switch h.builtin {
+	case .None:
+		if !prop_allows(w.db, h.value_perms, h.value_owner, progr, .Write) {
+			err = .E_PERM
+		}
+	case .Name:
+		if value.type != .Str {
+			err = .E_TYPE
+		} else if !is_wizard(w.db, progr) && (is_user(w.db, obj) || progr != owner) {
+			err = .E_PERM
+		}
+	case .Owner:
+		if value.type != .Obj {
+			err = .E_TYPE
+		} else if !is_wizard(w.db, progr) {
+			err = .E_PERM
+		}
+	case .Programmer:
+		if !is_wizard(w.db, progr) {
+			err = .E_PERM
+		}
+	case .Wizard:
+		if !is_wizard(w.db, progr) {
+			err = .E_PERM
+		} else if values.is_true(value) != is_wizard(w.db, obj) {
+			// Notify only on changes in state, matching the original's oklog().
+			fmt.printfln("%sWIZARDED: #%d by programmer #%d",
+				is_wizard(w.db, obj) ? "DE" : "", obj, progr)
+		}
+	case .R, .W, .F:
+		if !is_wizard(w.db, progr) && progr != owner {
+			err = .E_PERM
+		}
+	case .Location, .Contents:
+		err = .E_PERM
+	}
+	if err != .E_NONE {
+		values.free_var(value)
+		msg := err == .E_TYPE ? "Type mismatch" : "Permission denied"
+		return err_result(err, msg)
+	}
+	// set_property_value consumes `value` (storing it for a regular property, or extracting a
+	// scalar/string and freeing the wrapper for a built-in like .name/.wizard). Take our own
+	// reference for the return value BEFORE calling it.
 	result_ref := values.var_ref(value)
 	set_property_value(w.db, obj, h, value)
 	return vm.call_ok(result_ref)
@@ -211,6 +268,7 @@ call_verb_from :: proc(w: ^Object_World, vw: ^vm.World, this_obj, search_from: v
 	act.caller_programmer = ctx.activation.programmer
 	act.task_id = ctx.activation.task_id
 	act.depth = ctx.activation.depth + 1
+	act.parent = ctx.activation
 	act.verb_loc = vh.definer
 	// The DISPATCH name (`name`, e.g. "find_only" -- what the caller actually wrote), not
 	// vd.name (the verbdef's full alias-list string, e.g. "find* _only* _every*"). This is

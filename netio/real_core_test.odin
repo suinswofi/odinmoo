@@ -36,7 +36,7 @@ test_real_lambdacore_login :: proc(t: ^testing.T) {
 
 	s: Server
 	wire_connection_hooks(&ow, &s)
-	err := server_start(&s, 0, &sched, &world)
+	err := server_start(&s, 0, &sched, &world, net.IP4_Loopback)
 	testing.expectf(t, err == nil, "server_start: %v", err)
 	defer server_stop(&s)
 

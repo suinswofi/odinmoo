@@ -58,7 +58,11 @@ build_login_db :: proc() -> dbfile.Database {
 	db.version = dbfile.Current_DB_Version
 
 	sysobj := mkobj(&db, 0, values.NOTHING, 0, "System Object")
-	add_verb(&db, sysobj, "do_login_command", 0, int(1 << uint(objdb.Verb_Flag.Exec)), `
+	// Owned by #1 (the wizard below), like the real core's wizard-owned $login verbs: the
+	// verb's owner is the `programmer` its notify() calls run as, and notify() correctly
+	// requires wizard-or-self -- a #0-owned (non-wizard) login verb couldn't greet an
+	// unauthenticated (negative-id) connection at all.
+	add_verb(&db, sysobj, "do_login_command", 1, int(1 << uint(objdb.Verb_Flag.Exec)), `
 		if (callers())
 			return E_PERM;
 		endif
@@ -167,7 +171,7 @@ test_telnet_style_session_evaluates_moo_expressions :: proc(t: ^testing.T) {
 
 	s: Server
 	wire_connection_hooks(&ow, &s)
-	err := server_start(&s, 0, &sched, &world)
+	err := server_start(&s, 0, &sched, &world, net.IP4_Loopback)
 	testing.expectf(t, err == nil, "server_start: %v", err)
 	defer server_stop(&s)
 
@@ -215,7 +219,7 @@ test_ansi_color_default_on_and_toggle :: proc(t: ^testing.T) {
 
 	s: Server
 	wire_connection_hooks(&ow, &s)
-	err := server_start(&s, 0, &sched, &world)
+	err := server_start(&s, 0, &sched, &world, net.IP4_Loopback)
 	testing.expectf(t, err == nil, "server_start: %v", err)
 	defer server_stop(&s)
 
@@ -268,7 +272,7 @@ test_multiple_concurrent_connections :: proc(t: ^testing.T) {
 
 	s: Server
 	wire_connection_hooks(&ow, &s)
-	err := server_start(&s, 0, &sched, &world)
+	err := server_start(&s, 0, &sched, &world, net.IP4_Loopback)
 	testing.expectf(t, err == nil, "server_start: %v", err)
 	defer server_stop(&s)
 
@@ -313,7 +317,7 @@ test_server_stop_closes_listener :: proc(t: ^testing.T) {
 	world := objdb.make_world(&ow)
 
 	s: Server
-	err := server_start(&s, 0, &sched, &world)
+	err := server_start(&s, 0, &sched, &world, net.IP4_Loopback)
 	testing.expectf(t, err == nil, "server_start: %v", err)
 
 	endpoint, _ := net.bound_endpoint(s.listener)
@@ -339,7 +343,7 @@ test_program_intrinsic_command_edits_a_real_verb :: proc(t: ^testing.T) {
 
 	s: Server
 	wire_connection_hooks(&ow, &s)
-	err := server_start(&s, 0, &sched, &world)
+	err := server_start(&s, 0, &sched, &world, net.IP4_Loopback)
 	testing.expectf(t, err == nil, "server_start: %v", err)
 	defer server_stop(&s)
 
@@ -405,7 +409,7 @@ test_prefix_suffix_wrap_command_output :: proc(t: ^testing.T) {
 
 	s: Server
 	wire_connection_hooks(&ow, &s)
-	err := server_start(&s, 0, &sched, &world)
+	err := server_start(&s, 0, &sched, &world, net.IP4_Loopback)
 	testing.expectf(t, err == nil, "server_start: %v", err)
 	defer server_stop(&s)
 
@@ -466,7 +470,7 @@ test_force_input_drains_after_hold_cleared :: proc(t: ^testing.T) {
 
 	s: Server
 	wire_connection_hooks(&ow, &s)
-	err := server_start(&s, 0, &sched, &world)
+	err := server_start(&s, 0, &sched, &world, net.IP4_Loopback)
 	testing.expectf(t, err == nil, "server_start: %v", err)
 	defer server_stop(&s)
 

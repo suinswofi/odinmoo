@@ -68,7 +68,7 @@ mock_define_verb :: proc(m: ^Mock_World, obj: values.Objid, name: string, src: s
 }
 
 @(private = "file")
-world_get_prop :: proc(w: ^World, obj: values.Objid, name: string) -> Call_Result {
+world_get_prop :: proc(w: ^World, obj: values.Objid, name: string, ctx: ^Eval_Context) -> Call_Result {
 	m := (^Mock_World)(w.user_data)
 	props, ok := m.props[obj]
 	if !ok {
@@ -82,7 +82,7 @@ world_get_prop :: proc(w: ^World, obj: values.Objid, name: string) -> Call_Resul
 }
 
 @(private = "file")
-world_set_prop :: proc(w: ^World, obj: values.Objid, name: string, value: values.Var) -> Call_Result {
+world_set_prop :: proc(w: ^World, obj: values.Objid, name: string, value: values.Var, ctx: ^Eval_Context) -> Call_Result {
 	m := (^Mock_World)(w.user_data)
 	mock_set_prop(m, obj, name, value)
 	return call_ok(values.var_ref(value))

@@ -149,7 +149,7 @@ eval_prop_get :: proc(ctx: ^Eval_Context, obj_e, prop_e: compiler.Expr) -> Expr_
 	if obj_r.value.type != .Obj || prop_r.value.type != .Str {
 		return raise_or_value(ctx, .E_TYPE)
 	}
-	return call_to_expr(ctx.world.get_prop(ctx.world, obj_r.value.data.obj, prop_r.value.data.str.s))
+	return call_to_expr(ctx.world.get_prop(ctx.world, obj_r.value.data.obj, prop_r.value.data.str.s, ctx))
 }
 
 @(private = "file")

@@ -32,21 +32,21 @@ object_builtin :: proc(w: ^Object_World, name: string, args: values.Var, ctx: ^v
 	case "caller_perms":
 		return bf_caller_perms(args, ctx), true
 	case "notify":
-		return bf_notify(w, args), true
+		return bf_notify(w, args, ctx), true
 	case "notify_raw":
 		return bf_notify_raw(w, args, ctx), true
 	case "connection_name":
-		return bf_connection_name(w, args), true
+		return bf_connection_name(w, args, ctx), true
 	case "boot_player":
-		return bf_boot_player(w, args), true
+		return bf_boot_player(w, args, ctx), true
 	case "idle_seconds":
 		return bf_idle_seconds(w, args), true
 	case "verbs":
-		return bf_verbs(w, args), true
+		return bf_verbs(w, args, ctx), true
 	case "verb_args":
-		return bf_verb_args(w, args), true
+		return bf_verb_args(w, args, ctx), true
 	case "verb_info":
-		return bf_verb_info(w, args), true
+		return bf_verb_info(w, args, ctx), true
 	case "is_clear_property":
 		return bf_is_clear_property(w, args), true
 	case "pass":
@@ -76,7 +76,7 @@ object_builtin :: proc(w: ^Object_World, name: string, args: values.Var, ctx: ^v
 	case "max_object":
 		return bf_max_object(w, args), true
 	case "properties":
-		return bf_properties(w, args), true
+		return bf_properties(w, args, ctx), true
 	case "property_info":
 		return bf_property_info(w, args, ctx), true
 	case "set_property_info":
@@ -245,33 +245,36 @@ bf_server_version :: proc(args: values.Var) -> vm.Call_Result {
 	return ok_result(values.str_val(strings.clone("1.8.0+odin")))
 }
 
-// bf_callers ports callers(): true per-frame call-stack introspection would need this port
-// to maintain an explicit stack of caller identities (it currently only tracks a depth
-// counter -- see vm/activation.odin's Activation.depth comment). This returns a list of
-// `depth` entries shaped like the real thing ({this, verb-name, programmer, verb-loc,
-// player, line}), but every entry describes the CURRENT activation, not each actual
-// ancestor frame -- an honest approximation, good enough for the overwhelmingly common uses
-// (truthiness/length checks, e.g. #0:do_login_command's `if (callers()) return E_PERM;`
-// guard, which only cares whether the list is empty), not a promise of exact frame data.
+// bf_callers ports execute.c's bf_callers()/callers() over the REAL frame chain: each
+// Activation now records its caller (vm.Activation.parent), so every entry describes the
+// actual ancestor frame -- {this, verb-name, programmer, verb-loc, player}, most recent
+// caller first, down to the task's root verb; a 6th line-number element is appended only
+// when the include-line-numbers argument is truthy, matching the original's shape exactly
+// (though the number itself is always 0 here: a tree-walking VM has no PC to report).
+// Synthetic server-root activations (depth < 0 -- the netio dispatch scaffolding, not a MOO
+// verb) are excluded, exactly as the original's activ_stack never contains them at all.
 @(private = "file")
 bf_callers :: proc(args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	defer values.free_var(args)
 	if values.list_len(args) > 1 {
 		return err_result_local(.E_ARGS, "Incorrect number of arguments")
 	}
-	depth := ctx.activation.depth
-	items := make([]values.Var, depth)
-	for i in 0 ..< depth {
-		frame := make([]values.Var, 6)
-		frame[0] = values.obj_val(ctx.activation.this)
-		frame[1] = values.str_val(strings.clone(ctx.activation.verb_name))
-		frame[2] = values.obj_val(ctx.activation.programmer)
-		frame[3] = values.obj_val(ctx.activation.verb_loc)
-		frame[4] = values.obj_val(ctx.activation.player)
-		frame[5] = values.int_val(0) // line number: not tracked (tree-walking VM, no PC)
-		items[i] = values.list_val(frame)
+	include_lines := values.list_len(args) == 1 && values.is_true(values.list_get(args, 1))
+	items: [dynamic]values.Var
+	for a := ctx.activation.parent; a != nil && a.depth >= 0; a = a.parent {
+		nfields := include_lines ? 6 : 5
+		frame := make([]values.Var, nfields)
+		frame[0] = values.obj_val(a.this)
+		frame[1] = values.str_val(strings.clone(a.verb_name))
+		frame[2] = values.obj_val(a.programmer)
+		frame[3] = values.obj_val(a.verb_loc)
+		frame[4] = values.obj_val(a.player)
+		if include_lines {
+			frame[5] = values.int_val(0) // line number: not tracked (tree-walking VM, no PC)
+		}
+		append(&items, values.list_val(frame))
 	}
-	return ok_result(values.list_val(items))
+	return ok_result(values.list_val(items[:]))
 }
 
 // bf_caller_perms ports execute.c's bf_caller_perms(): the programmer of the CALLING
@@ -286,16 +289,24 @@ bf_caller_perms :: proc(args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Resu
 	return ok_result(values.obj_val(ctx.activation.caller_programmer))
 }
 
+// bf_notify ports server.c's bf_notify(): wizard-or-self only (E_PERM otherwise), with the
+// optional third no-flush argument accepted for compatibility (inert here -- this port has no
+// output-buffer flushing for it to bypass).
 @(private = "file")
-bf_notify :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
+bf_notify :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	defer values.free_var(args)
-	if values.list_len(args) != 2 {
+	n := values.list_len(args)
+	if n < 2 || n > 3 {
 		return err_result_local(.E_ARGS, "Incorrect number of arguments")
 	}
 	player := values.list_get(args, 1)
 	text := values.list_get(args, 2)
 	if player.type != .Obj || text.type != .Str {
 		return err_result_local(.E_TYPE, "Type mismatch")
+	}
+	progr := ctx.activation.programmer
+	if !is_wizard(w.db, progr) && progr != player.data.obj {
+		return err_result_local(.E_PERM, "Permission denied")
 	}
 	if w.conn.notify != nil {
 		w.conn.notify(w.conn.user_data, player.data.obj, text.data.str.s)
@@ -329,7 +340,7 @@ bf_notify_raw :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context)
 }
 
 @(private = "file")
-bf_connection_name :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
+bf_connection_name :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	defer values.free_var(args)
 	if values.list_len(args) != 1 {
 		return err_result_local(.E_ARGS, "Incorrect number of arguments")
@@ -337,6 +348,11 @@ bf_connection_name :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result
 	v := values.list_get(args, 1)
 	if v.type != .Obj {
 		return err_result_local(.E_TYPE, "Type mismatch")
+	}
+	// Wizard-or-self, ports server.c's bf_connection_name().
+	progr := ctx.activation.programmer
+	if !is_wizard(w.db, progr) && progr != v.data.obj {
+		return err_result_local(.E_PERM, "Permission denied")
 	}
 	if w.conn.connection_name == nil {
 		return err_result_local(.E_INVARG, "Not a connected player")
@@ -349,7 +365,7 @@ bf_connection_name :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result
 }
 
 @(private = "file")
-bf_boot_player :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
+bf_boot_player :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	defer values.free_var(args)
 	if values.list_len(args) != 1 {
 		return err_result_local(.E_ARGS, "Incorrect number of arguments")
@@ -357,6 +373,11 @@ bf_boot_player :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 	v := values.list_get(args, 1)
 	if v.type != .Obj {
 		return err_result_local(.E_TYPE, "Type mismatch")
+	}
+	// Wizard-or-self, ports server.c's bf_boot_player().
+	progr := ctx.activation.programmer
+	if !is_wizard(w.db, progr) && progr != v.data.obj {
+		return err_result_local(.E_PERM, "Permission denied")
 	}
 	if w.conn.boot_player != nil {
 		w.conn.boot_player(w.conn.user_data, v.data.obj)
@@ -476,7 +497,7 @@ prep_name :: proc(prep: int) -> string {
 // bf_verbs ports verbs(object): the raw verbdef.name strings (as stored, e.g. "l*ook" or
 // "wel*come @wel*come") for every verb defined DIRECTLY on `object` -- no inheritance.
 @(private = "file")
-bf_verbs :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
+bf_verbs :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	defer values.free_var(args)
 	if values.list_len(args) != 1 {
 		return err_result_local(.E_ARGS, "Incorrect number of arguments")
@@ -489,6 +510,10 @@ bf_verbs :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 	if !ok {
 		return err_result_local(.E_INVARG, "Invalid argument")
 	}
+	// Ports verbs.c's bf_verbs(): reading the verb list needs the object readable-by-progr.
+	if !object_allows(w.db, v.data.obj, ctx.activation.programmer, .Read) {
+		return err_result_local(.E_PERM, "Permission denied")
+	}
 	items := make([]values.Var, len(obj.verbdefs))
 	for vd, i in obj.verbdefs {
 		items[i] = values.str_val(strings.clone(vd.name))
@@ -500,7 +525,7 @@ bf_verbs :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 // string -- decoded from perms' packed DOBJSHIFT/IOBJSHIFT bit fields and the prep field,
 // exactly as db_verb_arg_specs() does.
 @(private = "file")
-bf_verb_args :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
+bf_verb_args :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	defer values.free_var(args)
 	if values.list_len(args) != 2 {
 		return err_result_local(.E_ARGS, "Incorrect number of arguments")
@@ -514,6 +539,10 @@ bf_verb_args :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 		return err_result_local(.E_VERBNF, "Verb not found")
 	}
 	vd := w.db.objects[vh.definer].verbdefs[vh.index]
+	// Ports verbs.c's bf_verb_args(): needs VF_READ on the verb.
+	if !verb_allows(w.db, vd.perms, vd.owner, ctx.activation.programmer, .Read) {
+		return err_result_local(.E_PERM, "Permission denied")
+	}
 	dobj := (vd.perms >> 4) & 0x3
 	iobj := (vd.perms >> 6) & 0x3
 	items := make([]values.Var, 3)
@@ -525,7 +554,7 @@ bf_verb_args :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 
 // bf_verb_info ports verb_info(object, verb-desc): {owner, perms-letters, verb-names}. Not
 // file-private: verb_crud_test.odin exercises it directly too.
-bf_verb_info :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
+bf_verb_info :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	defer values.free_var(args)
 	if values.list_len(args) != 2 {
 		return err_result_local(.E_ARGS, "Incorrect number of arguments")
@@ -539,6 +568,10 @@ bf_verb_info :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 		return err_result_local(.E_VERBNF, "Verb not found")
 	}
 	vd := w.db.objects[vh.definer].verbdefs[vh.index]
+	// Ports verbs.c's bf_verb_info(): needs VF_READ on the verb.
+	if !verb_allows(w.db, vd.perms, vd.owner, ctx.activation.programmer, .Read) {
+		return err_result_local(.E_PERM, "Permission denied")
+	}
 	perms := strings.builder_make()
 	if (vd.perms & (1 << uint(Verb_Flag.Read))) != 0 {
 		strings.write_byte(&perms, 'r')
