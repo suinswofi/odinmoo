@@ -1,4 +1,4 @@
-# moo-odin
+# Odin Multi-User Dungeon Object-Oriented (ODINMOO)
 
 A from-scratch rewrite of the [LambdaMOO](https://en.wikipedia.org/wiki/LambdaMOO) server — the
 1990s-era C virtual machine, object database, MOO-language compiler, and network server
