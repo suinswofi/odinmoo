@@ -17,7 +17,7 @@ import "core:strings"
 import "core:testing"
 
 @(private = "file")
-LAMBDACORE_PATH :: "/home/consty/LambdaMOO/LambdaCore.db"
+LAMBDACORE_PATH :: "LambdaCore.db"
 
 @(test)
 test_real_lambdacore_login :: proc(t: ^testing.T) {

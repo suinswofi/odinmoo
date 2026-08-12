@@ -7,7 +7,7 @@ import "core:os"
 import "core:strconv"
 
 main :: proc() {
-	db, lerr := dbfile.load_database("/home/consty/LambdaMOO/LambdaCore.db")
+	db, lerr := dbfile.load_database("LambdaCore.db")
 	defer dbfile.database_destroy(&db)
 	if lerr.stage != "" {
 		fmt.eprintln("load failed:", lerr)

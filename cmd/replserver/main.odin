@@ -12,7 +12,7 @@ import "core:net"
 import "core:os"
 
 main :: proc() {
-	path := len(os.args) > 1 ? os.args[1] : "/home/consty/LambdaMOO/LambdaCore.db"
+	path := len(os.args) > 1 ? os.args[1] : "LambdaCore.db"
 	port := 7777
 
 	fmt.printfln("Loading %s ...", path)

@@ -11,7 +11,7 @@ import "core:testing"
 
 @(test)
 test_save_and_reload_lambdacore_db :: proc(t: ^testing.T) {
-	db1, lerr1 := load_database("/home/consty/LambdaMOO/LambdaCore.db")
+	db1, lerr1 := load_database("LambdaCore.db")
 	defer database_destroy(&db1)
 	testing.expect(t, lerr1.stage == "")
 

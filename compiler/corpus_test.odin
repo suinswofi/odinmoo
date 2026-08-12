@@ -11,7 +11,7 @@ import "core:testing"
 
 @(test)
 test_corpus_all_lambdacore_verbs_parse :: proc(t: ^testing.T) {
-	db, lerr := dbfile.load_database("/home/consty/LambdaMOO/LambdaCore.db")
+	db, lerr := dbfile.load_database("LambdaCore.db")
 	defer dbfile.database_destroy(&db)
 	testing.expect(t, lerr.stage == "")
 

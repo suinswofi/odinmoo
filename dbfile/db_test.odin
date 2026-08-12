@@ -9,7 +9,7 @@ import "core:testing"
 
 @(test)
 test_load_lambdacore_db :: proc(t: ^testing.T) {
-	db, lerr := load_database("/home/consty/LambdaMOO/LambdaCore.db")
+	db, lerr := load_database("LambdaCore.db")
 	defer database_destroy(&db)
 
 	testing.expect(t, lerr.stage == "", lerr.stage)
