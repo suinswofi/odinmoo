@@ -103,6 +103,10 @@ fork_thread_proc :: proc(data: rawptr) {
 	job := (^Fork_Job)(data)
 	defer free(job)
 	defer sync.wait_group_done(&job.s.active_forks)
+	// This thread exists only to run one forked task, so reclaim its scratch arena on the way
+	// out -- context.temp_allocator is per-thread and only ever reclaimed explicitly, so
+	// without this every forked task would leave its scratch memory behind for good.
+	defer free_all(context.temp_allocator)
 
 	if job.delay_secs > 0 {
 		time.sleep(time.Duration(job.delay_secs * f64(time.Second)))

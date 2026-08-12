@@ -1,5 +1,6 @@
 package objdb
 
+import "../dbfile"
 import "../tasks"
 import "../values"
 import "../vm"
@@ -161,4 +162,133 @@ test_add_property_rejects_duplicate_and_permission :: proc(t: ^testing.T) {
 		delete(presult.msg)
 		values.free_var(presult.rvalue)
 	}
+}
+
+// add_prop is a small helper for the layout tests below: add_property(oid, name, value,
+// {#1, "rw"}) as a wizard, asserting it succeeded.
+@(private = "file")
+add_prop :: proc(t: ^testing.T, ow: ^Object_World, ctx: ^vm.Eval_Context, oid: values.Objid, name: string, value: values.Var) {
+	args := make([]values.Var, 4)
+	args[0] = values.obj_val(oid)
+	args[1] = values.str_val(strings.clone(name))
+	args[2] = value
+	info := make([]values.Var, 2)
+	info[0] = values.obj_val(1)
+	info[1] = values.str_val(strings.clone("rw"))
+	args[3] = values.list_val(info)
+	r := bf_add_property(ow, values.list_val(args), ctx)
+	testing.expectf(t, !r.raised, "add_property(%q) raised: %v %s", name, r.code, r.msg)
+	if r.raised {
+		delete(r.msg)
+		values.free_var(r.rvalue)
+	} else {
+		values.free_var(r.value)
+	}
+}
+
+@(private = "file")
+delete_prop :: proc(t: ^testing.T, ow: ^Object_World, ctx: ^vm.Eval_Context, oid: values.Objid, name: string) {
+	args := make([]values.Var, 2)
+	args[0] = values.obj_val(oid)
+	args[1] = values.str_val(strings.clone(name))
+	r := bf_delete_property(ow, values.list_val(args), ctx)
+	testing.expectf(t, !r.raised, "delete_property(%q) raised: %v %s", name, r.code, r.msg)
+	if r.raised {
+		delete(r.msg)
+		values.free_var(r.rvalue)
+	} else {
+		values.free_var(r.value)
+	}
+}
+
+// expect_prop asserts a property resolves to a specific int, naming it in the failure so a
+// shifted-value bug reports which property landed on the wrong slot.
+@(private = "file")
+expect_prop_int :: proc(t: ^testing.T, db: ^dbfile.Database, oid: values.Objid, name: string, want: i32) {
+	h := find_property(db, oid, name)
+	if !testing.expectf(t, h.found, "property %q not found on #%d", name, oid) {
+		return
+	}
+	v := property_value(db, oid, h)
+	defer values.free_var(v)
+	testing.expectf(t, v.type == .Int && v.data.num == want, "%q on #%d: wanted %d, got %v", name, oid, want, v)
+}
+
+// test_delete_property_keeps_remaining_values_aligned regression-tests propval/propdef index
+// alignment across a delete. Removing a propdef shifts every LATER property's slot index down
+// by one; the resync that follows has to re-pair values with the propdefs they actually belong
+// to, using the layout as it was BEFORE the removal. Getting that wrong silently shifts every
+// subsequent property's value down one slot (and orphans the last one), which is invisible
+// until someone reads a property and gets its neighbour's value.
+@(test)
+test_delete_property_keeps_remaining_values_aligned :: proc(t: ^testing.T) {
+	db := build_crud_world()
+	defer crud_world_destroy(&db)
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := object_world_init(&db, &sched)
+	defer object_world_destroy(&ow)
+	world := make_world(&ow)
+	act := crud_root_activation(1)
+	ctx := vm.Eval_Context{activation = &act, world = &world}
+
+	// #2 already defines "greeting"; append three more so there are slots after the one we
+	// delete (deleting the LAST propdef would pass even with a broken resync). "c" gets a
+	// STRING value on purpose: a resync that drops the trailing slot instead of freeing it
+	// leaks, which the test allocator then reports -- an int there would hide that.
+	add_prop(t, &ow, &ctx, 2, "a", values.int_val(101))
+	add_prop(t, &ow, &ctx, 2, "b", values.int_val(102))
+	add_prop(t, &ow, &ctx, 2, "c", values.str_val(strings.clone("cee")))
+
+	delete_prop(t, &ow, &ctx, 2, "a")
+
+	expect_prop_int(t, &db, 2, "b", 102)
+	ch := find_property(&db, 2, "c")
+	testing.expect(t, ch.found)
+	cv := property_value(&db, 2, ch)
+	defer values.free_var(cv)
+	testing.expectf(t, cv.type == .Str && cv.data.str.s == "cee", `"c" on #2: wanted "cee", got %v`, cv)
+	h := find_property(&db, 2, "greeting")
+	testing.expect(t, h.found)
+	gv := property_value(&db, 2, h)
+	defer values.free_var(gv)
+	testing.expect(t, gv.type == .Str && gv.data.str.s == "hi")
+	testing.expect(t, !find_property(&db, 2, "a").found)
+}
+
+// test_delete_inherited_property_realigns_descendants is the same alignment check one level
+// down: a descendant's propvals array covers its ancestors' propdefs too, so a delete on the
+// PARENT has to realign every child's array as well.
+@(test)
+test_delete_inherited_property_realigns_descendants :: proc(t: ^testing.T) {
+	db := build_crud_world()
+	defer crud_world_destroy(&db)
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := object_world_init(&db, &sched)
+	defer object_world_destroy(&ow)
+	world := make_world(&ow)
+	act := crud_root_activation(1)
+	ctx := vm.Eval_Context{activation = &act, world = &world}
+
+	add_prop(t, &ow, &ctx, 2, "pa", values.int_val(201))
+	add_prop(t, &ow, &ctx, 2, "pb", values.int_val(202))
+
+	// A child of #2 that overrides pb with its own value, so the check below distinguishes
+	// "read the right slot" from "fell through to the parent and happened to agree".
+	cargs := make([]values.Var, 1)
+	cargs[0] = values.obj_val(2)
+	cresult := bf_create(&ow, values.list_val(cargs), &ctx)
+	testing.expect(t, !cresult.raised)
+	child := cresult.value.data.obj
+	values.free_var(cresult.value)
+
+	ch := find_property(&db, child, "pb")
+	testing.expect(t, ch.found)
+	set_property_value(&db, child, ch, values.int_val(999))
+
+	delete_prop(t, &ow, &ctx, 2, "pa")
+
+	expect_prop_int(t, &db, child, "pb", 999)
+	expect_prop_int(t, &db, 2, "pb", 202)
 }

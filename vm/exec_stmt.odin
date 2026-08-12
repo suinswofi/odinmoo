@@ -32,6 +32,16 @@ raised_from_expr :: proc(r: Expr_Result) -> Stmt_Result {
 	return Stmt_Result{signal = .Raised, err = r.err}
 }
 
+// raised_stmt builds a Raised result for a statement-level type error. Always construct these
+// through here rather than filling in an Error_Info literal: `msg` is OWNED (whoever handles or
+// discards the exception calls error_info_destroy on it), so passing a string constant
+// directly would hand delete() a pointer into static data -- an invalid free that only shows up
+// when the error is actually caught, i.e. in exactly the try/except code written to handle it.
+@(private = "file")
+raised_stmt :: proc(code: values.Error, msg: string) -> Stmt_Result {
+	return Stmt_Result{signal = .Raised, err = Error_Info{code = code, msg = strings.clone(msg), value = values.int_val(0)}}
+}
+
 exec_stmts :: proc(ctx: ^Eval_Context, stmts: []compiler.Stmt) -> Stmt_Result {
 	for s in stmts {
 		r := exec_stmt(ctx, s)
@@ -131,7 +141,7 @@ exec_list_loop :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_List_Loop) -> Stmt_
 	case .Str:
 		n = len(list_r.value.data.str.s)
 	case:
-		return Stmt_Result{signal = .Raised, err = Error_Info{code = .E_TYPE, msg = "List or string required", value = values.int_val(0)}}
+		return raised_stmt(.E_TYPE, "List or string required")
 	}
 
 	for i in 1 ..= n {
@@ -172,7 +182,7 @@ exec_range_loop :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_Range_Loop) -> Stm
 	defer values.free_var(from_r.value)
 	defer values.free_var(to_r.value)
 	if from_r.value.type != .Int || to_r.value.type != .Int {
-		return Stmt_Result{signal = .Raised, err = Error_Info{code = .E_TYPE, msg = "Integer required", value = values.int_val(0)}}
+		return raised_stmt(.E_TYPE, "Integer required")
 	}
 
 	i := from_r.value.data.num

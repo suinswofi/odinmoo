@@ -140,6 +140,22 @@ world_call_verb :: proc(vw: ^vm.World, obj: values.Objid, name: string, args: va
 	return call_verb_from(w, vw, obj, obj, name, args, ctx)
 }
 
+// MAX_VERB_DEPTH caps how deep MOO verb calls may nest before E_MAXREC, matching the
+// original's DEFAULT_MAX_STACK_DEPTH (options.h) exactly -- so verb code that runs on the C
+// server hits the same ceiling here rather than a different one.
+//
+// This is load-bearing, not a tidiness limit. Because this port runs nested verb calls on the
+// NATIVE call stack (see vm/activation.odin's header on why that's what makes suspend/resume
+// simple), a runaway recursion isn't a growable heap array overflowing into a clean error the
+// way it is in the original -- it's a native stack overflow, i.e. an immediate segfault that
+// takes the whole server (and every other player's session) down with it. And it's trivially
+// reachable: `.program me:loop` / `this:loop();` is enough for anyone with a programmer bit.
+// So the check has to happen before recursing, and it's checked here because this is the one
+// funnel every verb call goes through -- ordinary `obj:verb()`, pass(), and command dispatch
+// alike. The original's $server_options.max_stack_depth override isn't supported (this port has
+// no $server_options plumbing); the fixed default is the conservative direction to differ in.
+MAX_VERB_DEPTH :: 50
+
 // call_verb_from is world_call_verb's body, generalized with a separate `search_from`
 // (where verb lookup starts) distinct from `this_obj` (what `this` is bound to in the
 // callee). For an ordinary `obj:verb(...)` call these are the same object (world_call_verb
@@ -165,6 +181,9 @@ world_call_verb :: proc(vw: ^vm.World, obj: values.Objid, name: string, args: va
 // disagreeing.
 call_verb_from :: proc(w: ^Object_World, vw: ^vm.World, this_obj, search_from: values.Objid, name: string, args: values.Var, ctx: ^vm.Eval_Context, cmd: ^Parsed_Command = nil, vh_hint: Verb_Handle = {}) -> vm.Call_Result {
 	defer values.free_var(args)
+	if ctx.activation.depth + 1 >= MAX_VERB_DEPTH {
+		return err_result(.E_MAXREC, "Too many verb calls")
+	}
 	if !valid(w.db, this_obj) {
 		return err_result(.E_INVIND, "Invalid indirection")
 	}

@@ -362,6 +362,9 @@ Match_Result :: struct {
 	groups: [9][2]int, // 0-based [start, end) per group; {-1, -1} if that group didn't participate
 }
 
+// Runner holds everything one match needs, including scratch that is reused across start
+// positions rather than reallocated per attempt (match_pattern tries up to len(subject)+1 of
+// them, so per-attempt allocation showed up as real work on long subjects).
 @(private = "file")
 Runner :: struct {
 	prog:       ^Program,
@@ -369,10 +372,53 @@ Runner :: struct {
 	case_fold:  bool,
 	steps:      int,
 	loop_entry: []int, // per-pc "pos we last entered this loop-Split at" (see Instr.is_loop); -1 = never
+	choices:    [dynamic]Choice,
+	undos:      [dynamic]Undo,
+	saves:      [20]int,
+}
+
+@(private = "file")
+runner_make :: proc(prog: ^Program, subject: string, case_fold: bool) -> Runner {
+	return Runner {
+		prog       = prog,
+		subject    = subject,
+		case_fold  = case_fold,
+		loop_entry = make([]int, len(prog.instrs)),
+		choices    = make([dynamic]Choice, 0, 32),
+		undos      = make([dynamic]Undo, 0, 16),
+	}
+}
+
+@(private = "file")
+runner_destroy :: proc(r: ^Runner) {
+	delete(r.loop_entry)
+	delete(r.choices)
+	delete(r.undos)
+}
+
+// runner_reset clears the per-attempt state before trying a new start position.
+@(private = "file")
+runner_reset :: proc(r: ^Runner) {
+	r.steps = 0
+	for i in 0 ..< len(r.loop_entry) {
+		r.loop_entry[i] = -1
+	}
+	clear(&r.choices)
+	clear(&r.undos)
+	for i in 0 ..< len(r.saves) {
+		r.saves[i] = -1
+	}
 }
 
 @(private = "file")
 MAX_STEPS :: 2_000_000 // backtracking budget: bounds pathological patterns instead of hanging
+
+// MAX_BACKTRACK bounds how many pending alternatives run() will hold at once. Like MAX_STEPS
+// it's a give-up-and-report-no-match valve for pathological inputs, bounding memory rather than
+// time. MAX_STEPS already caps pushes implicitly (at most one per step); this is the explicit
+// memory ceiling, ~24 MB of Choice entries at the limit.
+@(private = "file")
+MAX_BACKTRACK :: 1_000_000
 
 @(private = "file")
 byte_eq :: proc(r: ^Runner, a, b: byte) -> bool {
@@ -389,113 +435,155 @@ byte_eq :: proc(r: ^Runner, a, b: byte) -> bool {
 	return fa == fb
 }
 
+// Choice is one pending alternative: the branch of a Split that run() didn't take, to be
+// resumed if the branch it did take fails. `undo_top` records how tall the Save-undo journal
+// was at the time, so backtracking knows exactly which capture writes to roll back.
 @(private = "file")
-run :: proc(r: ^Runner, pc: int, pos: int, saves: ^[20]int) -> (end: int, ok: bool) {
-	r.steps += 1
-	if r.steps > MAX_STEPS {
-		return 0, false
-	}
-	instr := r.prog.instrs[pc]
-	switch instr.op {
-	case .Char:
-		if pos < len(r.subject) && byte_eq(r, r.subject[pos], instr.c) {
-			return run(r, pc + 1, pos + 1, saves)
-		}
-		return 0, false
-	case .Any:
-		if pos < len(r.subject) {
-			return run(r, pc + 1, pos + 1, saves)
-		}
-		return 0, false
-	case .Class:
-		if pos < len(r.subject) {
-			c := r.subject[pos]
-			member := instr.set[c]
-			if !member && r.case_fold {
-				alt := c
-				if alt >= 'a' && alt <= 'z' {
-					alt -= 32
-				} else if alt >= 'A' && alt <= 'Z' {
-					alt += 32
-				}
-				member = instr.set[alt]
-			}
-			if member != instr.negate {
-				return run(r, pc + 1, pos + 1, saves)
-			}
-		}
-		return 0, false
-	case .Bol:
-		if pos == 0 {
-			return run(r, pc + 1, pos, saves)
-		}
-		return 0, false
-	case .Eol:
-		if pos == len(r.subject) {
-			return run(r, pc + 1, pos, saves)
-		}
-		return 0, false
-	case .Wordb, .NWordb:
-		before := pos > 0 && is_word_byte(r.subject[pos - 1])
-		after := pos < len(r.subject) && is_word_byte(r.subject[pos])
-		boundary := before != after
-		if boundary == (instr.op == .Wordb) {
-			return run(r, pc + 1, pos, saves)
-		}
-		return 0, false
-	case .Jmp:
-		return run(r, instr.x, pos, saves)
-	case .Split:
-		if instr.is_loop {
-			// Refuse to re-enter this loop's body at the exact position we last entered it
-			// at -- a body that matches zero-width would otherwise recurse into this same
-			// Split forever (see Instr.is_loop's comment). Entering at a NEW (necessarily
-			// larger, since matching only ever consumes forward) position is genuine
-			// progress and is always allowed.
-			if r.loop_entry[pc] == pos {
-				return run(r, instr.y, pos, saves)
-			}
-			r.loop_entry[pc] = pos
-		}
-		if end, ok := run(r, instr.x, pos, saves); ok {
-			return end, ok
-		}
-		return run(r, instr.y, pos, saves)
-	case .Save:
-		old := saves[instr.x]
-		saves[instr.x] = pos
-		end, ok := run(r, pc + 1, pos, saves)
-		if !ok {
-			saves[instr.x] = old
-		}
-		return end, ok
-	case .Match:
-		return pos, true
-	}
-	return 0, false
+Choice :: struct {
+	pc:       int,
+	pos:      int,
+	undo_top: int,
 }
 
-// match_at tries to match starting EXACTLY at `start` (no scanning) -- the primitive both
-// match_pattern (which scans start forward) and rmatch (which scans start backward) share.
+// Undo is one entry in the capture-write journal: the slot a Save overwrote and what was in it
+// before. Journalling individual writes (rather than snapshotting all 20 save slots per choice
+// point) keeps a Choice down to a handful of words, which matters because a greedy quantifier
+// pushes one per character it consumes.
 @(private = "file")
-match_at :: proc(prog: ^Program, subject: string, start: int, case_fold: bool) -> (Match_Result, bool) {
-	loop_entry := make([]int, len(prog.instrs))
-	defer delete(loop_entry)
-	for i in 0 ..< len(loop_entry) {
-		loop_entry[i] = -1
+Undo :: struct {
+	slot: int,
+	old:  int,
+}
+
+// run executes the compiled program from (pc, pos), backtracking through Split alternatives
+// until something reaches Match or the alternatives run out. Capture positions land in
+// r.saves.
+//
+// This is an explicit loop over an explicit stack of alternatives, NOT the recursive tree-walk
+// it reads most naturally as. That matters: a recursive matcher recurses once per character
+// consumed, so matching something as ordinary as `a*b` against a few thousand characters
+// overflowed the native stack and took the whole server down with it (measured: ~7000
+// characters was enough). MOO code runs match() against mail bodies, note text and help
+// entries, so "a few thousand characters" is an ordinary input, not an attack. Moving that
+// growth onto the heap makes it bounded (MAX_BACKTRACK) and recoverable -- a pathological
+// pattern reports no-match instead of killing the process.
+@(private = "file")
+run :: proc(r: ^Runner, start_pc: int, start_pos: int) -> (end: int, ok: bool) {
+	pc, pos := start_pc, start_pos
+	for {
+		r.steps += 1
+		if r.steps > MAX_STEPS {
+			return 0, false
+		}
+		instr := r.prog.instrs[pc]
+
+		// Each case either advances (pc/pos) and `continue`s, or falls through to the single
+		// backtrack step at the bottom of the loop.
+		switch instr.op {
+		case .Char:
+			if pos < len(r.subject) && byte_eq(r, r.subject[pos], instr.c) {
+				pc += 1
+				pos += 1
+				continue
+			}
+		case .Any:
+			if pos < len(r.subject) {
+				pc += 1
+				pos += 1
+				continue
+			}
+		case .Class:
+			if pos < len(r.subject) {
+				c := r.subject[pos]
+				member := instr.set[c]
+				if !member && r.case_fold {
+					alt := c
+					if alt >= 'a' && alt <= 'z' {
+						alt -= 32
+					} else if alt >= 'A' && alt <= 'Z' {
+						alt += 32
+					}
+					member = instr.set[alt]
+				}
+				if member != instr.negate {
+					pc += 1
+					pos += 1
+					continue
+				}
+			}
+		case .Bol:
+			if pos == 0 {
+				pc += 1
+				continue
+			}
+		case .Eol:
+			if pos == len(r.subject) {
+				pc += 1
+				continue
+			}
+		case .Wordb, .NWordb:
+			before := pos > 0 && is_word_byte(r.subject[pos - 1])
+			after := pos < len(r.subject) && is_word_byte(r.subject[pos])
+			boundary := before != after
+			if boundary == (instr.op == .Wordb) {
+				pc += 1
+				continue
+			}
+		case .Jmp:
+			pc = instr.x
+			continue
+		case .Split:
+			if instr.is_loop {
+				// Refuse to re-enter this loop's body at the exact position we last entered it
+				// at -- a body that matches zero-width would otherwise spin here forever (see
+				// Instr.is_loop). Entering at a NEW position is genuine progress, always allowed.
+				if r.loop_entry[pc] == pos {
+					pc = instr.y
+					continue
+				}
+				r.loop_entry[pc] = pos
+			}
+			if len(r.choices) >= MAX_BACKTRACK {
+				return 0, false
+			}
+			append(&r.choices, Choice{pc = instr.y, pos = pos, undo_top = len(r.undos)})
+			pc = instr.x
+			continue
+		case .Save:
+			append(&r.undos, Undo{slot = instr.x, old = r.saves[instr.x]})
+			r.saves[instr.x] = pos
+			pc += 1
+			continue
+		case .Match:
+			return pos, true
+		}
+
+		// This path failed -- roll back to the most recent untried alternative, undoing any
+		// capture writes made since it was recorded, or give up if there are none left.
+		if len(r.choices) == 0 {
+			return 0, false
+		}
+		choice := pop(&r.choices)
+		for len(r.undos) > choice.undo_top {
+			u := pop(&r.undos)
+			r.saves[u.slot] = u.old
+		}
+		pc, pos = choice.pc, choice.pos
 	}
-	r := Runner{prog = prog, subject = subject, case_fold = case_fold, loop_entry = loop_entry}
-	saves: [20]int
-	for i in 0 ..< 20 {
-		saves[i] = -1
-	}
-	end, ok := run(&r, 0, start, &saves)
+}
+
+// match_attempt tries to match starting EXACTLY at `start` (no scanning) -- the primitive both
+// forward and reverse scanning share. Reuses `r`'s scratch buffers; resets per-attempt state.
+@(private = "file")
+match_attempt :: proc(r: ^Runner, start: int) -> (Match_Result, bool) {
+	runner_reset(r)
+	_, ok := run(r, 0, start)
 	if !ok {
 		return Match_Result{}, false
 	}
-	res := Match_Result{found = true, start = saves[0], end = saves[1]}
+	res := Match_Result{found = true, start = r.saves[0], end = r.saves[1]}
 	for g in 1 ..= 9 {
-		res.groups[g - 1] = [2]int{saves[2 * g], saves[2 * g + 1]}
+		res.groups[g - 1] = [2]int{r.saves[2 * g], r.saves[2 * g + 1]}
 	}
 	return res, true
 }
@@ -505,15 +593,17 @@ match_at :: proc(prog: ^Program, subject: string, start: int, case_fold: bool) -
 // (which tries every start position since this VM, like the original, isn't anchored by
 // default -- MOO patterns opt into anchoring themselves via `^`/`$`).
 match_pattern :: proc(prog: ^Program, subject: string, reverse: bool, case_fold: bool) -> Match_Result {
+	r := runner_make(prog, subject, case_fold)
+	defer runner_destroy(&r)
 	if !reverse {
 		for start := 0; start <= len(subject); start += 1 {
-			if res, ok := match_at(prog, subject, start, case_fold); ok {
+			if res, ok := match_attempt(&r, start); ok {
 				return res
 			}
 		}
 	} else {
 		for start := len(subject); start >= 0; start -= 1 {
-			if res, ok := match_at(prog, subject, start, case_fold); ok {
+			if res, ok := match_attempt(&r, start); ok {
 				return res
 			}
 		}

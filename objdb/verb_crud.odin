@@ -212,10 +212,10 @@ bf_delete_verb :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context
 	obj := w.db.objects[oid]
 	delete(obj.verbdefs[h.index].program_source)
 	ordered_remove_verbdef(&obj.verbdefs, h.index)
-	compile_cache_invalidate(&w.cache, oid, h.index)
-	// Every verbdef after the removed one just shifted down by one index -- their cache
-	// entries (if any) are now keyed wrong. Simplest correct fix: drop every cached entry
-	// for this object; they'll just recompile lazily on next call.
+	// Every verbdef after the removed one just shifted down by one index, so their cache
+	// entries (which are keyed by index) now point at the wrong verb. Dropping every entry for
+	// this object covers the removed verb and the shifted ones alike -- they just recompile
+	// lazily on next call.
 	compile_cache_invalidate_object(&w.cache, oid)
 	return ok_result(values.int_val(0))
 }

@@ -125,6 +125,10 @@ main :: proc() {
 		if g_checkpoint_requested {
 			g_checkpoint_requested = false
 			checkpoint(&db, &sched, checkpoint_db_path)
+			// Scratch memory used while writing a checkpoint isn't needed afterwards, and
+			// context.temp_allocator is a growing arena that's only ever reclaimed explicitly
+			// (see netio/connection.odin's per-line reset for the same reasoning).
+			free_all(context.temp_allocator)
 		}
 		time.sleep(200 * time.Millisecond)
 	}

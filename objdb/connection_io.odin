@@ -291,6 +291,12 @@ bf_eval :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	if !is_programmer(w.db, progr) {
 		return err_result_local(.E_PERM, "Permission denied")
 	}
+	// eval() runs its compiled body on the native call stack just like a verb call does, so it
+	// needs the same depth ceiling -- see MAX_VERB_DEPTH in world.odin for why exceeding it is a
+	// crash rather than an error here.
+	if ctx.activation.depth + 1 >= MAX_VERB_DEPTH {
+		return err_result_local(.E_MAXREC, "Too many verb calls")
+	}
 
 	r := compiler.parse_program(src_v.data.str.s, w.db.version)
 	defer {

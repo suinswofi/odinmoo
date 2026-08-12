@@ -191,27 +191,50 @@ eval_call :: proc(ctx: ^Eval_Context, name: string, is_known: bool, arg_exprs: [
 // splicing `@expr` arguments (which must themselves be lists) in place -- ports
 // OP_MAKE_SINGLETON_LIST/OP_LIST_ADD_TAIL/OP_LIST_APPEND/OP_CHECK_LIST_FOR_SPLICE's combined
 // effect.
+//
+// Accumulates into one growable array and wraps it at the end, rather than rebuilding an
+// immutable MOO list per argument. The latter is what the original's opcode-at-a-time codegen
+// effectively does (a listappend per argument, each reallocating), which costs O(n²) copying
+// for an n-element list literal -- fine for the 1-3 argument calls that dominate, needlessly
+// slow for the large literals that show up in database initialization code. This runs on every
+// verb call and every list literal, so it's worth doing in one pass; MOO can't observe the
+// difference, since the list only becomes a value at all once it's finished.
 @(private = "file")
 eval_args_as_list :: proc(ctx: ^Eval_Context, args: []compiler.Arg) -> Expr_Result {
-	result := values.empty_list()
+	acc := make([dynamic]values.Var, 0, len(args))
+	fail :: proc(acc: ^[dynamic]values.Var) {
+		for v in acc {
+			values.free_var(v)
+		}
+		delete(acc^)
+	}
 	for a in args {
 		item_r := eval_expr(ctx, a.expr)
 		if item_r.raised {
-			values.free_var(result)
+			fail(&acc)
 			return item_r
 		}
 		if a.splice {
 			if item_r.value.type != .List {
 				values.free_var(item_r.value)
-				values.free_var(result)
+				fail(&acc)
 				return raise_or_value(ctx, .E_TYPE)
 			}
-			result = values.list_concat(result, item_r.value)
+			for elem in item_r.value.data.list.items {
+				append(&acc, values.var_ref(elem))
+			}
+			values.free_var(item_r.value)
 		} else {
-			result = values.list_append(result, item_r.value)
+			append(&acc, item_r.value) // ownership transfers into the list
 		}
 	}
-	return ok_expr(result)
+	// A MOO list owns a plain []Var that free_var eventually delete()s, so hand over a slice
+	// whose allocation is exactly its length -- shrink() drops any spare capacity the growth
+	// above left behind. (Passing acc[:] with cap > len happens to work with the default heap
+	// allocator, which ignores the size on free, but quietly depends on that; this codebase has
+	// already been bitten once by an allocator assumption that held right up until it didn't.)
+	shrink(&acc)
+	return ok_expr(values.list_val(acc[:]))
 }
 
 @(private = "file")
@@ -339,7 +362,6 @@ eval_binary :: proc(ctx: ^Eval_Context, b: ^compiler.Expr_Binary) -> Expr_Result
 // default means "select code from tuple", i.e. index 1).
 @(private = "file")
 eval_catch :: proc(ctx: ^Eval_Context, c: ^compiler.Expr_Catch) -> Expr_Result {
-	saved_debug := ctx.activation.debug
 	result := eval_expr(ctx, c.try)
 	if !result.raised {
 		return result
@@ -347,12 +369,14 @@ eval_catch :: proc(ctx: ^Eval_Context, c: ^compiler.Expr_Catch) -> Expr_Result {
 	if !error_code_matches(ctx, c.codes, result.err.code) {
 		return result
 	}
+	// `code` is a plain enum, so it survives destroying the message/value payload below and is
+	// still readable for the no-handler case.
+	code := result.err.code
 	error_info_destroy_local(&result.err)
-	_ = saved_debug
 	if c.handler != nil {
 		return eval_expr(ctx, c.handler)
 	}
-	return ok_expr(values.err_val(result.err.code))
+	return ok_expr(values.err_val(code))
 }
 
 error_info_destroy_local :: proc(e: ^Error_Info) {

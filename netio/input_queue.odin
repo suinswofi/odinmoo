@@ -142,17 +142,37 @@ dispatch_now :: proc(conn: ^Connection, line: string) {
 	}
 }
 
+// spawn_drain starts a thread to dispatch whatever is queued, if one isn't already working.
+// Registering with conn.drains is what lets connection teardown wait for it rather than
+// pulling `conn` out from under it (see connection_handler's defer); `drain_running` keeps a
+// burst of force_input() calls from spawning a thread per line, since one drain loop already
+// picks up everything queued.
 @(private = "file")
 spawn_drain :: proc(conn: ^Connection) {
+	sync.mutex_lock(&conn.io_lock)
+	already := conn.drain_running
+	if !already {
+		conn.drain_running = true
+	}
+	sync.mutex_unlock(&conn.io_lock)
+	if already {
+		return
+	}
+	sync.wait_group_add(&conn.drains, 1)
 	thread.create_and_start_with_data(conn, drain_thread_proc, init_context = context, self_cleanup = true)
 }
 
 @(private = "file")
 drain_thread_proc :: proc(data: rawptr) {
 	conn := (^Connection)(data)
+	defer sync.wait_group_done(&conn.drains)
+	// Per-thread scratch arena, only ever reclaimed explicitly -- see the reset in
+	// connection.odin's read loop for the full reasoning.
+	defer free_all(context.temp_allocator)
 	for {
 		sync.mutex_lock(&conn.io_lock)
 		if values.is_true(conn.options["hold-input"]) || len(conn.pending_lines) == 0 || conn.reader_task_id != 0 {
+			conn.drain_running = false
 			sync.mutex_unlock(&conn.io_lock)
 			return
 		}

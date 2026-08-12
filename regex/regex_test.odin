@@ -1,5 +1,6 @@
 package regex
 
+import "core:strings"
 import "core:testing"
 
 @(test)
@@ -152,4 +153,56 @@ test_malformed_pattern_fails_to_compile :: proc(t: ^testing.T) {
 
 	_, ok2 := compile("[unterminated")
 	testing.expect(t, !ok2)
+}
+
+// test_long_subject_does_not_overflow_the_stack is a crash regression test. run() used to
+// recurse once per character consumed, so an entirely ordinary pattern over a few thousand
+// characters overflowed the native stack -- measured at roughly 7000 characters for `a*b`,
+// which is smaller than a typical mail message or help entry, i.e. reachable by accident
+// rather than only by attack. Sizes here are well past that threshold in both the
+// matches-eventually and never-matches directions.
+@(test)
+test_long_subject_does_not_overflow_the_stack :: proc(t: ^testing.T) {
+	prog, ok := compile("a*b")
+	defer program_destroy(&prog)
+	testing.expect(t, ok)
+
+	// 100k a's followed by a b: the greedy star has to consume the whole run and match.
+	run_of_as := strings.repeat("a", 100_000)
+	defer delete(run_of_as)
+	matching := strings.concatenate({run_of_as, "b"})
+	defer delete(matching)
+	res := match_pattern(&prog, matching, false, true)
+	testing.expect(t, res.found)
+	testing.expect(t, res.start == 0 && res.end == 100_001)
+
+	// a's and no b: every start position fails, which is what drove the deepest recursion
+	// before. Kept well past the ~7000 crash threshold but modest, since this case costs one
+	// full scan per start position. The budget valves (MAX_STEPS/MAX_BACKTRACK) may report
+	// no-match rather than exhaustively proving it; either way it must return, not die.
+	non_matching := strings.repeat("a", 12_000)
+	defer delete(non_matching)
+	res2 := match_pattern(&prog, non_matching, false, true)
+	testing.expect(t, !res2.found)
+}
+
+// test_long_subject_with_groups_reports_correct_offsets checks that the explicit backtrack
+// stack restores capture-group state correctly when it unwinds -- the recursive version undid
+// each Save individually on the way out, the loop restores a snapshot at each choice point, and
+// those have to agree.
+@(test)
+test_long_subject_with_groups_reports_correct_offsets :: proc(t: ^testing.T) {
+	prog, ok := compile("%(a*%)%(b+%)c")
+	defer program_destroy(&prog)
+	testing.expect(t, ok)
+
+	as := strings.repeat("a", 5_000)
+	defer delete(as)
+	subject := strings.concatenate({as, "bbb", "c"})
+	defer delete(subject)
+	res := match_pattern(&prog, subject, false, true)
+	testing.expect(t, res.found)
+	testing.expect(t, res.start == 0 && res.end == 5_004)
+	testing.expect(t, res.groups[0] == [2]int{0, 5_000})
+	testing.expect(t, res.groups[1] == [2]int{5_000, 5_003})
 }

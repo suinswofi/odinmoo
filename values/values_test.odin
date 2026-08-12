@@ -223,3 +223,34 @@ test_is_true_matches_moo_truthiness :: proc(t: ^testing.T) {
 	testing.expect(t, is_true(one)) // non-empty list is true regardless of contents
 	free_var(one)
 }
+
+// test_ascii_fold_helpers pins the behavior the callers rely on. The empty-needle answers
+// matter more than they look: LambdaCore's $site_db trie insert genuinely depends on
+// index(s, "") == 1 (MOO-1-based, so 0 here), and rindex(s, "") == len+1, so these have to
+// agree with what core:strings returns rather than "sensibly" reporting not-found.
+@(test)
+test_ascii_fold_helpers :: proc(t: ^testing.T) {
+	testing.expect(t, ascii_compare_fold("abc", "ABC") == 0)
+	testing.expect(t, ascii_compare_fold("abc", "abd") < 0)
+	testing.expect(t, ascii_compare_fold("abd", "ABC") > 0)
+	testing.expect(t, ascii_compare_fold("ab", "abc") < 0)
+	testing.expect(t, ascii_compare_fold("", "") == 0)
+
+	testing.expect(t, ascii_index_fold("Hello World", "world") == 6)
+	testing.expect(t, ascii_index_fold("Hello", "xyz") == -1)
+	testing.expect(t, ascii_index_fold("aaa", "AA") == 0)
+	testing.expect(t, ascii_index_fold("abc", "") == 0)
+	testing.expect(t, ascii_index_fold("ab", "abc") == -1)
+
+	testing.expect(t, ascii_last_index_fold("aXaXa", "x") == 3)
+	testing.expect(t, ascii_last_index_fold("abc", "") == 3)
+	testing.expect(t, ascii_last_index_fold("abc", "zz") == -1)
+
+	testing.expect(t, ascii_has_prefix_fold("HeLLo", "hell"))
+	testing.expect(t, !ascii_has_prefix_fold("Hi", "hill"))
+	testing.expect(t, ascii_has_prefix_fold("anything", ""))
+
+	// Non-ASCII bytes are compared as-is, not case-folded -- matching the original's
+	// byte-oriented comparisons rather than Unicode semantics.
+	testing.expect(t, ascii_compare_fold("é", "É") != 0)
+}

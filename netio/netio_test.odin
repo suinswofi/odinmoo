@@ -447,3 +447,59 @@ test_prefix_suffix_wrap_command_output :: proc(t: ^testing.T) {
 	defer delete(only)
 	testing.expect(t, only == "hello there")
 }
+
+// test_force_input_drains_after_hold_cleared exercises the queued-input path end to end, which
+// the objdb-side tests can't: they stand in a fake for Connection_Hooks, so they never touch the
+// real queue, the drain thread, or the interaction between them. Sequence: hold input, inject two
+// lines with force_input(), then clear the hold -- which has to hand both queued lines to ordinary
+// command dispatch, in order, on a thread that isn't the one holding the interpreter lock.
+@(test)
+test_force_input_drains_after_hold_cleared :: proc(t: ^testing.T) {
+	db := build_login_db()
+	defer dbfile.database_destroy(&db)
+
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := objdb.object_world_init(&db, &sched)
+	defer objdb.object_world_destroy(&ow)
+	world := objdb.make_world(&ow)
+
+	s: Server
+	wire_connection_hooks(&ow, &s)
+	err := server_start(&s, 0, &sched, &world)
+	testing.expectf(t, err == nil, "server_start: %v", err)
+	defer server_stop(&s)
+
+	endpoint, _ := net.bound_endpoint(s.listener)
+	sock, derr := net.dial_tcp_from_endpoint(endpoint)
+	testing.expectf(t, derr == nil, "dial: %v", derr)
+	defer net.close(sock)
+	client := client_init(sock)
+	defer client_destroy(&client)
+
+	banner := recv_line(t, &client)
+	defer delete(banner)
+	log_in(t, &client)
+
+	// All in one expression on purpose: while "hold-input" is set, the connection queues
+	// EVERYTHING it reads -- including whatever the test types next -- so this can't be split
+	// across several lines. Sets the hold, queues two lines behind it, then clears the hold,
+	// which is what has to kick off the drain.
+	send_cmd(&client, `.eval {set_connection_option(player, "hold-input", 1), force_input(player, "greet"), force_input(player, "greet"), set_connection_option(player, "hold-input", 0)}`)
+
+	// Both queued "greet" commands now run, each notify()ing once. Scanning rather than
+	// expecting an exact next line: the .eval result and the drained output are produced by two
+	// different threads, so their order isn't guaranteed.
+	greeted := 0
+	for _ in 0 ..< 6 {
+		line := recv_line(t, &client)
+		defer delete(line)
+		if line == "hello there" {
+			greeted += 1
+			if greeted == 2 {
+				break
+			}
+		}
+	}
+	testing.expectf(t, greeted == 2, "expected both queued lines to dispatch, saw %d", greeted)
+}

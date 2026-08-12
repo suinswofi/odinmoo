@@ -212,20 +212,25 @@ bf_add_property :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Contex
 	}
 
 	obj := w.db.objects[oid]
+
+	// Snapshot BEFORE appending the propdef -- see prop_resync.odin's usage note.
+	snap := prop_layout_snapshot(w.db, oid)
+	defer prop_layout_snapshot_destroy(&snap)
+
 	append(&obj.propdefs, dbfile.Propdef{name = intern_local(w, name)})
 	append(&obj.propvals, dbfile.Propval{value = values.var_ref(value_v), owner = owner, perms = flags})
 
 	// Every descendant needs the new inherited (CLEAR) slot; `oid` itself already has its
 	// real value appended above, so only resync the CHILDREN, not oid itself (a full
-	// resync_subtree_propvals(w.db, oid, ...) would work too, but would rebuild -- and thus
-	// needlessly re-snapshot/reallocate -- oid's own array that's already correct).
+	// resync_subtree_propvals(w.db, oid, ...) would work too, but would needlessly rebuild
+	// oid's own array that's already correct).
 	for c := obj.child; c != values.NOTHING; {
 		child, cok := w.db.objects[c]
 		if !cok {
 			break
 		}
 		next := child.sibling
-		resync_subtree_propvals(w.db, c, owner)
+		resync_subtree_propvals(w.db, c, owner, &snap)
 		c = next
 	}
 	return ok_result(values.int_val(0))
@@ -262,8 +267,13 @@ bf_delete_property :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Con
 	if found_idx < 0 {
 		return err_result_local(.E_PROPNF, "Property not found")
 	}
+	// Snapshot BEFORE removing the propdef -- see prop_resync.odin's usage note. Without
+	// this, every property after found_idx keeps its now-wrong slot and ends up holding its
+	// neighbour's value.
+	snap := prop_layout_snapshot(w.db, oid)
+	defer prop_layout_snapshot_destroy(&snap)
 	ordered_remove(&obj.propdefs, found_idx)
-	resync_subtree_propvals(w.db, oid, obj.owner)
+	resync_subtree_propvals(w.db, oid, obj.owner, &snap)
 	return ok_result(values.int_val(0))
 }
 

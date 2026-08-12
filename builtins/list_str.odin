@@ -191,7 +191,7 @@ bf_index :: proc(args: values.Var) -> vm.Call_Result {
 	if case_matters {
 		pos = strings.index(source.data.str.s, what.data.str.s)
 	} else {
-		pos = strings.index(strings.to_lower(source.data.str.s, context.temp_allocator), strings.to_lower(what.data.str.s, context.temp_allocator))
+		pos = values.ascii_index_fold(source.data.str.s, what.data.str.s)
 	}
 	return vm.call_ok(values.int_val(i32(pos + 1)))
 }
@@ -211,7 +211,7 @@ bf_rindex :: proc(args: values.Var) -> vm.Call_Result {
 	if case_matters {
 		pos = strings.last_index(source.data.str.s, what.data.str.s)
 	} else {
-		pos = strings.last_index(strings.to_lower(source.data.str.s, context.temp_allocator), strings.to_lower(what.data.str.s, context.temp_allocator))
+		pos = values.ascii_last_index_fold(source.data.str.s, what.data.str.s)
 	}
 	return vm.call_ok(values.int_val(i32(pos + 1)))
 }
@@ -237,14 +237,13 @@ bf_strsub :: proc(args: values.Var) -> vm.Call_Result {
 
 	haystack := subject.data.str.s
 	needle := what.data.str.s
-	search_haystack := case_matters ? haystack : strings.to_lower(haystack, context.temp_allocator)
-	search_needle := case_matters ? needle : strings.to_lower(needle, context.temp_allocator)
 
 	b := strings.builder_make()
 	i := 0
 	for i < len(haystack) {
-		rest := search_haystack[i:]
-		if strings.has_prefix(rest, search_needle) {
+		rest := haystack[i:]
+		matched := strings.has_prefix(rest, needle) if case_matters else values.ascii_has_prefix_fold(rest, needle)
+		if matched {
 			strings.write_string(&b, with.data.str.s)
 			i += len(needle)
 		} else {

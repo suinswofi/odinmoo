@@ -139,10 +139,6 @@ empty_list :: proc() -> Var {
 
 // ---- Reference counting (ports utils.c: free_var/var_ref/var_dup) ----
 
-is_complex :: proc(t: Var_Type) -> bool {
-	return t == .Str || t == .List || t == .Float
-}
-
 var_ref :: proc(v: Var) -> Var {
 	#partial switch v.type {
 	case .Str:

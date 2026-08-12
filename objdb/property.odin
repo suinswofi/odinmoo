@@ -165,7 +165,16 @@ property_value :: proc(db: ^dbfile.Database, oid: values.Objid, h: Prop_Handle) 
 	o := oid
 	n := h.value_index
 	for {
-		obj := db.objects[o]
+		// A well-formed DB always terminates this walk: the property's definer holds a
+		// non-CLEAR value (add_property sets one, and clear_property refuses to clear a
+		// definer's own slot), so we stop at or before it. The bounds checks below only
+		// matter for a corrupt or hand-edited .db, where without them a CLEAR-all-the-way
+		// chain would walk off the root and nil-deref -- a segfault in a live server. Falling
+		// back to 0 (the same value an unset property reads as) keeps that recoverable.
+		obj, ok := db.objects[o]
+		if !ok || n < 0 || n >= len(obj.propvals) {
+			return values.int_val(0)
+		}
 		pv := obj.propvals[n]
 		if pv.value.type != .Clear {
 			return values.var_ref(pv.value)

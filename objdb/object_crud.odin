@@ -138,8 +138,13 @@ bf_create :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> 
 	obj.sibling = values.NOTHING
 	w.db.objects[oid] = obj
 
+	// The snapshot is empty here (a brand new object has no propvals yet), but going through
+	// the same two-phase path as every other caller keeps the contract uniform -- see
+	// prop_resync.odin's usage note.
+	snap := prop_layout_snapshot(w.db, oid)
+	defer prop_layout_snapshot_destroy(&snap)
 	db_change_parent_links(w.db, oid, parent)
-	resync_subtree_propvals(w.db, oid, obj.owner)
+	resync_subtree_propvals(w.db, oid, obj.owner, &snap)
 
 	init_args := values.list_val(make([]values.Var, 0))
 	result := call_verb_from(w, ctx.world, oid, oid, "initialize", init_args, ctx)
@@ -227,12 +232,18 @@ bf_recycle :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) ->
 	}
 
 	// Flatten the inheritance hierarchy: every child gets reparented to this object's own
-	// parent rather than being left with a dangling/invalid parent.
+	// parent rather than being left with a dangling/invalid parent. Each child loses whatever
+	// properties THIS object defined, so their propvals need realigning -- snapshot the whole
+	// subtree's layouts up front, before any reparenting (see prop_resync.odin's usage note);
+	// reparenting one child doesn't disturb its siblings' layouts, so one snapshot covers the
+	// entire loop.
+	snap := prop_layout_snapshot(w.db, oid)
+	defer prop_layout_snapshot_destroy(&snap)
 	own_parent := w.db.objects[oid].parent
 	for w.db.objects[oid].child != values.NOTHING {
 		c := w.db.objects[oid].child
 		db_change_parent_links(w.db, c, own_parent)
-		resync_subtree_propvals(w.db, c, w.db.objects[c].owner)
+		resync_subtree_propvals(w.db, c, w.db.objects[c].owner, &snap)
 	}
 	db_change_parent_links(w.db, oid, values.NOTHING)
 
@@ -301,8 +312,13 @@ bf_chparent :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -
 		}
 	}
 
+	// Snapshot BEFORE reparenting -- `what`'s accumulated layout is about to become a
+	// completely different splice of ancestors, so every slot in its (and its descendants')
+	// propvals needs re-pairing by property identity. See prop_resync.odin's usage note.
+	snap := prop_layout_snapshot(w.db, what)
+	defer prop_layout_snapshot_destroy(&snap)
 	db_change_parent_links(w.db, what, new_parent)
-	resync_subtree_propvals(w.db, what, w.db.objects[what].owner)
+	resync_subtree_propvals(w.db, what, w.db.objects[what].owner, &snap)
 	return ok_result(values.int_val(0))
 }
 

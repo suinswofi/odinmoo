@@ -223,7 +223,7 @@ compare_ordered :: proc(a, b: values.Var) -> (cmp: int, err: values.Error) {
 	case .Err:
 		return int(a.data.err) - int(b.data.err), .E_NONE
 	case .Str:
-		return strings.compare(strings.to_lower(a.data.str.s, context.temp_allocator), strings.to_lower(b.data.str.s, context.temp_allocator)), .E_NONE
+		return values.ascii_compare_fold(a.data.str.s, b.data.str.s), .E_NONE
 	case .Float, .List, .Clear, .None, .Catch, .Finally:
 		return 0, .E_TYPE
 	}

@@ -49,6 +49,8 @@ Connection :: struct {
 	reader_task_id: int, // 0 = no task currently parked in read() on this connection
 	pending_lines:  [dynamic]string, // queued while "hold-input" is set, or awaiting a non-blocking read()
 	options:        map[string]values.Var, // connection-option store, see input_queue.odin's option_defaults
+	drains:         sync.Wait_Group, // outstanding drain threads (input_queue.odin's spawn_drain)
+	drain_running:  bool, // guards against spawning a second drain thread while one is working
 
 	// `.program` intrinsic editor state (see program_editor.odin). Only ever touched by this
 	// connection's own recv-loop thread, so unlike the fields above it needs no lock.
@@ -96,6 +98,12 @@ connection_handler :: proc(data: rawptr) {
 	defer sync.wait_group_done(&conn.server.conns_done)
 	defer connection_io_destroy(conn)
 	defer program_state_destroy(conn)
+	// Registered LAST so it runs FIRST (defers are LIFO): a drain thread (see
+	// input_queue.odin's spawn_drain) holds this same `conn` pointer and dispatches queued
+	// input on it, so everything below -- freeing the connection's queues and options, and
+	// ultimately free(conn) itself -- has to wait for any in-flight drain to finish, or it's a
+	// use-after-free the moment a force_input()'d line races a disconnect.
+	defer sync.wait_group_wait(&conn.drains)
 	conn.ansi_enabled = true
 	conn.options = init_option_defaults()
 	conn.player = allocate_connection_id(conn.server, conn)
@@ -120,6 +128,14 @@ connection_handler :: proc(data: rawptr) {
 				line := strings.trim_right(strings.to_string(pending), "\r")
 				on_incoming_line(conn, line)
 				strings.builder_reset(&pending)
+				// One completed line of input = one finished task, which is the natural point
+				// to reclaim scratch memory. context.temp_allocator is a GROWING arena that is
+				// never reclaimed on its own, and it's per-thread, so a connection thread that
+				// never resets it would grow for as long as the connection lives -- months, for
+				// a MOO. Nothing temp-allocated outlives a single dispatched line (verb code
+				// works in owned Vars, and the compiler clones every string it keeps), so this
+				// is safe here and belongs at exactly this boundary.
+				free_all(context.temp_allocator)
 			} else {
 				strings.write_byte(&pending, c)
 			}

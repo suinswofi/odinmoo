@@ -2,6 +2,7 @@ package vm
 
 import "../compiler"
 import "../values"
+import "core:mem"
 import "core:testing"
 
 @(private = "file")
@@ -426,4 +427,35 @@ test_builtin_call_via_world :: proc(t: ^testing.T) {
 	defer values.free_var(r.value)
 	testing.expect(t, r.signal == .Return)
 	testing.expect(t, r.value.type == .Str && r.value.data.str.s == "n=5")
+}
+
+// test_caught_statement_type_error_frees_its_message covers a whole class of ownership bug
+// rather than one expression: Error_Info.msg is owned, so every raise site has to hand over an
+// allocated string. Two statement-level raises (a `for` over a non-list, and a range loop with
+// non-integer bounds) used to pass a string *literal* instead, which meant delete()ing static
+// data the moment anything handled the exception -- invisible until the error is actually
+// caught, i.e. in exactly the try/except code written to handle it.
+//
+// This runs each case under its own tracking allocator and asserts bad_free_array is empty,
+// because the enclosing test runner reports invalid frees as warnings rather than failures --
+// checking it here is what makes this an actual regression test and not just a behavior test
+// that would keep passing while quietly corrupting the heap.
+@(test)
+test_caught_statement_type_error_frees_its_message :: proc(t: ^testing.T) {
+	for src in ([]string{
+		`try for x in (5) endfor except e (ANY) return e[1] == E_TYPE; endtry return 0;`,
+		`try for i in ["a".."b"] endfor except e (ANY) return e[1] == E_TYPE; endtry return 0;`,
+	}) {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		track.bad_free_callback = mem.tracking_allocator_bad_free_callback_add_to_array
+		{
+			context.allocator = mem.tracking_allocator(&track)
+			expect_return_int(t, src, 1)
+		}
+		if len(track.bad_free_array) > 0 {
+			testing.expectf(t, false, "%s: %d invalid free(s), first at %v", src, len(track.bad_free_array), track.bad_free_array[0].location)
+		}
+		mem.tracking_allocator_destroy(&track)
+	}
 }
