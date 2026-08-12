@@ -1,3 +1,7 @@
 bin/
+
+# Checkpoints and other databases the server writes out at runtime, minus the
+# hand-added cores that are bundled with the repo on purpose.
 *.db
 !LambdaCore.db
+!jhcore.db

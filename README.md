@@ -125,6 +125,16 @@ standard LambdaMOO starting database, bundled here so the repo is runnable strai
 (If you'd rather bootstrap from something smaller/emptier, a `Minimal.db` also exists in the wider
 LambdaMOO community — swap it in the same way.)
 
+A second community core, `jhcore.db` (JHCore), is bundled alongside it as a larger, more
+demanding corpus: format version 4, 237 objects / 2729 verb programs, against LambdaCore's
+97 / 1727.
+
+Not every community core will load. Databases at format version 5 and above (HellCore, for
+instance) come from extended-server forks that postdate stock LambdaMOO, whose `DB_Version` enum
+stops at 4 (`DBV_BFBugFixed`) — the original C server rejects those too, and supporting one would
+mean implementing that fork's format and value types rather than fixing a bug here. Such a file
+fails cleanly at load: `Bad_Format` at the `header` stage, no crash and no partial database.
+
 ### Build
 
 ```sh
@@ -220,6 +230,7 @@ cmd/            small standalone dev tools (dumpverb, loadcheck, replserver) -- 
                 from the repo root (`odin run cmd/replserver`, etc.)
 docs/           the original LambdaMOO/LambdaCore reference manuals (see below)
 LambdaCore.db   the bundled starting database (see Prerequisites, above)
+jhcore.db       JHCore -- a second, larger core that also loads and runs here
 run.sh          quick-start script: runs bin/moo against LambdaCore.db
 ```
 
