@@ -96,10 +96,20 @@ Two structural points that are easy to violate by accident:
 - **List copy-on-write is MOO-visible aliasing behavior**, not an optimization: mutate in place only
   when `refcount == 1`, otherwise rebuild. Refcounts use an explicit `rc` field in an allocation
   header, not the original's `((int*)ptr)[-1]` pointer arithmetic.
+- **The verb `d` (debug) flag is load-bearing, not legacy.** In a verb with `d` clear, an error
+  from that verb's *own* operation — a built-in returning an error, an undispatchable verb call,
+  a missing property — becomes the value of the expression rather than raising (`call_to_expr`
+  in `vm/eval_expr.odin`, porting `PUSH_ERROR`). Core code probes with it instead of try/except.
+  An error unwinding out of a verb that already started running is not subject to it.
+- **A verb dispatched by a built-in gets a synthetic `callers()` frame** naming that built-in
+  (`{#-1, "move", #-1, #-1, player}`) — set via `call_verb_from`'s `via_builtin`. `:enterfunc`
+  and friends check for it to prove they were called by `move()` and not by a player.
 - Deliberate, documented gaps: outbound `open_network_connection()` is disabled (matching the
   original's default non-`OUTBOUND_NETWORK` build); some `set_connection_option()` flags (`binary`,
-  `disable-oob`) are stored but inert. Databases at format version 5+ (e.g. HellCore) are rejected
-  cleanly at load — stock LambdaMOO's `DB_Version` stops at 4, and so does this.
+  `disable-oob`) are stored but inert; `listen()`/`unlisten()` are not implemented (`listeners()`
+  reports the single command-line listening point); `disassemble()` has no bytecode to report on.
+  Databases at format version 5+ (e.g. HellCore) are rejected cleanly at load — stock LambdaMOO's
+  `DB_Version` stops at 4, and so does this.
 
 ## Working in this codebase
 
@@ -114,8 +124,11 @@ Two structural points that are easy to violate by accident:
 - To investigate a misbehaving builtin against a real database, write a small standalone program in
   a scratch directory that imports `dbfile`/`objdb`/`compiler`/`vm`, loads the `.db`, and dumps a
   verb or runs a snippet through `vm.run` with `this`/`player`/`caller` bound manually. Much faster
-  than rebuilding the whole server to add print statements. `cmd/dumpverb`, `cmd/loadcheck`, and
-  `cmd/replserver` already exist for the common cases (`odin run cmd/replserver ...` from the root).
+  than rebuilding the whole server to add print statements. `cmd/dumpverb`, `cmd/loadcheck`,
+  `cmd/replserver`, and `cmd/jhverify` already exist for the common cases (`odin run
+  cmd/replserver ...` from the root). `cmd/jhverify <db>` is the compatibility auditor: object
+  graph, property-inheritance invariant, value types, every verb compiling, and every built-in
+  those verbs call being implemented — run it against a core before assuming it works.
 - **Test-reported allocator leaks are real bugs.** `core:testing`'s tracking allocator runs on every
   test; a package that starts reporting leaks or double-frees after a change has regressed, and
   should not be treated as noise.

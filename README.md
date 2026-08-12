@@ -25,6 +25,17 @@ There is no automated test suite in the *original* C server; this port adds one 
 verb in the real database, unparse, reparse, diff the AST" regression corpus that turns
 `LambdaCore.db` itself into free parser test coverage.
 
+JHCore (`jhcore.db`, bundled -- 237 objects / 2729 verb programs) is verified the same way:
+it loads, every verb compiles and survives a parse/unparse/reparse round trip, and a real
+session over a socket logs in, is placed in the world by `#0:user_connected`, and can `look`,
+`say`, `@dig`, and walk between rooms. `cmd/jhverify` is the auditor that checks all of that
+statically for any `.db` -- object-graph integrity, the property-inheritance invariant, value
+types, whether every verb compiles, and whether every built-in those verbs call is implemented:
+
+```sh
+odin run cmd/jhverify -extra-linker-flags:"-lcrypt" -- jhcore.db
+```
+
 Known, deliberate gaps (all documented at the point in the code where they matter, not silent):
 outbound network connections (`open_network_connection()`) are disabled, matching the original's
 own default (non-`OUTBOUND_NETWORK`) build configuration; `queued_tasks()`/`task_stack()` only
@@ -32,6 +43,13 @@ see genuinely-suspended tasks and report one call frame, not a full chain, an in
 consequence of the concurrency redesign described below; a handful of `set_connection_option()`
 flags (`binary`, `disable-oob`) are accepted and stored but don't change wire behavior, since
 nothing else in this port implements what they'd toggle.
+
+Six built-ins JHCore references remain unimplemented, none on a path ordinary play reaches:
+`listen()`/`unlisten()` (creating and destroying listening points at runtime -- `listeners()`
+does work, reporting the single command-line listener the original also creates as
+`new_slistener(SYSTEM_OBJECT, port, 1, 0)`), `disassemble()` (there is no bytecode to
+disassemble here -- see the VM note below), `decode_binary()`, `db_disk_size()`, and
+`buffered_output_length()` (nothing in this port buffers output to measure).
 
 ## Why a rewrite, and how it was approached
 
@@ -127,7 +145,9 @@ Two more databases sit alongside it, at opposite ends of the size range — pass
 of `LambdaCore.db` on the command line:
 
 - `jhcore.db` — JHCore, format version 4, 237 objects / 2729 verb programs (against LambdaCore's
-  97 / 1727). A second, larger corpus for the parse/unparse regression tests.
+  97 / 1727). A second, larger corpus for the parse/unparse regression tests
+  (`compiler/jhcore_corpus_test.odin`), and the core that shook out the `d`-flag, `callers()`,
+  and property-inheritance divergences fixed since.
 - `Minimal.db` — the stock bootstrapping database that ships with the original C server: format
   version 1, four objects (`#0` System Object, `#1` Root Class, `#2` The First Room, `#3` Wizard)
   and a single verb, in 321 bytes. Too bare to be a usable MOO — it has no `$string_utils`, no
@@ -231,7 +251,7 @@ netio/          TCP server, login state machine, command dispatch, the `.program
                 PREFIX/SUFFIX, connection option handling
 ansi/           %-code and |NN pipe-code color markup -> real ANSI SGR escapes
 server/         main(), CLI, signal handling, checkpoint (fork()-based), emergency mode
-cmd/            small standalone dev tools (dumpverb, loadcheck, replserver) -- like the
+cmd/            small standalone dev tools (dumpverb, loadcheck, replserver, jhverify) -- like the
                 tests above, these load `LambdaCore.db` via a relative path, so run them
                 from the repo root (`odin run cmd/replserver`, etc.)
 docs/           the original LambdaMOO/LambdaCore reference manuals (see below)
