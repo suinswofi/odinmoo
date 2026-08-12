@@ -35,6 +35,8 @@ object_builtin :: proc(w: ^Object_World, name: string, args: values.Var, ctx: ^v
 		return bf_notify(w, args, ctx), true
 	case "notify_raw":
 		return bf_notify_raw(w, args, ctx), true
+	case "listeners":
+		return bf_listeners(w, args), true
 	case "connection_name":
 		return bf_connection_name(w, args, ctx), true
 	case "boot_player":
@@ -185,7 +187,9 @@ bf_parent :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 		return err_result_local(.E_TYPE, "Type mismatch")
 	}
 	if !valid(w.db, v.data.obj) {
-		return err_result_local(.E_INVIND, "Invalid indirection")
+		// E_INVARG, not E_INVIND: objects.c:347. The distinction is load-bearing --
+		// $object_utils:isa walks parent() up to #-1 and catches only E_INVARG.
+		return err_result_local(.E_INVARG, "Invalid argument")
 	}
 	return ok_result(values.obj_val(w.db.objects[v.data.obj].parent))
 }
@@ -201,7 +205,7 @@ bf_children :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 		return err_result_local(.E_TYPE, "Type mismatch")
 	}
 	if !valid(w.db, v.data.obj) {
-		return err_result_local(.E_INVIND, "Invalid indirection")
+		return err_result_local(.E_INVARG, "Invalid argument") // objects.c:381
 	}
 	items: [dynamic]values.Var
 	c := w.db.objects[v.data.obj].child
@@ -261,6 +265,29 @@ bf_callers :: proc(args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	}
 	include_lines := values.list_len(args) == 1 && values.is_true(values.list_get(args, 1))
 	items: [dynamic]values.Var
+
+	// A frame dispatched by a built-in is preceded by a synthetic entry naming that built-in
+	// (make_stack_list, execute.c:431-447): {#-1, "move", #-1, #-1, player}. It is emitted
+	// for the CURRENT frame too, whose own entry callers() otherwise omits -- that's the
+	// whole point, since it's how :enterfunc/:exitfunc/:initialize/:recycle tell "move()
+	// called me" from "a player called me" ($perm_utils:invoked_by_function).
+	append_builtin_frame :: proc(items: ^[dynamic]values.Var, a: ^vm.Activation, include_lines: bool) {
+		if a.bi_func_name == "" {
+			return
+		}
+		frame := make([]values.Var, include_lines ? 6 : 5)
+		frame[0] = values.obj_val(values.NOTHING)
+		frame[1] = values.str_val(strings.clone(a.bi_func_name))
+		frame[2] = values.obj_val(values.NOTHING)
+		frame[3] = values.obj_val(values.NOTHING)
+		frame[4] = values.obj_val(a.player)
+		if include_lines {
+			frame[5] = values.int_val(0)
+		}
+		append(items, values.list_val(frame))
+	}
+
+	append_builtin_frame(&items, ctx.activation, include_lines)
 	for a := ctx.activation.parent; a != nil && a.depth >= 0; a = a.parent {
 		nfields := include_lines ? 6 : 5
 		frame := make([]values.Var, nfields)
@@ -273,6 +300,7 @@ bf_callers :: proc(args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 			frame[5] = values.int_val(0) // line number: not tracked (tree-walking VM, no PC)
 		}
 		append(&items, values.list_val(frame))
+		append_builtin_frame(&items, a, include_lines)
 	}
 	return ok_result(values.list_val(items[:]))
 }
@@ -337,6 +365,31 @@ bf_notify_raw :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context)
 		w.conn.notify_raw(w.conn.user_data, player.data.obj, text.data.str.s)
 	}
 	return ok_result(values.int_val(1))
+}
+
+// bf_listeners ports server.c's bf_listeners(): one {object, canonical-desc, print-messages}
+// triple per listening point, no permission check. This port has a single listening point
+// (the command-line port), so the list has one entry -- but it must exist and must name the
+// right object: JHCore's $mcp:user_connected is `if ($list_utils:assoc(caller, listeners()))`
+// on the connect path, so an unimplemented listeners() aborts #0:user_connected before it
+// can run confunc, stranding every connecting player wherever the DB last left them.
+@(private = "file")
+bf_listeners :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
+	values.free_var(args)
+	if w.conn.listening_points == nil {
+		return ok_result(values.empty_list()) // no network layer wired up (e.g. -e mode)
+	}
+	points := w.conn.listening_points(w.conn.user_data)
+	defer delete(points)
+	items := make([]values.Var, len(points))
+	for p, i in points {
+		entry := make([]values.Var, 3)
+		entry[0] = values.obj_val(p.object)
+		entry[1] = values.int_val(i32(p.port))
+		entry[2] = values.int_val(p.print_messages ? 1 : 0)
+		items[i] = values.list_val(entry)
+	}
+	return ok_result(values.list_val(items))
 }
 
 @(private = "file")
@@ -607,7 +660,7 @@ bf_is_clear_property :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Resu
 		return err_result_local(.E_TYPE, "Type mismatch")
 	}
 	if !valid(w.db, obj_v.data.obj) {
-		return err_result_local(.E_INVIND, "Invalid indirection")
+		return err_result_local(.E_INVARG, "Invalid argument") // property.c:293
 	}
 	h := find_property(w.db, obj_v.data.obj, name_v.data.str.s)
 	if !h.found || h.builtin != .None {
@@ -801,7 +854,7 @@ bf_move :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	if dest != values.NOTHING {
 		accept_args := make([]values.Var, 1)
 		accept_args[0] = values.obj_val(what)
-		result := call_verb_from(w, ctx.world, dest, dest, "accept", values.list_val(accept_args), ctx)
+		result := call_verb_from(w, ctx.world, dest, dest, "accept", values.list_val(accept_args), ctx, via_builtin = "move")
 		if result.raised {
 			if result.code != .E_VERBNF {
 				return result
@@ -840,7 +893,7 @@ bf_move :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	if valid(w.db, oldloc) {
 		exit_args := make([]values.Var, 1)
 		exit_args[0] = values.obj_val(what)
-		result := call_verb_from(w, ctx.world, oldloc, oldloc, "exitfunc", values.list_val(exit_args), ctx)
+		result := call_verb_from(w, ctx.world, oldloc, oldloc, "exitfunc", values.list_val(exit_args), ctx, via_builtin = "move")
 		if result.raised {
 			if result.code == .E_MAXREC {
 				return result
@@ -855,7 +908,7 @@ bf_move :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	if valid(w.db, dest) && valid(w.db, what) && db_object_location(w, what) == dest {
 		enter_args := make([]values.Var, 1)
 		enter_args[0] = values.obj_val(what)
-		result := call_verb_from(w, ctx.world, dest, dest, "enterfunc", values.list_val(enter_args), ctx)
+		result := call_verb_from(w, ctx.world, dest, dest, "enterfunc", values.list_val(enter_args), ctx, via_builtin = "move")
 		if result.raised {
 			if result.code == .E_MAXREC {
 				return result

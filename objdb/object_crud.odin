@@ -147,7 +147,7 @@ bf_create :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> 
 	resync_subtree_propvals(w.db, oid, obj.owner, &snap)
 
 	init_args := values.list_val(make([]values.Var, 0))
-	result := call_verb_from(w, ctx.world, oid, oid, "initialize", init_args, ctx)
+	result := call_verb_from(w, ctx.world, oid, oid, "initialize", init_args, ctx, via_builtin = "create")
 	if result.raised {
 		if result.code == .E_MAXREC {
 			return result
@@ -185,7 +185,7 @@ bf_recycle :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) ->
 	}
 
 	recycle_args := values.list_val(make([]values.Var, 0))
-	rresult := call_verb_from(w, ctx.world, oid, oid, "recycle", recycle_args, ctx)
+	rresult := call_verb_from(w, ctx.world, oid, oid, "recycle", recycle_args, ctx, via_builtin = "recycle")
 	if rresult.raised {
 		if rresult.code == .E_MAXREC {
 			return rresult
