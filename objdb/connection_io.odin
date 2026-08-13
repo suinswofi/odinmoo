@@ -85,24 +85,56 @@ bf_read :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	if non_blocking {
 		return ok_result(values.int_val(0)) // no input pending, matches read_input_now()
 	}
-	if w.conn.register_reader == nil || !w.conn.register_reader(w.conn.user_data, conn_oid, ctx.activation.task_id) {
-		return err_result_local(.E_INVARG, "Not a connected player")
-	}
-	if w.scheduler == nil {
-		if w.conn.unregister_reader != nil {
-			w.conn.unregister_reader(w.conn.user_data, conn_oid, ctx.activation.task_id)
-		}
+	if w.scheduler == nil || w.conn.register_reader == nil {
 		return err_result_local(.E_INVARG, "Not a connected player")
 	}
 
-	// Park exactly like suspend(): release the big lock, wait to be resumed (by
-	// netio/input_queue.odin's wake_reader, once a matching line arrives), reacquire before
-	// returning to the caller's MOO code.
-	suspend_result, _ := tasks.scheduler_builtin(w.scheduler, "suspend", values.empty_list(), ctx)
-	if w.conn.unregister_reader != nil {
-		w.conn.unregister_reader(w.conn.user_data, conn_oid, ctx.activation.task_id)
+	// Two-phase park, in this exact order:
+	//
+	//   1. register_task -- the scheduler entry EXISTS before anything can try to wake it;
+	//   2. register_reader -- only now does netio's deliver() see a parked reader;
+	//   3. re-check the queue -- a line that arrived between the dequeue attempt above and
+	//      step 2 was queued with no reader visible, and the drain worker won't touch it
+	//      while reader_task_id is set: without this check the reader would park forever
+	//      over a line that's already waiting;
+	//   4. park_wait.
+	//
+	// Doing 1 before 2 is what makes a delivery racing this window safe: deliver() claims
+	// the reader and resume()s it, and the entry from step 1 catches that resume even
+	// though we haven't reached park_wait yet (its wait loop checks `woken` first). The
+	// old order -- expose reader, then build the wait machinery inside suspend() -- let
+	// that resume fail with E_INVARG and the delivery wrongly conclude the reader died.
+	task_id := ctx.activation.task_id
+	info := tasks.register_task(w.scheduler, task_id, ctx.activation)
+	if !w.conn.register_reader(w.conn.user_data, conn_oid, task_id) {
+		stray, _ := tasks.park_cancel(w.scheduler, task_id, info)
+		values.free_var(stray)
+		return err_result_local(.E_INVARG, "Not a connected player")
 	}
-	return suspend_result
+	if line, ok := w.conn.try_dequeue_input(w.conn.user_data, conn_oid); ok {
+		if w.conn.unregister_reader != nil {
+			w.conn.unregister_reader(w.conn.user_data, conn_oid, task_id)
+		}
+		stray, was_woken := tasks.park_cancel(w.scheduler, task_id, info)
+		if was_woken && stray.type == .Str && w.conn.force_input != nil {
+			// A delivery won the race after all: its line is NEWER than the queued one
+			// we're about to return, so it goes back to the FRONT of the queue.
+			w.conn.force_input(w.conn.user_data, conn_oid, stray.data.str.s, true)
+		}
+		values.free_var(stray)
+		defer delete(line)
+		return ok_result(values.str_val(strings.clone(line)))
+	}
+
+	value, killed := tasks.park_wait(w.scheduler, task_id, info, -1)
+	if w.conn.unregister_reader != nil {
+		w.conn.unregister_reader(w.conn.user_data, conn_oid, task_id)
+	}
+	if killed {
+		values.free_var(value)
+		return err_result_local(.E_INVARG, "Task killed")
+	}
+	return ok_result(value)
 }
 
 // bf_force_input ports tasks.c's bf_force_input(): (conn, string, [at-front]) -> injects a

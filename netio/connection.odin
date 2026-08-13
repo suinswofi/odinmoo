@@ -53,8 +53,11 @@ Connection :: struct {
 	drains:         sync.Wait_Group, // outstanding drain threads (input_queue.odin's spawn_drain)
 	drain_running:  bool, // guards against spawning a second drain thread while one is working
 
-	// `.program` intrinsic editor state (see program_editor.odin). Only ever touched by this
-	// connection's own recv-loop thread, so unlike the fields above it needs no lock.
+	// `.program` intrinsic editor state (see program_editor.odin). Only ever touched while
+	// dispatching this connection's lines -- which happens on at most one drain worker at a
+	// time (input_queue.odin's drain_running), never concurrently -- so unlike the fields
+	// above it needs no lock; the drain_running handoff through io_lock orders successive
+	// workers' accesses.
 	programming:        bool,
 	program_obj:        values.Objid, // the verb's DEFINER (h.definer from find_defined_verb), not necessarily the object named in ".program obj:verb"
 	program_verb_name:  string, // owned; the verb name as typed, re-resolved against program_obj when programming ends

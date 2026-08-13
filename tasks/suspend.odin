@@ -65,7 +65,26 @@ bf_suspend :: proc(s: ^Scheduler, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 
 	id := ctx.activation.task_id
 	info := register_task(s, id, ctx.activation)
+	resume_value, killed := park_wait(s, id, info, seconds)
 
+	if killed {
+		values.free_var(resume_value)
+		return raise_err(.E_INVARG, "Task killed")
+	}
+	// resume_value's zero value is Var{type: .Int, data: 0} (Int is Var_Type's zero
+	// value) -- exactly the right default when nobody ever called resume() with a value
+	// (a timeout, or a bare `resume(id)`), so no separate "was it set" check is needed.
+	return vm.call_ok(resume_value)
+}
+
+// park_wait is the waiting half of suspend()/read()'s park: releases the big lock, blocks
+// on info's condition variable until resume()/kill_task() or the timeout (seconds < 0 means
+// forever), then reacquires the big lock. `info` must come from register_task, and this
+// consumes it. Split out from bf_suspend so read() can register FIRST, then expose itself
+// to line delivery (netio's reader_task_id), then wait -- if the wait machinery only came
+// into existence after the reader was visible, a delivery racing that window would resume()
+// a task id with no registry entry, get E_INVARG, and wrongly conclude the reader was gone.
+park_wait :: proc(s: ^Scheduler, id: int, info: ^Task_Info, seconds: f64) -> (resume_value: values.Var, killed: bool) {
 	sync.mutex_lock(&s.meta_lock)
 	sync.mutex_unlock(&s.big_lock) // stop competing for the DB while parked
 	if seconds < 0 {
@@ -82,8 +101,8 @@ bf_suspend :: proc(s: ^Scheduler, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 			sync.cond_wait_with_timeout(&info.cond, &s.meta_lock, remaining)
 		}
 	}
-	resume_value := info.resume_value
-	killed := info.killed
+	resume_value = info.resume_value
+	killed = info.killed
 	// Unregistering must be ATOMIC with reading the outcome, inside this same meta_lock
 	// hold. With the old unlock-then-unregister ordering, a resume() arriving in that gap
 	// found the task still registered, wrote its value into `info`, and reported success --
@@ -98,15 +117,22 @@ bf_suspend :: proc(s: ^Scheduler, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	free(info)
 
 	sync.mutex_lock(&s.big_lock) // reacquire before touching the DB again
+	return resume_value, killed
+}
 
-	if killed {
-		values.free_var(resume_value)
-		return raise_err(.E_INVARG, "Task killed")
-	}
-	// resume_value's zero value is Var{type: .Int, data: 0} (Int is Var_Type's zero
-	// value) -- exactly the right default when nobody ever called resume() with a value
-	// (a timeout, or a bare `resume(id)`), so no separate "was it set" check is needed.
-	return vm.call_ok(resume_value)
+// park_cancel abandons a park begun with register_task without ever waiting: removes the
+// registry entry and disposes of info, all without touching the big lock (the caller never
+// released it). If a resume() landed in the meantime, its value is handed back with
+// was_woken=true so the caller can do something sensible with it rather than leak it --
+// read() puts a stray delivered line back at the front of the input queue.
+park_cancel :: proc(s: ^Scheduler, id: int, info: ^Task_Info) -> (stray: values.Var, was_woken: bool) {
+	sync.mutex_lock(&s.meta_lock)
+	stray = info.resume_value
+	was_woken = info.woken
+	delete_key(&s.tasks, id)
+	sync.mutex_unlock(&s.meta_lock)
+	free(info)
+	return stray, was_woken
 }
 
 // bf_resume ports resume_task(): wakes a suspended task, handing it `value` (default 0) as

@@ -13,14 +13,23 @@ package netio
 // (no dispatch); else if "hold-input" is set, queue it; else dispatch it as an ordinary
 // command/login line.
 //
-// The one real subtlety: on_forced_line is always called from INSIDE a running MOO task's own
-// thread, which already holds the scheduler's big lock -- dispatching a command synchronously
-// from there would try to reacquire that same (non-reentrant) lock and deadlock. So a forced
-// line that isn't consumed by a waiting reader always queues, then a fresh one-shot thread
-// (spawn_drain, mirroring tasks/fork.odin's do_fork) is used to actually dispatch it, exactly
-// like the original's "just enqueue it, the scheduler picks it up later" model. A real
-// socket line (on_incoming_line) never has this problem -- it runs on that connection's own
-// recv thread, which isn't holding the big lock yet -- so it can dispatch inline as before.
+// NOTHING dispatches MOO code on a connection's recv thread -- every line, socket-typed or
+// force_input()'d, either wakes a parked reader directly or goes through the queue and a
+// drain worker thread (spawn_drain, mirroring tasks/fork.odin's do_fork), exactly like the
+// original's "just enqueue it, the scheduler picks it up later" model. Two reasons, both
+// load-bearing:
+//
+//  - on_forced_line runs on a MOO task's own thread, which already holds the scheduler's
+//    (non-reentrant) big lock: dispatching synchronously would self-deadlock.
+//  - on_incoming_line runs on the recv thread, and dispatching there means a command (or a
+//    `;`-eval) that calls read()/suspend() parks the ONE thread that receives this
+//    connection's input: read(player) from your own connection would deadlock until the
+//    connection died. The original never had the problem because its network loop and task
+//    execution were always decoupled; queue-plus-drain is that same decoupling here.
+//
+// The drain worker processes queued lines strictly in order, one at a time, and stands down
+// while a reader is parked (the reader consumes the queue itself via try_dequeue) or while
+// hold-input is set.
 
 import "../tasks"
 import "../values"
@@ -72,9 +81,10 @@ connection_io_destroy :: proc(conn: ^Connection) {
 	}
 }
 
-// on_incoming_line handles a line read directly off conn's own socket -- see header.
+// on_incoming_line handles a line read directly off conn's own socket -- see header for why
+// it queues rather than dispatching on the recv thread.
 on_incoming_line :: proc(conn: ^Connection, line: string) {
-	deliver(conn, strings.clone(line), false, false)
+	deliver(conn, strings.clone(line), false, true)
 }
 
 // on_forced_line handles a force_input()'d line -- see header for why it must never
@@ -264,7 +274,14 @@ hook_unregister_reader :: proc(user_data: rawptr, player: values.Objid, task_id:
 	if conn.reader_task_id == task_id {
 		conn.reader_task_id = 0
 	}
+	// The drain worker stands down while a reader is parked; if lines queued up in the
+	// meantime (or the read consumed only some of them), restart it now that the reader is
+	// gone, or they'd sit until the next line happened to arrive.
+	kick := len(conn.pending_lines) > 0 && !values.is_true(conn.options["hold-input"])
 	sync.mutex_unlock(&conn.io_lock)
+	if kick {
+		spawn_drain(conn)
+	}
 }
 
 hook_force_input :: proc(user_data: rawptr, player: values.Objid, line: string, at_front: bool) -> bool {
