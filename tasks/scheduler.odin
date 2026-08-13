@@ -78,8 +78,10 @@ new_task_id :: proc(s: ^Scheduler) -> int {
 }
 
 // register_task records a task as suspended/waiting, so resume()/kill_task() (called from
-// a different thread) can find it, and so queued_tasks()/task_stack() can report on it. Must
-// be paired with unregister_task once the wait ends.
+// a different thread) can find it, and so queued_tasks()/task_stack() can report on it.
+// Teardown happens inside bf_suspend itself -- the entry must be removed atomically with
+// reading the wait's outcome (under the same meta_lock hold), so there is deliberately no
+// separate unregister helper to reach for.
 register_task :: proc(s: ^Scheduler, id: int, act: ^vm.Activation) -> ^Task_Info {
 	info := new(Task_Info)
 	info.id = id
@@ -95,12 +97,6 @@ register_task :: proc(s: ^Scheduler, id: int, act: ^vm.Activation) -> ^Task_Info
 	s.tasks[id] = info
 	sync.mutex_unlock(&s.meta_lock)
 	return info
-}
-
-unregister_task :: proc(s: ^Scheduler, id: int) {
-	sync.mutex_lock(&s.meta_lock)
-	delete_key(&s.tasks, id)
-	sync.mutex_unlock(&s.meta_lock)
 }
 
 // task_exists reports whether a task is currently registered (i.e. suspended and waiting) --

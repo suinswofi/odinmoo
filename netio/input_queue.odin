@@ -86,12 +86,21 @@ on_forced_line :: proc(conn: ^Connection, line: string, at_front: bool) {
 @(private = "file")
 deliver :: proc(conn: ^Connection, line: string, at_front: bool, from_other_thread: bool) {
 	sync.mutex_lock(&conn.io_lock)
-	if conn.reader_task_id != 0 {
+	for conn.reader_task_id != 0 {
 		tid := conn.reader_task_id
 		conn.reader_task_id = 0
 		sync.mutex_unlock(&conn.io_lock)
-		wake_reader(conn.server.scheduler, tid, line)
-		return
+		if wake_reader(conn.server.scheduler, tid, strings.clone(line)) {
+			delete(line)
+			return
+		}
+		// The parked read() was already gone -- timed out or kill_task()'d in the moment
+		// between our claim above and the resume attempt (bf_suspend unregisters
+		// atomically with committing to that outcome, so the resume cleanly failed
+		// rather than writing into a task that would never look). We still hold the
+		// line; re-take the lock and deliver it the ordinary way. The loop re-checks
+		// reader_task_id because a NEW read() may legitimately have parked meanwhile.
+		sync.mutex_lock(&conn.io_lock)
 	}
 	hold := values.is_true(conn.options["hold-input"])
 	if hold || from_other_thread {
@@ -118,8 +127,11 @@ deliver :: proc(conn: ^Connection, line: string, at_front: bool, from_other_thre
 }
 
 // Not file-private: server.odin's server_stop() calls this too -- see its own comment on why
-// a parked reader can't be woken just by closing its connection's socket.
-wake_reader :: proc(s: ^tasks.Scheduler, task_id: int, line: string) {
+// a parked reader can't be woken just by closing its connection's socket. Takes ownership
+// of `line` either way (bf_resume consumes its args even on failure); returns whether the
+// task actually received it, so deliver() can fall back with its own copy instead of
+// letting the line vanish when the reader died racing the delivery.
+wake_reader :: proc(s: ^tasks.Scheduler, task_id: int, line: string) -> (delivered: bool) {
 	args := make([]values.Var, 2)
 	args[0] = values.int_val(i32(task_id))
 	args[1] = values.str_val(line)
@@ -127,9 +139,10 @@ wake_reader :: proc(s: ^tasks.Scheduler, task_id: int, line: string) {
 	if rr.raised {
 		delete(rr.msg)
 		values.free_var(rr.rvalue)
-	} else {
-		values.free_var(rr.value)
+		return false
 	}
+	values.free_var(rr.value)
+	return true
 }
 
 @(private = "file")

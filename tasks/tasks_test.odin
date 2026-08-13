@@ -297,3 +297,81 @@ test_task_id_builtin :: proc(t: ^testing.T) {
 	defer values.free_var(r.value)
 	testing.expect(t, r.signal == .Return && r.value.data.num == 12345)
 }
+
+// The timeout-vs-resume race: a resume() arriving just as the suspend times out must NOT
+// have its value silently swallowed. bf_suspend now unregisters atomically with committing
+// to the timeout, so the late resume gets a clean E_INVARG -- the caller (netio's
+// wake_reader for a parked read()) keeps the line and can deliver it another way. The old
+// unlock-then-unregister ordering let the resume "succeed" into a Task_Info about to be
+// freed: value leaked, input line lost, nobody told.
+@(test)
+test_resume_after_timeout_is_invarg :: proc(t: ^testing.T) {
+	sync.mutex_lock(&serial_tests)
+	defer sync.mutex_unlock(&serial_tests)
+	s := scheduler_init()
+	defer scheduler_destroy(&s)
+	world := make_test_world(&s)
+	task_id := new_task_id(&s)
+
+	sync.mutex_lock(&s.big_lock)
+	r := run_src(t, &world, task_id, `return suspend(0);`)
+	sync.mutex_unlock(&s.big_lock)
+	testing.expect(t, r.signal == .Return)
+	values.free_var(r.value)
+
+	// The suspend has returned (timed out); its registry entry must already be gone, so a
+	// late resume cleanly fails instead of writing into freed memory.
+	resume_args := make([]values.Var, 2)
+	resume_args[0] = values.int_val(i32(task_id))
+	resume_args[1] = values.str_val(strings.clone("late line"))
+	rr := bf_resume(&s, values.list_val(resume_args))
+	if !testing.expect(t, rr.raised, "late resume must raise E_INVARG") {
+		values.free_var(rr.value)
+		return
+	}
+	testing.expectf(t, rr.code == .E_INVARG, "wanted E_INVARG, got %v", rr.code)
+	delete(rr.msg)
+	values.free_var(rr.rvalue)
+}
+
+// A second resume() before the first has been consumed is "not suspended" (matching the
+// original's resume_task queue check) -- accepting it would overwrite and leak the first
+// resume's value.
+@(test)
+test_double_resume_is_invarg :: proc(t: ^testing.T) {
+	sync.mutex_lock(&serial_tests)
+	defer sync.mutex_unlock(&serial_tests)
+	s := scheduler_init()
+	defer scheduler_destroy(&s)
+	task_id := new_task_id(&s)
+
+	// Register a parked task by hand -- no thread actually waits on it, which is exactly
+	// the window this exercises: resumed but not yet torn down.
+	info := register_task(&s, task_id, nil)
+
+	first := make([]values.Var, 2)
+	first[0] = values.int_val(i32(task_id))
+	first[1] = values.str_val(strings.clone("first"))
+	r1 := bf_resume(&s, values.list_val(first))
+	testing.expect(t, !r1.raised)
+	values.free_var(r1.value)
+
+	second := make([]values.Var, 2)
+	second[0] = values.int_val(i32(task_id))
+	second[1] = values.str_val(strings.clone("second"))
+	r2 := bf_resume(&s, values.list_val(second))
+	if !testing.expect(t, r2.raised, "second resume must raise E_INVARG") {
+		values.free_var(r2.value)
+	} else {
+		testing.expectf(t, r2.code == .E_INVARG, "wanted E_INVARG, got %v", r2.code)
+		delete(r2.msg)
+		values.free_var(r2.rvalue)
+	}
+
+	// Tear down what bf_suspend would have: consume the delivered value, drop the entry.
+	sync.mutex_lock(&s.meta_lock)
+	values.free_var(info.resume_value)
+	delete_key(&s.tasks, task_id)
+	sync.mutex_unlock(&s.meta_lock)
+	free(info)
+}

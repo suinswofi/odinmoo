@@ -84,8 +84,17 @@ bf_suspend :: proc(s: ^Scheduler, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	}
 	resume_value := info.resume_value
 	killed := info.killed
+	// Unregistering must be ATOMIC with reading the outcome, inside this same meta_lock
+	// hold. With the old unlock-then-unregister ordering, a resume() arriving in that gap
+	// found the task still registered, wrote its value into `info`, and reported success --
+	// while this side had already committed to the timeout/kill outcome and was about to
+	// free(info). The value (for a parked read(), a line of player input) was leaked and
+	// lost: neither returned here nor anywhere the sender could see. Removing the entry
+	// before releasing meta_lock forces any later resume() to get E_INVARG instead, which
+	// tells its caller (netio's wake_reader) that delivery failed while it still holds the
+	// line and can fall back to normal dispatch.
+	delete_key(&s.tasks, id)
 	sync.mutex_unlock(&s.meta_lock)
-	unregister_task(s, id)
 	free(info)
 
 	sync.mutex_lock(&s.big_lock) // reacquire before touching the DB again
@@ -117,7 +126,11 @@ bf_resume :: proc(s: ^Scheduler, args: values.Var) -> vm.Call_Result {
 
 	sync.mutex_lock(&s.meta_lock)
 	info, ok := s.tasks[id]
-	if !ok {
+	// An already-woken (or killed) entry counts as "not suspended" too: the task has been
+	// handed its outcome and just hasn't torn the entry down yet. Treating it as resumable
+	// would overwrite (and leak) the first resume's value -- the original's resume_task()
+	// likewise only accepts tasks actually in the suspended queue.
+	if !ok || info.woken || info.killed {
 		sync.mutex_unlock(&s.meta_lock)
 		return raise_err(.E_INVARG, "Task is not suspended")
 	}
@@ -148,7 +161,7 @@ bf_kill_task :: proc(s: ^Scheduler, args: values.Var) -> vm.Call_Result {
 
 	sync.mutex_lock(&s.meta_lock)
 	info, ok := s.tasks[id]
-	if !ok {
+	if !ok || info.woken || info.killed {
 		sync.mutex_unlock(&s.meta_lock)
 		return raise_err(.E_INVARG, "Task is not suspended")
 	}
