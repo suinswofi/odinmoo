@@ -103,9 +103,12 @@ The short version, subsystem by subsystem:
   provides real concurrency, with no `select()`-loop bookkeeping left to replicate. The real
   login state machine, command parser (`parse_command`/`match_object`/verb dispatch), and the
   `.program`/`PREFIX`/`SUFFIX` intrinsic commands are all ported on top of this.
-- **Server/checkpointing** (`server/`) — checkpointing still uses a real `fork()` (Odin exposes
-  POSIX `fork()` directly) for a copy-on-write snapshot, exactly like the original, since it's
-  still the simplest correct approach and Odin doesn't need anything fancier here.
+- **Server/checkpointing** (`server/`) — re-engineered away from the original's `fork()`
+  copy-on-write snapshot: `fork()` in a *multi-threaded* process (which this server is, unlike
+  the original) can deadlock the child if any vanished thread held the allocator's lock at the
+  fork instant. Instead the DB is serialized to an in-memory buffer under the scheduler's lock
+  (memory-speed) and a background thread does the slow disk write — same "don't stall the MOO
+  for the disk" property, no fork hazards.
 - **ANSI color** (`ansi/`) — genuinely new, not a port of anything: a `%`-code markup language
   (the convention used by other enhanced MU* cores) plus a classic BBS-door pipe-code language
   (`|00`–`|31`, PCBoard/Renegade/Synchronet-style, extended in this project with bright

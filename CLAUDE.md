@@ -66,7 +66,7 @@ one-directional and worth keeping that way):
 | `tasks/` | `tasks.c` | scheduler: `fork`/`suspend`/`resume`/`kill_task` |
 | `objdb/` | `db_objects.c`, `db_verbs.c`, `db_properties.c`, `parse_cmd.c`, `match.c` | object graph, inheritance, permissions, quota, command parser/dispatcher, the DB-dependent builtins |
 | `netio/` | `network.c`, `net_bsd_tcp.c` | TCP server, login state machine, command dispatch, `.program` editor, `PREFIX`/`SUFFIX` |
-| `server/` | `server.c` | `main()`, CLI, signals, `fork()`-based checkpointing, emergency mode |
+| `server/` | `server.c` | `main()`, CLI, signals, checkpointing (serialize under lock, write on a thread), emergency mode |
 
 Two structural points that are easy to violate by accident:
 
@@ -90,7 +90,14 @@ Two structural points that are easy to violate by accident:
   DB must hold it. The visible cost: `queued_tasks()`/`task_stack()` see only genuinely-suspended
   tasks and report one frame rather than a full chain.
 - **Each connection gets its own thread with a blocking socket**, instead of one `select()`/`poll()`
-  multiplexing loop. There is no event loop to add a descriptor to.
+  multiplexing loop. There is no event loop to add a descriptor to. Outbound writes never happen
+  inline: `send_line` appends to a bounded per-connection buffer drained by a dedicated writer
+  thread (`enqueue_output` in `netio/connection.odin`), because senders usually hold `big_lock`
+  and a blocking `send` there would let one stalled client freeze every task.
+- **Every path that executes MOO code or reads the object DB must hold `Scheduler.big_lock`** —
+  including "just a lookup" like `parse_command`'s object matching or an `is_player` check on a
+  connection thread. When adding an entry point, grep for `vm.run`/`call_root_verb` and copy an
+  existing site's locking.
 - **Enum ordinals in `values/` are DB-format-visible** (`Var_Type`, `Error`) — they are stored as
   raw integers in `.db` files. Never reorder or insert into them.
 - **List copy-on-write is MOO-visible aliasing behavior**, not an optimization: mutate in place only
