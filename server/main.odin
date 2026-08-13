@@ -136,6 +136,7 @@ main :: proc() {
 	fmt.println("SHUTTING DOWN: signal received")
 	netio.server_stop(&s)
 	fmt.println("DUMPING: final checkpoint before exit")
+	checkpoint_wait() // let any in-flight background checkpoint write finish first
 	sync.mutex_lock(&sched.big_lock)
 	ok := dbfile.save_database(&db, checkpoint_db_path)
 	sync.mutex_unlock(&sched.big_lock)

@@ -131,6 +131,17 @@ write_object :: proc(w: ^Writer, obj: ^Object) {
 // object records don't have to interleave with variable-length source text), task queue
 // trailer, active connections trailer.
 save_database :: proc(db: ^Database, path: string) -> bool {
+	data := save_database_bytes(db)
+	defer delete(data)
+	werr := os.write_entire_file(path, data)
+	return werr == nil
+}
+
+// save_database_bytes serializes the whole database to an owned byte slice without touching
+// the filesystem -- the checkpointing path serializes under the scheduler's big lock (fast,
+// memory-speed) and hands the immutable buffer to a background thread for the actual disk
+// write (slow), so the lock is never held across file I/O. See server/checkpoint.odin.
+save_database_bytes :: proc(db: ^Database) -> []byte {
 	w := writer_make()
 	defer writer_destroy(&w)
 
@@ -215,7 +226,7 @@ save_database :: proc(db: ^Database, path: string) -> bool {
 		write_string(&w, "0 active connections with listeners")
 	}
 
-	data := strings.to_string(w.b)
-	werr := os.write_entire_file(path, transmute([]byte)data)
-	return werr == nil
+	out := make([]byte, len(w.b.buf))
+	copy(out, w.b.buf[:])
+	return out
 }
