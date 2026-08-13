@@ -170,7 +170,13 @@ login_dispatch :: proc(conn: ^Connection, line: string) {
 	}
 	defer values.free_var(result.value)
 
-	if result.value.type == .Obj && is_player_object(s.world, result.value.data.obj) {
+	// is_player_object reads db.objects (validity + the User flag) -- that's a DB access
+	// like any other, and a forked task from another connection's login can be mutating the
+	// object map concurrently, so it needs the lock exactly as the verb call above did.
+	sync.mutex_lock(&s.scheduler.big_lock)
+	is_player := result.value.type == .Obj && is_player_object(s.world, result.value.data.obj)
+	sync.mutex_unlock(&s.scheduler.big_lock)
+	if is_player {
 		finish_login(s, conn, result.value.data.obj)
 	}
 }

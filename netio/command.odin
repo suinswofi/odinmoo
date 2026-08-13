@@ -60,7 +60,13 @@ dispatch_command :: proc(conn: ^Connection, line: string) {
 	s := conn.server
 	ow := (^objdb.Object_World)(s.world.user_data)
 
+	// parse_command is a DB read like any other -- dobj/iobj matching walks the player's and
+	// the room's contents chains -- so it can't run unlocked on this connection thread while
+	// other tasks mutate the object graph. Locked separately from the dispatch block below
+	// because handle_intrinsic_command takes the (non-reentrant) lock itself.
+	sync.mutex_lock(&s.scheduler.big_lock)
 	pc := objdb.parse_command(ow.db, line, conn.player)
+	sync.mutex_unlock(&s.scheduler.big_lock)
 	defer objdb.parsed_command_destroy(&pc)
 	if !pc.ok {
 		return
