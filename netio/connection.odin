@@ -34,6 +34,7 @@ import "../vm"
 import "core:net"
 import "core:strings"
 import "core:sync"
+import "core:thread"
 import "core:time"
 
 Connection :: struct {
@@ -64,6 +65,86 @@ Connection :: struct {
 	// output. Empty string ("") means unset, matching the original's NULL-slot convention.
 	output_prefix: string, // owned
 	output_suffix: string, // owned
+
+	// Outbound buffering. Almost every send happens from a MOO task's thread WHILE HOLDING
+	// the scheduler's big_lock (notify() and friends), so a direct blocking send_tcp there
+	// would let one stalled client -- full TCP window, peer stopped reading -- freeze every
+	// task in the server at its next notify() to that connection. The original never has
+	// this problem because its select() loop only writes to ready sockets, buffering the
+	// rest (network.c's enqueue_output with MAX_QUEUED_OUTPUT). Reproduced here as: sends
+	// append to out_buf (bounded the same way) and a dedicated per-connection writer thread
+	// drains it to the socket, blocking only itself.
+	out_lock:    sync.Mutex,
+	out_cond:    sync.Cond, // signaled on new output and on out_closing
+	out_buf:     [dynamic]byte,
+	out_closing: bool, // writer flushes what it has and exits; enqueues become no-ops
+	out_done:    sync.Wait_Group, // signaled when the writer thread has exited
+}
+
+// MAX_QUEUED_OUTPUT matches options.h's default (65536): the most outbound bytes a
+// connection may have buffered before the oldest are discarded (with a notice, like the
+// original's "lines of output flushed" message -- byte-counted here rather than line-
+// counted, since the buffer is a flat byte stream).
+@(private = "file")
+MAX_QUEUED_OUTPUT :: 65536
+
+// enqueue_output appends msg to conn's outbound buffer and wakes the writer thread. Never
+// blocks on the network, so it's safe to call while holding big_lock (which is exactly what
+// notify() does). Silently drops output once the connection is shutting down. Not
+// file-private: input_queue.odin's telnet ECHO negotiation routes through it too, so those
+// bytes stay ordered with ordinary output.
+enqueue_output :: proc(conn: ^Connection, msg: []byte) {
+	sync.mutex_lock(&conn.out_lock)
+	defer sync.mutex_unlock(&conn.out_lock)
+	if conn.out_closing {
+		return
+	}
+	if len(conn.out_buf) + len(msg) > MAX_QUEUED_OUTPUT {
+		// Same policy as the original's flush_pushed_output: discard the backlog the slow
+		// client never read, tell them, keep the newest output flowing.
+		clear(&conn.out_buf)
+		notice := ">> Network buffer overflow: previous output to you has been lost <<\r\n"
+		append(&conn.out_buf, ..transmute([]byte)notice)
+	}
+	append(&conn.out_buf, ..msg)
+	sync.cond_signal(&conn.out_cond)
+}
+
+// output_writer_proc is the per-connection writer thread: waits for buffered output, swaps
+// the buffer out under the lock, sends without holding any lock, repeats until out_closing
+// and the buffer is drained (or the socket dies).
+@(private = "file")
+output_writer_proc :: proc(data: rawptr) {
+	conn := (^Connection)(data)
+	defer sync.wait_group_done(&conn.out_done)
+	local: [dynamic]byte
+	defer delete(local)
+
+	for {
+		sync.mutex_lock(&conn.out_lock)
+		for len(conn.out_buf) == 0 && !conn.out_closing {
+			sync.cond_wait(&conn.out_cond, &conn.out_lock)
+		}
+		conn.out_buf, local = local, conn.out_buf
+		closing := conn.out_closing
+		sync.mutex_unlock(&conn.out_lock)
+
+		if len(local) > 0 {
+			_, serr := net.send_tcp(conn.socket, local[:])
+			clear(&local)
+			if serr != nil {
+				// Socket dead (or shutdown() from teardown unblocked us). Stop accepting
+				// output and exit; the recv loop notices the death independently.
+				sync.mutex_lock(&conn.out_lock)
+				conn.out_closing = true
+				sync.mutex_unlock(&conn.out_lock)
+				return
+			}
+		}
+		if closing {
+			return
+		}
+	}
 }
 
 // send_line translates conn's %-code/pipe-code markup per its current ansi_enabled setting,
@@ -74,7 +155,7 @@ send_line :: proc(conn: ^Connection, text: string) {
 	defer delete(colored)
 	msg := strings.concatenate({colored, "\r\n"})
 	defer delete(msg)
-	net.send_tcp(conn.socket, transmute([]byte)msg)
+	enqueue_output(conn, transmute([]byte)msg)
 }
 
 // send_line_raw writes text + "\r\n" straight to the socket with NO color translation at
@@ -87,7 +168,7 @@ send_line :: proc(conn: ^Connection, text: string) {
 send_line_raw :: proc(conn: ^Connection, text: string) {
 	msg := strings.concatenate({text, "\r\n"})
 	defer delete(msg)
-	net.send_tcp(conn.socket, transmute([]byte)msg)
+	enqueue_output(conn, transmute([]byte)msg)
 }
 
 connection_handler :: proc(data: rawptr) {
@@ -107,6 +188,22 @@ connection_handler :: proc(data: rawptr) {
 	conn.ansi_enabled = true
 	conn.options = init_option_defaults()
 	conn.player = allocate_connection_id(conn.server, conn)
+
+	// Spawn the outbound writer (see enqueue_output/output_writer_proc above). The defer
+	// tells it to flush-and-exit, unblocks any in-flight send via shutdown(), and joins it
+	// -- registered here, after the cleanup defers above, so it runs BEFORE them (LIFO):
+	// the writer is gone before the socket closes and conn is freed.
+	sync.wait_group_add(&conn.out_done, 1)
+	thread.create_and_start_with_data(conn, output_writer_proc, init_context = context, self_cleanup = true)
+	defer {
+		sync.mutex_lock(&conn.out_lock)
+		conn.out_closing = true
+		sync.cond_signal(&conn.out_cond)
+		sync.mutex_unlock(&conn.out_lock)
+		net.shutdown(conn.socket, .Both) // unblocks a send_tcp mid-stall
+		sync.wait_group_wait(&conn.out_done)
+		delete(conn.out_buf)
+	}
 
 	// Mirrors server_new_connection() dispatching an empty command through do_login_task():
 	// this is what makes $login:welcome's notify()-based banner appear, rather than netio

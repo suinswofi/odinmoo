@@ -207,7 +207,7 @@ send_telnet_echo_negotiation :: proc(conn: ^Connection, echo_on: bool) {
 	cmd[0] = IAC
 	cmd[1] = WONT if echo_on else WILL
 	cmd[2] = ECHO
-	net.send_tcp(conn.socket, cmd[:])
+	enqueue_output(conn, cmd[:])
 }
 
 // ---- Connection_Hooks implementations (wired in login.odin's wire_connection_hooks) ----
