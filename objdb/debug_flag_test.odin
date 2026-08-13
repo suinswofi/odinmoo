@@ -274,3 +274,47 @@ test_created_object_inherits_property_permissions :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, r.value.type == .Int && r.value.data.num == 42, "wanted 42, got %v", r.value)
 }
+
+// add_property's slot for the DEFINING object must land at its layout position -- last of
+// the object's own slots, before every inherited one (find_property's walk is self-first;
+// insert_prop inserts there, db_properties.c:78-100). Appending it at the end instead
+// shifts every inherited property on that object by one and points the new property at a
+// neighbour's value. Only visible when the target has inherited slots, which is why a test
+// against a root object can't catch it.
+@(test)
+test_add_property_slot_position_with_inherited_props :: proc(t: ^testing.T) {
+	f := new(Fixture)
+	defer free(f)
+	f.db = build_crud_world()
+	defer crud_world_destroy(&f.db)
+	f.sched = tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&f.sched)
+	f.ow = object_world_init(&f.db, &f.sched)
+	defer object_world_destroy(&f.ow)
+	f.world = make_world(&f.ow)
+
+	// #2 already defines "greeting" and inherits from #1. Give #1 a property so #2 has an
+	// inherited slot, then define a new property on #2 itself and read all three back.
+	add_verb_with_perms(&f.db, 2, "layout_check", `
+		add_property(#1, "base_prop", 111, {#1, "r"});
+		add_property(#2, "own_prop", 222, {#1, "r"});
+		return {#2.own_prop, #2.base_prop, #2.greeting};
+	`, true)
+
+	r := run_verb(f, "layout_check")
+	defer values.free_var(r.value)
+	if !testing.expectf(t, !r.raised, "raised %v (%s)", r.code, r.raised ? r.msg : "") {
+		delete(r.msg)
+		values.free_var(r.rvalue)
+		return
+	}
+	if !testing.expectf(t, r.value.type == .List && values.list_len(r.value) == 3, "got %v", r.value) {
+		return
+	}
+	own := values.list_get(r.value, 1)
+	base := values.list_get(r.value, 2)
+	greeting := values.list_get(r.value, 3)
+	testing.expectf(t, own.type == .Int && own.data.num == 222, "own_prop: wanted 222, got %v", own)
+	testing.expectf(t, base.type == .Int && base.data.num == 111, "base_prop: wanted 111, got %v", base)
+	testing.expectf(t, greeting.type == .Str && greeting.data.str.s == "hi", "greeting: wanted \"hi\", got %v", greeting)
+}

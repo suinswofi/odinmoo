@@ -223,7 +223,17 @@ bf_add_property :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Contex
 	defer prop_layout_snapshot_destroy(&snap)
 
 	append(&obj.propdefs, dbfile.Propdef{name = intern_local(w, name)})
-	append(&obj.propvals, dbfile.Propval{value = values.var_ref(value_v), owner = owner, perms = flags})
+	// The new slot's index is its position in the accumulated layout -- last among oid's OWN
+	// propdefs, BEFORE every inherited slot (find_property's walk is self-first). Appending
+	// at the end instead lands it after the inherited slots, shifting every inherited
+	// property's lookup on oid by one and pointing the new property at someone else's value.
+	// C inserts at exactly this position (insert_prop, db_properties.c:78-100), and re-owns
+	// the slot to the object's owner when the property is "c" (:92-95), definer included.
+	slot_owner := owner
+	if flags & (1 << uint(Prop_Flag.Chown)) != 0 {
+		slot_owner = obj.owner
+	}
+	inject_at(&obj.propvals, len(obj.propdefs) - 1, dbfile.Propval{value = values.var_ref(value_v), owner = slot_owner, perms = flags})
 
 	// Every descendant needs the new inherited (CLEAR) slot; `oid` itself already has its
 	// real value appended above, so only resync the CHILDREN, not oid itself (a full
