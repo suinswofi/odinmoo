@@ -887,15 +887,20 @@ bf_move :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	oldloc := db_object_location(w, what)
 	db_change_location(w, what, dest)
 
-	// exitfunc/enterfunc are best-effort notifications: E_VERBNF (no such verb) is expected
-	// and ignored, matching the original falling through on E_VERBNF/E_INVIND; only E_MAXREC
-	// propagates as a real error.
+	// exitfunc/enterfunc dispatch failures fall through -- a missing verb (E_VERBNF, or
+	// E_INVIND for an invalid `this`) is expected and ignored (bf_move's "fall through"
+	// comments, objects.c:118/133) -- but that is the ONLY thing that falls through: a
+	// dispatch E_MAXREC is a real error (objects.c:115/131), and a raise from a verb body
+	// that actually ran never reaches bf_move in the original at all -- it unwinds straight
+	// through move()'s caller (unwind_stack's squelch path, execute.c:327-359). So an
+	// exitfunc raise also means enterfunc never runs, exactly as unwinding past `case 3`
+	// skips it in the original. The location change has already happened by then, in both.
 	if valid(w.db, oldloc) {
 		exit_args := make([]values.Var, 1)
 		exit_args[0] = values.obj_val(what)
 		result := call_verb_from(w, ctx.world, oldloc, oldloc, "exitfunc", values.list_val(exit_args), ctx, via_builtin = "move")
 		if result.raised {
-			if result.code == .E_MAXREC {
+			if result.unwinding || result.code == .E_MAXREC {
 				return result
 			}
 			delete(result.msg)
@@ -910,7 +915,7 @@ bf_move :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 		enter_args[0] = values.obj_val(what)
 		result := call_verb_from(w, ctx.world, dest, dest, "enterfunc", values.list_val(enter_args), ctx, via_builtin = "move")
 		if result.raised {
-			if result.code == .E_MAXREC {
+			if result.unwinding || result.code == .E_MAXREC {
 				return result
 			}
 			delete(result.msg)

@@ -318,3 +318,61 @@ test_add_property_slot_position_with_inherited_props :: proc(t: ^testing.T) {
 	testing.expectf(t, base.type == .Int && base.data.num == 111, "base_prop: wanted 111, got %v", base)
 	testing.expectf(t, greeting.type == .Str && greeting.data.str.s == "hi", "greeting: wanted \"hi\", got %v", greeting)
 }
+
+// A raise from an :enterfunc/:exitfunc body propagates through move()'s caller -- in the
+// original it never reaches bf_move at all, unwinding straight past it (execute.c:327-359),
+// so it is NOT subject to the caller's `d` flag either, and the location change (which
+// happens before those calls) survives. Only a MISSING verb falls through silently
+// (objects.c:118/133).
+@(test)
+test_enterfunc_raise_propagates_through_move :: proc(t: ^testing.T) {
+	f := new(Fixture)
+	defer free(f)
+	f.db = build_crud_world()
+	defer crud_world_destroy(&f.db)
+	f.sched = tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&f.sched)
+	f.ow = object_world_init(&f.db, &f.sched)
+	defer object_world_destroy(&f.ow)
+	f.world = make_world(&f.ow)
+
+	add_verb_with_perms(&f.db, 3, "enterfunc", `raise(E_PERM);`, true)
+
+	// Catchable by the caller, and the move itself already happened when it raises.
+	add_verb_with_perms(&f.db, 2, "go_catch", `
+		try
+			move(this, #3);
+			return "no raise";
+		except (E_PERM)
+			return {"caught", this.location};
+		endtry
+	`, true)
+	r := run_verb(f, "go_catch")
+	if !testing.expectf(t, !r.raised, "raised %v (%s)", r.code, r.raised ? r.msg : "") {
+		delete(r.msg)
+		values.free_var(r.rvalue)
+	} else {
+		ok := r.value.type == .List && values.list_len(r.value) == 2 &&
+			values.list_get(r.value, 2).data.obj == 3
+		testing.expectf(t, ok, "wanted a caught/#3 pair, got %v", r.value)
+		values.free_var(r.value)
+	}
+
+	// Move back so the next half starts from a known location.
+	obj2 := f.db.objects[2]
+	testing.expect(t, obj2.location == 3)
+
+	// Through a NON-debug caller the raise still unwinds -- it is a body raise, not the
+	// caller's own operation, so the `d` flag does not convert it to an inline value.
+	add_verb_with_perms(&f.db, 2, "go_nd", `move(this, #3);`, false)
+	obj2.location = values.NOTHING // reset so the move isn't a no-op
+	f.db.objects[3].contents = values.NOTHING
+	r2 := run_verb(f, "go_nd")
+	if !testing.expect(t, r2.raised, "body raise in enterfunc must unwind through a !d caller") {
+		values.free_var(r2.value)
+		return
+	}
+	testing.expectf(t, r2.code == .E_PERM, "wanted E_PERM, got %v", r2.code)
+	delete(r2.msg)
+	values.free_var(r2.rvalue)
+}
