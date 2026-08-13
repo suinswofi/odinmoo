@@ -288,7 +288,15 @@ finish_login :: proc(s: ^Server, conn: ^Connection, player: values.Objid) {
 	args_items[0] = values.obj_val(player)
 	args := values.list_val(args_items)
 	task_id := tasks.new_task_id(s.scheduler)
+	// big_lock is NOT optional here, even though this call site "owns" the connection: MOO
+	// execution anywhere means holding it. #0:user_connected's own fork(0) bodies start
+	// immediately on their own threads and take the lock -- run this call without it and
+	// the connect chain races its own forks over shared refcounted values, which surfaces
+	// as one-in-N random E_VERBNF/E_TYPE/E_RANGE around login and anything typed just
+	// after it. (Found exactly that way.)
+	sync.mutex_lock(&s.scheduler.big_lock)
 	result := call_root_verb(s.world, SYSTEM_OBJECT, "user_connected", args, player, task_id)
+	sync.mutex_unlock(&s.scheduler.big_lock)
 	if result.raised {
 		// An uncaught error here is not cosmetic: #0:user_connected is what moves a
 		// connecting player into the world, so a raise leaves them wherever the DB left
