@@ -376,3 +376,158 @@ test_enterfunc_raise_propagates_through_move :: proc(t: ^testing.T) {
 	delete(r2.msg)
 	values.free_var(r2.rvalue)
 }
+
+// A raise from :initialize unwinds through create()'s caller -- the continuation that
+// would have returned the oid is discarded (objects.c:286-290) -- but the object stays
+// created and the quota stays spent. Only a MISSING :initialize returns the oid normally.
+@(test)
+test_initialize_raise_propagates_through_create :: proc(t: ^testing.T) {
+	f := new(Fixture)
+	defer free(f)
+	f.db = build_crud_world()
+	defer crud_world_destroy(&f.db)
+	f.sched = tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&f.sched)
+	f.ow = object_world_init(&f.db, &f.sched)
+	defer object_world_destroy(&f.ow)
+	f.world = make_world(&f.ow)
+
+	// Inherited by anything created under #2 (crud fixture max_oid 3, so the child is #4).
+	add_verb_with_perms(&f.db, 2, "initialize", `raise(E_NACC);`, true)
+	add_verb_with_perms(&f.db, 2, "make_catch", `
+		try
+			return {"no raise", create(#2)};
+		except (E_NACC)
+			return {"caught", valid(#4)};
+		endtry
+	`, true)
+	r := run_verb(f, "make_catch")
+	if !testing.expectf(t, !r.raised, "raised %v (%s)", r.code, r.raised ? r.msg : "") {
+		delete(r.msg)
+		values.free_var(r.rvalue)
+	} else {
+		tag := values.list_get(r.value, 1)
+		created := values.list_get(r.value, 2)
+		testing.expectf(
+			t,
+			r.value.type == .List && tag.type == .Str && tag.data.str.s == "caught" &&
+			created.type == .Int && created.data.num == 1,
+			"wanted caught + valid(#4)==1, got %v", r.value,
+		)
+		values.free_var(r.value)
+	}
+
+	// Through a non-debug caller the body raise still unwinds.
+	add_verb_with_perms(&f.db, 2, "make_nd", `create(#2);`, false)
+	r2 := run_verb(f, "make_nd")
+	if !testing.expect(t, r2.raised, ":initialize raise must unwind through a !d caller") {
+		values.free_var(r2.value)
+		return
+	}
+	testing.expectf(t, r2.code == .E_NACC, "wanted E_NACC, got %v", r2.code)
+	delete(r2.msg)
+	values.free_var(r2.rvalue)
+}
+
+// A raise from :recycle does NOT stop the destruction: the demolition completes with the
+// eviction's :exitfunc/:enterfunc notifications suppressed (unwind_stack's squelch loop,
+// execute.c:337-358), and only then does the raise continue into recycle()'s caller.
+@(test)
+test_recycle_raise_completes_destruction_squelched :: proc(t: ^testing.T) {
+	f := new(Fixture)
+	defer free(f)
+	f.db = build_crud_world()
+	defer crud_world_destroy(&f.db)
+	f.sched = tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&f.sched)
+	f.ow = object_world_init(&f.db, &f.sched)
+	defer object_world_destroy(&f.ow)
+	f.world = make_world(&f.ow)
+
+	// Setup: box #4 (in room #3) holding thing #5; a witness :exitfunc on both #3 and #4
+	// renames #3, so ANY eviction notification firing is visible.
+	add_verb_with_perms(&f.db, 2, "setup", `
+		box = create(#2);
+		thing = create(#2);
+		move(box, #3);
+		move(thing, box);
+		return {box, thing};
+	`, true)
+	rs := run_verb(f, "setup")
+	if !testing.expectf(t, !rs.raised, "setup raised %v (%s)", rs.code, rs.raised ? rs.msg : "") {
+		delete(rs.msg)
+		values.free_var(rs.rvalue)
+		return
+	}
+	values.free_var(rs.value)
+	add_verb_with_perms(&f.db, 3, "exitfunc", `#3.name = "witnessed";`, true)
+	add_verb_with_perms(&f.db, 4, "exitfunc", `#3.name = "witnessed";`, true)
+	add_verb_with_perms(&f.db, 4, "recycle", `raise(E_NACC);`, true)
+
+	add_verb_with_perms(&f.db, 2, "wreck", `
+		try
+			recycle(#4);
+			return "no raise";
+		except (E_NACC)
+			return {"caught", valid(#4), #5.location};
+		endtry
+	`, true)
+	r := run_verb(f, "wreck")
+	defer values.free_var(r.value)
+	if !testing.expectf(t, !r.raised, "raised %v (%s)", r.code, r.raised ? r.msg : "") {
+		delete(r.msg)
+		values.free_var(r.rvalue)
+		return
+	}
+	ok := r.value.type == .List && values.list_len(r.value) == 3 &&
+		values.list_get(r.value, 2).data.num == 0 && // #4 destroyed
+		values.list_get(r.value, 3).data.obj == values.NOTHING // #5 evicted
+	testing.expectf(t, ok, "wanted caught + destroyed + evicted, got %v", r.value)
+	// The eviction notifications were squelched: neither witness :exitfunc ran.
+	testing.expectf(t, f.db.objects[3].name == "Room", "exitfunc fired during squelch: #3 renamed %q", f.db.objects[3].name)
+}
+
+// The normal path is unchanged: with no :recycle raise, eviction goes through move() and
+// the :exitfunc notifications DO fire.
+@(test)
+test_recycle_normal_path_still_fires_exitfunc :: proc(t: ^testing.T) {
+	f := new(Fixture)
+	defer free(f)
+	f.db = build_crud_world()
+	defer crud_world_destroy(&f.db)
+	f.sched = tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&f.sched)
+	f.ow = object_world_init(&f.db, &f.sched)
+	defer object_world_destroy(&f.ow)
+	f.world = make_world(&f.ow)
+
+	add_verb_with_perms(&f.db, 2, "setup", `
+		box = create(#2);
+		thing = create(#2);
+		move(box, #3);
+		move(thing, box);
+		return 0;
+	`, true)
+	rs := run_verb(f, "setup")
+	if !testing.expectf(t, !rs.raised, "setup raised %v (%s)", rs.code, rs.raised ? rs.msg : "") {
+		delete(rs.msg)
+		values.free_var(rs.rvalue)
+		return
+	}
+	values.free_var(rs.value)
+	add_verb_with_perms(&f.db, 4, "exitfunc", `#3.name = "witnessed";`, true)
+
+	add_verb_with_perms(&f.db, 2, "wreck_ok", `recycle(#4); return {valid(#4), #5.location};`, true)
+	r := run_verb(f, "wreck_ok")
+	defer values.free_var(r.value)
+	if !testing.expectf(t, !r.raised, "raised %v (%s)", r.code, r.raised ? r.msg : "") {
+		delete(r.msg)
+		values.free_var(r.rvalue)
+		return
+	}
+	ok := r.value.type == .List &&
+		values.list_get(r.value, 1).data.num == 0 &&
+		values.list_get(r.value, 2).data.obj == values.NOTHING
+	testing.expectf(t, ok, "wanted destroyed + evicted, got %v", r.value)
+	testing.expectf(t, f.db.objects[3].name == "witnessed", "exitfunc did not fire on the normal path: #3 is %q", f.db.objects[3].name)
+}

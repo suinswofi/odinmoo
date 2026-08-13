@@ -149,7 +149,13 @@ bf_create :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> 
 	init_args := values.list_val(make([]values.Var, 0))
 	result := call_verb_from(w, ctx.world, oid, oid, "initialize", init_args, ctx, via_builtin = "create")
 	if result.raised {
-		if result.code == .E_MAXREC {
+		// A raise from the :initialize body unwinds through create()'s caller (in the
+		// original it never returns to bf_create -- the squelch path discards the
+		// continuation, objects.c:286-290), as does a dispatch E_MAXREC (objects.c:279).
+		// The object stays created and the quota stays spent in both servers; the caller
+		// just never learns the oid. Only a MISSING :initialize (E_VERBNF) falls through
+		// to return the new object normally (objects.c:281).
+		if result.unwinding || result.code == .E_MAXREC {
 			return result
 		}
 		delete(result.msg)
@@ -184,26 +190,47 @@ bf_recycle :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) ->
 		return err_result_local(.E_PERM, "Permission denied")
 	}
 
+	// The :recycle() notification's error handling is the most lenient of the
+	// builtin-dispatched verb calls: BOTH dispatch failures -- E_VERBNF (no such verb) and
+	// even E_MAXREC -- fall through and the destruction proceeds ("e == E_VERBNF or
+	// E_MAXREC; fall through", objects.c:458). A raise from the verb BODY doesn't stop the
+	// destruction either: the raise unwinds, and unwind_stack's squelch loop
+	// (execute.c:337-358) keeps re-invoking bf_recycle's continuation while discarding
+	// every verb call it attempts -- so the demolition completes with the
+	// :exitfunc/:enterfunc eviction notifications suppressed, and THEN the original raise
+	// continues into recycle()'s caller. `pending`/`squelch` reproduce exactly that.
+	pending: vm.Call_Result
+	squelch := false
 	recycle_args := values.list_val(make([]values.Var, 0))
 	rresult := call_verb_from(w, ctx.world, oid, oid, "recycle", recycle_args, ctx, via_builtin = "recycle")
 	if rresult.raised {
-		if rresult.code == .E_MAXREC {
-			return rresult
+		if rresult.unwinding {
+			pending = rresult
+			squelch = true
+		} else {
+			delete(rresult.msg)
+			values.free_var(rresult.rvalue)
 		}
-		delete(rresult.msg)
-		values.free_var(rresult.rvalue)
 	} else {
 		values.free_var(rresult.value)
 	}
 	if !valid(w.db, oid) {
 		// The :recycle() verb (or something it called) already destroyed this object.
+		if squelch {
+			return pending
+		}
 		return ok_result(values.int_val(0))
 	}
 
-	// Evict every content item, then the object itself, to NOTHING via move() so
-	// :exitfunc/:enterfunc fire normally.
+	// Evict every content item, then the object itself, to NOTHING. Normally via move() so
+	// :exitfunc/:enterfunc fire; in squelch mode via the bare DB-level location change, the
+	// verb calls having been discarded by the unwind (see above).
 	for valid(w.db, oid) && w.db.objects[oid].contents != values.NOTHING {
 		c := w.db.objects[oid].contents
+		if squelch {
+			db_change_location(w, c, values.NOTHING)
+			continue
+		}
 		mv_items := make([]values.Var, 2)
 		mv_items[0] = values.obj_val(c)
 		mv_items[1] = values.obj_val(values.NOTHING)
@@ -216,18 +243,25 @@ bf_recycle :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) ->
 		values.free_var(mresult.value)
 	}
 	if valid(w.db, oid) && w.db.objects[oid].location != values.NOTHING {
-		mv_items := make([]values.Var, 2)
-		mv_items[0] = values.obj_val(oid)
-		mv_items[1] = values.obj_val(values.NOTHING)
-		mresult := bf_move(w, values.list_val(mv_items), ctx)
-		if mresult.raised {
-			delete(mresult.msg)
-			values.free_var(mresult.rvalue)
+		if squelch {
+			db_change_location(w, oid, values.NOTHING)
 		} else {
-			values.free_var(mresult.value)
+			mv_items := make([]values.Var, 2)
+			mv_items[0] = values.obj_val(oid)
+			mv_items[1] = values.obj_val(values.NOTHING)
+			mresult := bf_move(w, values.list_val(mv_items), ctx)
+			if mresult.raised {
+				delete(mresult.msg)
+				values.free_var(mresult.rvalue)
+			} else {
+				values.free_var(mresult.value)
+			}
 		}
 	}
 	if !valid(w.db, oid) {
+		if squelch {
+			return pending
+		}
 		return ok_result(values.int_val(0))
 	}
 
@@ -251,6 +285,10 @@ bf_recycle :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) ->
 	incr_quota(w.db, owner)
 	destroy_object(w.db, oid)
 	compile_cache_invalidate_object(&w.cache, oid)
+	if squelch {
+		// Demolition complete; NOW the :recycle body's raise continues into the caller.
+		return pending
+	}
 	return ok_result(values.int_val(0))
 }
 

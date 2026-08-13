@@ -734,7 +734,8 @@ db_object_location :: proc(w: ^Object_World, oid: values.Objid) -> values.Objid 
 // `what.location`. A NOTHING old/new location is skipped (matches `valid(old_location)`/
 // `valid(location)` guards in the original -- moving "from limbo" or "to limbo" doesn't touch
 // any contents chain).
-@(private = "file")
+// Not file-private: object_crud.odin's bf_recycle uses it directly for its squelched
+// eviction path (the DB-level move with the :exitfunc/:enterfunc notifications suppressed).
 db_change_location :: proc(w: ^Object_World, what, location: values.Objid) {
 	old_location := w.db.objects[what].location
 	if valid(w.db, old_location) {
