@@ -587,6 +587,13 @@ bf_verb_args :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) 
 	if obj_v.type != .Obj || (desc_v.type != .Str && desc_v.type != .Int) {
 		return err_result_local(.E_TYPE, "Type mismatch")
 	}
+	// verbs.c checks valid(oid) BEFORE looking the verb up: an invalid object is E_INVARG,
+	// never E_VERBNF. Core code depends on the distinction -- JHCore's $object_utils:has_verb
+	// walks parent(obj) until verb_info() stops saying E_VERBNF, so E_VERBNF for #-1 would
+	// send it on to parent(#-1) and an uncaught E_INVARG out of every `huh` explanation.
+	if !valid(w.db, obj_v.data.obj) {
+		return err_result_local(.E_INVARG, "Invalid argument")
+	}
 	vh := resolve_verb_desc(w, obj_v.data.obj, desc_v)
 	if !vh.found {
 		return err_result_local(.E_VERBNF, "Verb not found")
@@ -615,6 +622,9 @@ bf_verb_info :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) 
 	obj_v, desc_v := values.list_get(args, 1), values.list_get(args, 2)
 	if obj_v.type != .Obj || (desc_v.type != .Str && desc_v.type != .Int) {
 		return err_result_local(.E_TYPE, "Type mismatch")
+	}
+	if !valid(w.db, obj_v.data.obj) { // E_INVARG before E_VERBNF, as verbs.c does (see bf_verb_args)
+		return err_result_local(.E_INVARG, "Invalid argument")
 	}
 	vh := resolve_verb_desc(w, obj_v.data.obj, desc_v)
 	if !vh.found {

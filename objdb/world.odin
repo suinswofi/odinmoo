@@ -12,6 +12,7 @@ import "../tasks"
 import "../values"
 import "../vm"
 import "core:fmt"
+import "core:os"
 import "core:strings"
 
 // Connection_Hooks is how notify()/connection_name()/boot_player() reach an actual network
@@ -82,8 +83,16 @@ Object_World :: struct {
 }
 
 object_world_init :: proc(db: ^dbfile.Database, scheduler: ^tasks.Scheduler = nil) -> Object_World {
+	trace_errors = os.get_env("MOO_TRACE_ERRORS", context.temp_allocator) != ""
 	return Object_World{db = db, cache = compile_cache_init(), scheduler = scheduler}
 }
+
+// trace_errors: set MOO_TRACE_ERRORS=1 in the environment to log every error raised out of
+// a verb body to stderr, innermost frame first -- the port has no per-line traceback like
+// the original's log_traceback(), so this is the tool for "which verb raised E_INVARG?"
+// when a core's command chain misbehaves. Read once at world init; off by default.
+@(private = "file")
+trace_errors: bool
 
 object_world_destroy :: proc(w: ^Object_World) {
 	compile_cache_destroy(&w.cache)
@@ -271,6 +280,12 @@ call_verb_from :: proc(w: ^Object_World, vw: ^vm.World, this_obj, search_from: v
 	if !ok {
 		return err_result(.E_VERBNF, "Verb does not compile")
 	}
+	// Hold the program for the whole run: the body may set_verb_code() itself (LambdaCore's
+	// eval_d_util does exactly that on its first line), or another task may re-@program it
+	// while this one is suspended -- either invalidates the cache entry, and without this
+	// reference the AST being walked would be freed under the interpreter.
+	compiled_verb_retain(cv)
+	defer compiled_verb_release(cv)
 
 	definer_obj := w.db.objects[vh.definer]
 	vd := definer_obj.verbdefs[vh.index]
@@ -353,6 +368,11 @@ call_verb_from :: proc(w: ^Object_World, vw: ^vm.World, this_obj, search_from: v
 	case .Raised:
 		// The verb body ran and raised: this unwinds through the caller regardless of the
 		// caller's `d` flag (execute.c's unwind_stack), unlike a dispatch failure above.
+		if trace_errors {
+			// Innermost frame prints first, so reading the log top-down walks the unwind --
+			// a poor man's version of the traceback the original logs for uncaught errors.
+			fmt.eprintfln("TRACE: #%d:%s (defined on #%d, programmer #%d) raised %s: %s", this_obj, name, vh.definer, act.programmer, compiler.error_name(r.err.code), r.err.msg)
+		}
 		return vm.Call_Result{raised = true, code = r.err.code, msg = r.err.msg, rvalue = r.err.value, unwinding = true}
 	case .Normal, .Break, .Continue:
 		return vm.call_ok(values.int_val(0))
