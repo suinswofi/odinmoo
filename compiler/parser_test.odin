@@ -197,3 +197,33 @@ test_unparse_string_escaping_round_trips :: proc(t: ^testing.T) {
 	}
 	delete(r2.errors)
 }
+
+// The unparser must undo the parser's `$foo` desugaring, as unparse.c does: `#0.foo` prints
+// as `$foo`, `#0:foo(...)` as `$foo(...)`; anything else -- another object, a non-identifier
+// or keyword name, a computed name -- keeps the explicit form. Every corified reference in
+// a real core goes through this, so a slip here rewrites `$string_utils` as `#0.string_utils`
+// in @list/@edit output (and, via set_verb_code, eventually in the database itself).
+@(test)
+test_unparse_restores_dollar_sugar :: proc(t: ^testing.T) {
+	cases := [][2]string{
+		{`$foo;`, `$foo;`},
+		{`#0.foo;`, `$foo;`},
+		{`$string_utils:left("x", 5);`, `$string_utils:left("x", 5);`},
+		{`$foo(1, 2);`, `$foo(1, 2);`},
+		{`#0:foo(1, 2);`, `$foo(1, 2);`},
+		{`$foo.bar;`, `$foo.bar;`},
+		{`#0.("dyn" + x);`, `#0.("dyn" + x);`},
+		{`#0.("if");`, `#0.("if");`},
+		{`#0.("E_PERM");`, `#0.("E_PERM");`},
+		{`#1.foo;`, `#1.foo;`},
+		{`x.foo;`, `x.foo;`},
+		{`x.("if");`, `x.("if");`},
+	}
+	for c in cases {
+		r := parse_ok(t, c[0])
+		text := unparse_program(r.body, &r.names)
+		testing.expectf(t, strings.trim_space(text) == c[1], "unparse(%s) = %q, want %q", c[0], strings.trim_space(text), c[1])
+		delete(text)
+		result_destroy(&r)
+	}
+}

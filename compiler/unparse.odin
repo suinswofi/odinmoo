@@ -200,24 +200,39 @@ unparse_expr :: proc(b: ^strings.Builder, e: Expr, names: ^Name_Table, paren_if_
 	case ^Expr_Id:
 		strings.write_string(b, var_name(names, v.var_id))
 	case ^Expr_Prop:
-		unparse_expr_nested(b, v.obj, names)
-		if lit, ok := v.prop.(^Expr_Var); ok && lit.value.type == .Str && is_identifier_like(lit.value.data.str.s) {
-			strings.write_byte(b, '.')
-			strings.write_string(b, lit.value.data.str.s)
+		// `#0.foo` prints as `$foo`, undoing the parser's desugaring exactly as unparse.c's
+		// EXPR_PROP case does -- otherwise every corified reference in a core (`$string_utils`,
+		// `$recycler`) comes back from verb_code()/@list as `#0.string_utils`, and an @edit
+		// round trip through set_verb_code() would bake that form into the database source.
+		if name, ok := dollar_name(v.obj, v.prop); ok {
+			strings.write_byte(b, '$')
+			strings.write_string(b, name)
 		} else {
-			strings.write_string(b, ".(")
-			unparse_expr_top(b, v.prop, names)
-			strings.write_byte(b, ')')
+			unparse_expr_nested(b, v.obj, names)
+			if lit, ok := v.prop.(^Expr_Var); ok && lit.value.type == .Str && is_identifier_like(lit.value.data.str.s) {
+				strings.write_byte(b, '.')
+				strings.write_string(b, lit.value.data.str.s)
+			} else {
+				strings.write_string(b, ".(")
+				unparse_expr_top(b, v.prop, names)
+				strings.write_byte(b, ')')
+			}
 		}
 	case ^Expr_Verb_Call:
-		unparse_expr_nested(b, v.obj, names)
-		if lit, ok := v.verb.(^Expr_Var); ok && lit.value.type == .Str && is_identifier_like(lit.value.data.str.s) {
-			strings.write_byte(b, ':')
-			strings.write_string(b, lit.value.data.str.s)
+		// Likewise `#0:foo(args)` prints as `$foo(args)` (unparse.c's EXPR_VERB case).
+		if name, ok := dollar_name(v.obj, v.verb); ok {
+			strings.write_byte(b, '$')
+			strings.write_string(b, name)
 		} else {
-			strings.write_string(b, ":(")
-			unparse_expr_top(b, v.verb, names)
-			strings.write_byte(b, ')')
+			unparse_expr_nested(b, v.obj, names)
+			if lit, ok := v.verb.(^Expr_Var); ok && lit.value.type == .Str && is_identifier_like(lit.value.data.str.s) {
+				strings.write_byte(b, ':')
+				strings.write_string(b, lit.value.data.str.s)
+			} else {
+				strings.write_string(b, ":(")
+				unparse_expr_top(b, v.verb, names)
+				strings.write_byte(b, ')')
+			}
 		}
 		strings.write_byte(b, '(')
 		unparse_args(b, v.args, names)
@@ -350,6 +365,10 @@ unparse_scatter :: proc(b: ^strings.Builder, items: []Scatter_Item, names: ^Name
 }
 
 @(private = "file")
+// is_identifier_like ports unparse.c's ok_identifier(): a name that can be written bare
+// after `.`/`:`/`$` -- identifier characters AND not a keyword (keywords are
+// case-insensitive in MOO, so `If` is as unusable as `if`; a property literally named
+// "if" has to print as `.("if")`, since `.if` would not lex back as a name).
 is_identifier_like :: proc(s: string) -> bool {
 	if len(s) == 0 {
 		return false
@@ -364,7 +383,32 @@ is_identifier_like :: proc(s: string) -> bool {
 			return false
 		}
 	}
+	lower_buf: [16]byte
+	if len(s) <= len(lower_buf) {
+		for i in 0 ..< len(s) {
+			c := s[i]
+			lower_buf[i] = c + ('a' - 'A') if c >= 'A' && c <= 'Z' else c
+		}
+		if _, is_kw := keywords[string(lower_buf[:len(s)])]; is_kw {
+			return false
+		}
+	}
 	return true
+}
+
+// dollar_name recognizes the `$name` shape -- object part a literal #0, name part an
+// identifier-like string literal -- and returns the name.
+@(private = "file")
+dollar_name :: proc(obj, name: Expr) -> (string, bool) {
+	o, ok_o := obj.(^Expr_Var)
+	if !ok_o || o.value.type != .Obj || o.value.data.obj != 0 {
+		return "", false
+	}
+	n, ok_n := name.(^Expr_Var)
+	if !ok_n || n.value.type != .Str || !is_identifier_like(n.value.data.str.s) {
+		return "", false
+	}
+	return n.value.data.str.s, true
 }
 
 @(private = "file")
