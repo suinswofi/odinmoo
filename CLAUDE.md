@@ -48,7 +48,21 @@ odin test <package> -extra-linker-flags:"-lcrypt"              # test one packag
   with no network, for recovering a database broken by bad verb code. `SIGINT`/`SIGTERM` shut down
   cleanly (checkpointing first); `SIGUSR2` checkpoints immediately without stopping.
 - `bin/` and `*.db` are gitignored except the three bundled cores (`LambdaCore.db`, `jhcore.db`,
-  `Minimal.db`). Checkpoint output is regenerated runtime state — never commit it.
+  `Minimal.db`) and their themed copies (`LambdaCore-ansi.db`, `jhcore-ansi.db`, see below).
+  Checkpoint output is regenerated runtime state — never commit it.
+- **Themed cores are generated, not hand-edited.** `LambdaCore-ansi.db`/`jhcore-ansi.db` are
+  produced by `themes/build.sh` from the pristine cores plus `themes/cga/*.moo` (a `$ansi`
+  theme object + the stock display verbs with only their output calls changed), applied by
+  `cmd/dbscript <in.db> <out.db> <script>...` (MOO statements prefixed `;`, `@program
+  obj:verb ... .` blocks, `@verb` to add command verbs; wizard perms; never writes the input).
+  Change the theme by editing the scripts and rebuilding — never by editing the `-ansi.db`
+  files in a running server and checkpointing over them. Verb code in the theme asks `$ansi`
+  for a role (`$ansi:title/heading/exit/thing/place/player/speech/punct/meta/error/name/
+  names/quote/rule/fade/cut`) rather than embedding codes; only `|NN` pipe-codes are used,
+  never `%`-codes, because `pronoun_sub` owns `%N`/`%n`.
+- `MOO_TRACE_ERRORS=1 ./bin/moo ...` logs every error raised out of a verb body to stderr,
+  innermost frame first — the substitute for the original's per-line traceback when hunting
+  "which verb raised E_INVARG" through a core's command chain (`objdb/world.odin`).
 
 ## Architecture
 
@@ -132,10 +146,14 @@ Two structural points that are easy to violate by accident:
   a scratch directory that imports `dbfile`/`objdb`/`compiler`/`vm`, loads the `.db`, and dumps a
   verb or runs a snippet through `vm.run` with `this`/`player`/`caller` bound manually. Much faster
   than rebuilding the whole server to add print statements. `cmd/dumpverb`, `cmd/loadcheck`,
-  `cmd/replserver`, and `cmd/jhverify` already exist for the common cases (`odin run
-  cmd/replserver ...` from the root). `cmd/jhverify <db>` is the compatibility auditor: object
-  graph, property-inheritance invariant, value types, every verb compiling, and every built-in
-  those verbs call being implemented — run it against a core before assuming it works.
+  `cmd/replserver`, `cmd/jhverify`, and `cmd/dbscript` already exist for the common cases
+  (`odin run cmd/replserver ...` from the root). `dbscript` doubles as a MOO probe: a script of
+  `;return <expr>;` lines runs against any core with wizard perms and prints each result — but
+  note the wizard is not *connected* there, so JHCore's room `enterfunc` bounces `move(player,
+  room)` back to `$limbo`; probe connection-dependent paths in a live server via `.eval` instead.
+  `cmd/jhverify <db>` is the compatibility auditor: object graph, property-inheritance invariant,
+  value types, every verb compiling, and every built-in those verbs call being implemented — run
+  it against a core before assuming it works.
 - **Test-reported allocator leaks are real bugs.** `core:testing`'s tracking allocator runs on every
   test; a package that starts reporting leaks or double-frees after a change has regressed, and
   should not be treated as noise.

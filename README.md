@@ -216,6 +216,41 @@ nc localhost 7777
 
 and `connect wizard` (or whichever player your core database defines) to log in.
 
+### Themed cores (color)
+
+Two pre-themed copies of the bundled cores ship alongside the originals: `LambdaCore-ansi.db`
+and `jhcore-ansi.db`. They are the same databases with a color theme applied *inside* the
+object database -- a `$ansi` theme object plus the core's own display verbs (room and player
+`look`, contents and inventory listings, `say`/`emote`/`whisper`/`page`, arrivals and
+departures, `@who`, `@exits`, the "I don't understand that" family, and the login banner) taught
+to paint through it. The theme is CGA "palette 1": cyan, magenta and white on black, with the
+BBS-door-game touch of a bright-to-dim fade across room titles and table headers. Run one exactly
+like the plain core:
+
+```sh
+./bin/moo LambdaCore-ansi.db LambdaCore-ansi-checkpoint.db [port]
+```
+
+Color reaches a client only through the server's per-connection ANSI toggle (`.ansi off` strips
+every code), so a plain-text client sees the stock text.
+
+The theme is a convention, not a pile of literals: verb code never writes color codes, it asks
+`$ansi` for a *role* -- `$ansi:title(text)`, `:heading`, `:exit`, `:thing`, `:place`,
+`:player`, `:speech`, `:punct`, `:meta`, `:error` -- plus `$ansi:name(obj [, text])` (which
+picks the role by what `obj` is), `:names(objs)`, `:quote(text)`, `:rule([width])`,
+`:fade(text, ramp)` and `:cut(text, width)`. Each role is a property on `$ansi` holding a
+*ramp*: a list of `|NN` pipe-codes (one code = solid color, several = a fade). Retheming is
+editing those properties in the running MOO; the verbs never change. Column layout stays
+straight because `$string_utils:left/right/center/columnize` (and JHCore's
+`$who_utils:left_just`) measure visible width with the `ansi_len()` builtin.
+
+The whole thing is data, and reproducible: `themes/cga/ansi.moo` builds `$ansi`,
+`themes/cga/lambdacore.moo` and `themes/cga/jhcore.moo` hold each edited verb in full (the stock
+verb with only its output calls changed), and `themes/build.sh` regenerates both `-ansi.db`
+files from the pristine cores with `cmd/dbscript` -- a small tool that loads a `.db`, runs a
+script of MOO statements and `@program` blocks with wizard permissions, and writes a *new* file
+(never the input). Anything you'd rather theme differently, edit there and rebuild.
+
 ### Test
 
 ```sh
@@ -254,12 +289,14 @@ netio/          TCP server, login state machine, command dispatch, the `.program
                 PREFIX/SUFFIX, connection option handling
 ansi/           %-code and |NN pipe-code color markup -> real ANSI SGR escapes
 server/         main(), CLI, signal handling, checkpoint (fork()-based), emergency mode
-cmd/            small standalone dev tools (dumpverb, loadcheck, replserver, jhverify) -- like the
-                tests above, these load `LambdaCore.db` via a relative path, so run them
-                from the repo root (`odin run cmd/replserver`, etc.)
+cmd/            small standalone dev tools (dumpverb, loadcheck, replserver, jhverify, dbscript)
+                -- like the tests above, these load `LambdaCore.db` via a relative path, so run
+                them from the repo root (`odin run cmd/replserver`, etc.)
+themes/         color themes as re-runnable dbscript scripts (themes/cga/*.moo) + build.sh
 docs/           the original LambdaMOO/LambdaCore reference manuals (see below)
 LambdaCore.db   the bundled starting database (see Prerequisites, above)
 jhcore.db       JHCore -- a second, larger core that also loads and runs here
+*-ansi.db       the same two cores with the CGA color theme applied (see Themed cores, above)
 Minimal.db      the stock 4-object bootstrapping database (see Prerequisites, above)
 run.sh          quick-start script: runs bin/moo against LambdaCore.db
 ```

@@ -6,3 +6,6 @@ bin/
 !LambdaCore.db
 !jhcore.db
 !Minimal.db
+# ...and the themed copies of the two big cores that themes/build.sh regenerates from them.
+!LambdaCore-ansi.db
+!jhcore-ansi.db
