@@ -6,6 +6,3 @@ bin/
 !LambdaCore.db
 !jhcore.db
 !Minimal.db
-
-# Local Claude Code guidance; kept out of the repo.
-CLAUDE.md
