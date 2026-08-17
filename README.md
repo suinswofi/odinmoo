@@ -309,3 +309,7 @@ This is a derivative work of LambdaMOO, originally:
 
 (as stated in the original C source's own file headers). No separate `LICENSE` file accompanied
 the original source as obtained for this port; the terms above are reproduced here as found.
+
+The Odin source in this repository is released under those same terms — see the top-level
+[`LICENSE`](LICENSE) file, which carries both the original Xerox notice and the matching notice
+for the new code.

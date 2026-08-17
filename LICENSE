@@ -1,0 +1,42 @@
+ODINMOO — License
+
+ODINMOO is a from-scratch rewrite in Odin of the LambdaMOO server. It is a
+derivative work of LambdaMOO and is distributed under the same terms that
+LambdaMOO itself was released under. Those terms are reproduced verbatim from the
+original C source's file headers below, followed by the notice covering the new
+Odin code in this repository.
+
+------------------------------------------------------------------------------
+LambdaMOO (the original C server, whose semantics, database format, language,
+and built-in library this project reimplements)
+------------------------------------------------------------------------------
+
+  Copyright (c) 1992, 1995, 1996 Xerox Corporation.  All rights reserved.
+  Portions of this code were written by Stephen White, aka ghond.
+  Use and copying of this software and preparation of derivative works based
+  upon this software are permitted.  Any distribution of this software or
+  derivative works must comply with all applicable United States export control
+  laws.  This software is made available AS IS, and Xerox Corporation makes no
+  warranty about the software, its performance or its conformity to any
+  specification.
+
+------------------------------------------------------------------------------
+ODINMOO (the Odin source in this repository)
+------------------------------------------------------------------------------
+
+  Copyright (c) 2026 the ODINMOO authors.
+  Use and copying of this software and preparation of derivative works based
+  upon this software are permitted, under the same terms as LambdaMOO above.
+  Any distribution of this software or derivative works must comply with all
+  applicable United States export control laws.  This software is made
+  available AS IS, and the authors make no warranty about the software, its
+  performance or its conformity to any specification.
+
+------------------------------------------------------------------------------
+Bundled databases and documentation
+------------------------------------------------------------------------------
+
+The bundled cores (LambdaCore.db, jhcore.db, Minimal.db) and the manuals under
+docs/ are the work of their respective authors and are included for
+convenience and testing; they are not covered by the notices above and retain
+whatever terms accompanied them originally.
