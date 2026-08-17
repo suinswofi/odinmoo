@@ -118,7 +118,11 @@ dispatch_command :: proc(conn: ^Connection, line: string) {
 		}
 	}
 	if !found && objdb.valid(ow.db, location) {
-		h := objdb.find_command_verb(ow.db, location, "huh", 1, objdb.PREP_ANY, 1)
+		// tasks.c uses db_find_callable_verb(location, "huh"): ANY callable verb of that name,
+		// its argument specs ignored. Both stock cores define $root_class:huh as `this none
+		// this`, so requiring `any any any` here would silently skip $command_utils:do_huh
+		// (feature objects, room :here_huh, exit-name recovery) and print the server fallback.
+		h := objdb.find_callable_verb(ow.db, location, "huh")
 		if h.found {
 			this_obj = location
 			vh = h
