@@ -154,6 +154,16 @@ Two structural points that are easy to violate by accident:
   full contract is the "Connection lifetime" note at the bottom of `netio/login.odin`; also:
   only the owning thread ever `close()`s a socket (everyone else `shutdown()`s — a double close
   hands a live descriptor number to an unrelated connection).
+- **netio's `.eval` is gated on the programmer bit**, like the in-database `;` it shortcuts.
+  It is a debugging escape hatch that runs arbitrary MOO code outside command dispatch, so
+  leaving it open would hand every connected player a way around a trust decision the
+  database had already made. Any new `.`-prefixed local command that can run code needs the
+  same gate.
+- **`resume()` and `kill_task()` are owner-or-wizard**, checked in `objdb`'s
+  `task_control_denied` rather than in `tasks` — that package has no database access by design
+  (same split `task_stack()` already uses). Task ids are small sequential integers, so without
+  the check any player who can run MOO code could kill another player's suspended task, or
+  `resume()` a wizard's parked `read()` with a value of their own choosing.
 - **Every path that executes MOO code or reads the object DB must hold `Scheduler.big_lock`** —
   including "just a lookup" like `parse_command`'s object matching or an `is_player` check on a
   connection thread. When adding an entry point, grep for `vm.run`/`call_root_verb` and copy an

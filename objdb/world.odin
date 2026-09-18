@@ -404,10 +404,56 @@ world_call_builtin :: proc(vw: ^vm.World, name: string, is_known: bool, args: va
 		return result
 	}
 	if w.scheduler != nil {
+		if result, denied := task_control_denied(w, name, args, ctx); denied {
+			return result
+		}
 		if result, found := tasks.scheduler_builtin(w.scheduler, name, args, ctx); found {
 			return result
 		}
 	}
 	values.free_var(args)
 	return err_result(.E_VERBNF, "Unknown built-in function")
+}
+
+// task_control_denied enforces the owner-or-wizard rule on resume()/kill_task(), which
+// tasks.c's bf_resume()/bf_kill_task() both apply ("If the programmer is neither the owner
+// of that task nor a wizard, then E_PERM is raised" -- Programmer's Manual, resume/
+// kill_task). It lives here rather than in `tasks` for the same reason task_stack()'s
+// identical check does (task_introspection.odin): that package deliberately has no database
+// access and so cannot ask whether the caller is a wizard.
+//
+// It is load-bearing, not bookkeeping. Task ids are small sequential integers and
+// queued_tasks() hands out other players' ones to any wizard-adjacent code that asks, so
+// without this any player who can run MOO code at all could kill an arbitrary suspended
+// task -- or, worse, resume() one with a value of their own choosing. A wizard task parked
+// in read() (or $command_utils:read(), which every core confirmation prompt goes through)
+// takes that value as the answer it was waiting for, which turns "can evaluate an
+// expression" into "can answer a wizard's prompt".
+//
+// denied=false means "not my business": either this isn't one of the two built-ins, or the
+// arguments are malformed / the task doesn't exist, in which case the real implementation
+// must report E_ARGS/E_TYPE/E_INVARG. That ordering is the original's -- the permission
+// check is the LAST thing either built-in does, after the task has been found.
+@(private = "file")
+task_control_denied :: proc(w: ^Object_World, name: string, args: values.Var, ctx: ^vm.Eval_Context) -> (result: vm.Call_Result, denied: bool) {
+	if name != "resume" && name != "kill_task" {
+		return {}, false
+	}
+	if values.list_len(args) < 1 {
+		return {}, false
+	}
+	id_v := values.list_get(args, 1)
+	if id_v.type != .Int {
+		return {}, false
+	}
+	snap, found := tasks.task_snapshot(w.scheduler, int(id_v.data.num))
+	if !found {
+		return {}, false
+	}
+	progr := ctx.activation.programmer
+	if progr == snap.owner || is_wizard(w.db, progr) {
+		return {}, false
+	}
+	values.free_var(args) // a denial consumes them, like every other dispatched built-in
+	return err_result(.E_PERM, "Permission denied"), true
 }

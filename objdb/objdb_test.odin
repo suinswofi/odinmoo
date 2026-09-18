@@ -5,6 +5,7 @@ package objdb
 
 import "../compiler"
 import "../dbfile"
+import "../tasks"
 import "../values"
 import "../vm"
 import "core:strings"
@@ -367,4 +368,77 @@ test_quota :: proc(t: ^testing.T) {
 	testing.expect(t, !decr_quota(&db, 1)) // 0 -> denied
 	incr_quota(&db, 1)
 	testing.expect(t, decr_quota(&db, 1)) // 1 -> 0 again
+}
+
+// call_task_builtin invokes `name(id)` through the real World dispatcher as `progr` would,
+// which is what routes it past world.odin's task_control_denied on the way to `tasks`.
+@(private = "file")
+call_task_builtin :: proc(world: ^vm.World, name: string, id: i32, progr: values.Objid) -> vm.Call_Result {
+	act := vm.activation_make(0)
+	defer vm.activation_destroy(&act)
+	act.programmer = progr
+	ctx := vm.Eval_Context{activation = &act, world = world}
+	args := make([]values.Var, 1)
+	args[0] = values.int_val(id)
+	return world.call_builtin(world, name, true, values.list_val(args), &ctx)
+}
+
+// resume()/kill_task() are owner-or-wizard, like task_stack(). Without the check, task ids
+// being sequential integers, anyone able to run MOO code could kill another player's
+// suspended task or -- the serious half -- resume() a wizard's parked read() with a value of
+// their own choosing. See world.odin's task_control_denied.
+@(test)
+test_resume_and_kill_task_require_owner_or_wizard :: proc(t: ^testing.T) {
+	db := build_hierarchy() // #1 plain, #2 wizard, #3 plain
+	defer db_destroy(&db)
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := object_world_init(&db, &sched)
+	defer object_world_destroy(&ow)
+	world := make_world(&ow)
+
+	// A suspended task belonging to #1. Registering it directly stands in for #1 having
+	// called suspend(): the registry entry is all resume()/kill_task() ever look at.
+	owner_act := vm.activation_make(0)
+	defer vm.activation_destroy(&owner_act)
+	owner_act.programmer = 1
+	info := tasks.register_task(&sched, 4242, &owner_act)
+
+	for name in ([]string{"kill_task", "resume"}) {
+		r := call_task_builtin(&world, name, 4242, 3) // #3: neither the owner nor a wizard
+		testing.expectf(t, r.raised && r.code == .E_PERM, "%s by a stranger should be E_PERM, got raised=%v code=%v", name, r.raised, r.code)
+		delete(r.msg)
+		values.free_var(r.rvalue)
+	}
+
+	// A stranger must not even learn whether the task exists by killing it, so the task is
+	// still there and still resumable by its owner.
+	r := call_task_builtin(&world, "resume", 4242, 1)
+	testing.expectf(t, !r.raised, "resume by the task's own owner should succeed, got code=%v", r.code)
+	if r.raised {
+		delete(r.msg)
+		values.free_var(r.rvalue)
+	} else {
+		values.free_var(r.value)
+	}
+
+	stray, was_woken := tasks.park_cancel(&sched, 4242, info)
+	testing.expect(t, was_woken, "the owner's resume should have marked the task woken")
+	values.free_var(stray)
+
+	// And a wizard may act on someone else's task: #2 has the wizard bit.
+	other_act := vm.activation_make(0)
+	defer vm.activation_destroy(&other_act)
+	other_act.programmer = 1
+	info2 := tasks.register_task(&sched, 4343, &other_act)
+	r2 := call_task_builtin(&world, "kill_task", 4343, 2)
+	testing.expectf(t, !r2.raised, "kill_task by a wizard should succeed, got code=%v", r2.code)
+	if r2.raised {
+		delete(r2.msg)
+		values.free_var(r2.rvalue)
+	} else {
+		values.free_var(r2.value)
+	}
+	stray2, _ := tasks.park_cancel(&sched, 4343, info2)
+	values.free_var(stray2)
 }

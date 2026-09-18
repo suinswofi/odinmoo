@@ -28,6 +28,7 @@ import "../ansi"
 import "../builtins"
 import "../compiler"
 import "../dbfile"
+import "../objdb"
 import "../tasks"
 import "../values"
 import "../vm"
@@ -413,8 +414,27 @@ handle_line :: proc(conn: ^Connection, line: string) {
 // permission checks and `player`-referencing code behave sensibly), but there's no `this`/
 // `dobj`/`iobj`/`args` command context -- ordinary play goes through dispatch_command in
 // command.odin.
+//
+// It is gated on the programmer bit, and that gate is not decorative. Being able to run an
+// arbitrary MOO expression is precisely what the programmer bit grants: the in-database `;`
+// command checks it ($prog:eval, and the eval() built-in checks it again in bf_eval), so an
+// ungated `.eval` handed every connected player -- including one the database has
+// deliberately not trusted with code -- a way around a decision the database had already
+// made. Wizards pass by virtue of the usual wizard-implies-programmer rule.
 @(private = "file")
 eval_expr :: proc(conn: ^Connection, trimmed: string) {
+	s := conn.server
+	ow := (^objdb.Object_World)(s.world.user_data)
+	// Reading an object's flags is a database read like any other, so it takes big_lock --
+	// another task may be setting that very bit (see CLAUDE.md's locking rule).
+	sync.mutex_lock(&s.scheduler.big_lock)
+	allowed := objdb.is_programmer(ow.db, conn.player) || objdb.is_wizard(ow.db, conn.player)
+	sync.mutex_unlock(&s.scheduler.big_lock)
+	if !allowed {
+		send_line(conn, "%r** Permission denied **%n")
+		return
+	}
+
 	src := strings.concatenate({"return (", trimmed, ");"})
 	defer delete(src)
 	r := compiler.parse_program(src, dbfile.Current_DB_Version)
