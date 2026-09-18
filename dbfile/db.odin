@@ -78,6 +78,12 @@ Propval :: struct {
 	perms: int,
 }
 
+// USER_FLAG_BIT is db.h's FLAG_USER bit position within Object.flags. objdb owns the full
+// Object_Flag enum, but `flags` is a raw int in the on-disk record, and the writer needs this
+// one bit to recompute the player list (see write.odin) -- which is on-disk-format knowledge,
+// and so belongs here rather than being a reason for dbfile to depend on objdb.
+USER_FLAG_BIT :: 0
+
 Object :: struct {
 	id:       values.Objid,
 	recycled: bool, // matches a "#<oid> recycled" record -- a hole left by a destroyed object

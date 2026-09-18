@@ -33,6 +33,27 @@ reader_at_eof :: proc(r: ^Reader) -> bool {
 	return r.pos >= len(r.data)
 }
 
+// bytes_left reports how much input remains. Used by plausible_count below.
+bytes_left :: proc(r: ^Reader) -> int {
+	return len(r.data) - r.pos
+}
+
+// plausible_count screens an element count read out of the file before it is used to size an
+// allocation. Every such count describes records that must still be present in the input, and
+// the smallest possible record is one byte, so a count larger than the bytes remaining cannot
+// be honest -- and a negative one never can.
+//
+// This is not belt-and-braces: without it a corrupt .db takes the process down rather than
+// being rejected. `make([]Var, -1)` aborts outright ("Invalid slice length for make: -1"),
+// and a huge count makes the allocation fail, which `make` reports by returning an EMPTY
+// slice -- so the very next write through it aborts on a bounds check instead. A truncated
+// checkpoint (a crash part-way through a write, a bad disk) is exactly the situation the
+// checkpoint/emergency-mode design exists to survive, so it has to produce a clean
+// Load_Error, not a SIGILL before the server has finished starting.
+plausible_count :: proc(r: ^Reader, n: int) -> bool {
+	return n >= 0 && n <= bytes_left(r)
+}
+
 // read_line consumes bytes up to and including the next '\n' (or to EOF), returning the
 // line WITHOUT the trailing newline. Ports the line-oriented half of dbio_read_string /
 // dbio_read_num / dbio_scanf's per-field newline handling.
@@ -158,10 +179,23 @@ read_var :: proc(r: ^Reader, version: int, intern: ^values.Intern_Table) -> (v: 
 		if nerr != .None {
 			return values.none_val(), nerr
 		}
-		items := make([]values.Var, n)
+		if !plausible_count(r, n) {
+			return values.none_val(), .Bad_Format
+		}
+		items, merr := make([]values.Var, n)
+		if merr != nil {
+			return values.none_val(), .Bad_Format
+		}
 		for i in 0 ..< n {
 			item, ierr := read_var(r, version, intern)
 			if ierr != .None {
+				// Release the elements already read -- this is a malformed-input path, and
+				// leaking a partial list on every one of them is how a rejected database still
+				// ends up costing memory (and showing up as a leak report in the tests).
+				for j in 0 ..< i {
+					values.free_var(items[j])
+				}
+				delete(items)
 				return values.none_val(), ierr
 			}
 			items[i] = item

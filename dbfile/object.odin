@@ -77,6 +77,14 @@ read_object :: proc(r: ^Reader, version: int, names: ^Name_Intern, str_intern: ^
 
 	obj = new(Object)
 	obj.id = oid
+	// Every failure below goes through object_abort, not a bare free(obj): by the time the
+	// later fields are being read the object may already own verbdef/propdef/propval arrays
+	// and the Vars inside them, and free() releases only the struct itself. That is a leak on
+	// every malformed record, which is exactly the path a corrupt database takes.
+	defer if err != .None {
+		object_abort(obj)
+		obj = nil
+	}
 
 	if len(line) > 1 && strip_prefix_num(line[1:]) == " recycled" {
 		obj.recycled = true
@@ -85,8 +93,7 @@ read_object :: proc(r: ^Reader, version: int, names: ^Name_Intern, str_intern: ^
 
 	name, nerr := read_string(r)
 	if nerr != .None {
-		free(obj)
-		return nil, nerr
+		return obj, nerr
 	}
 	obj.name = intern_name(names, name)
 
@@ -94,8 +101,7 @@ read_object :: proc(r: ^Reader, version: int, names: ^Name_Intern, str_intern: ^
 
 	flags, ferr := read_num(r)
 	if ferr != .None {
-		free(obj)
-		return nil, ferr
+		return obj, ferr
 	}
 	obj.flags = flags
 
@@ -103,50 +109,43 @@ read_object :: proc(r: ^Reader, version: int, names: ^Name_Intern, str_intern: ^
 	for f in fields {
 		v, verr := read_objid(r)
 		if verr != .None {
-			free(obj)
-			return nil, verr
+			return obj, verr
 		}
 		f^ = v
 	}
 
 	nverbs, nverr := read_num(r)
 	if nverr != .None {
-		free(obj)
-		return nil, nverr
+		return obj, nverr
 	}
 	for _ in 0 ..< nverbs {
 		v, verr := read_verbdef(r, names)
 		if verr != .None {
-			free(obj)
-			return nil, verr
+			return obj, verr
 		}
 		append(&obj.verbdefs, v)
 	}
 
 	nprops, perr2 := read_num(r)
 	if perr2 != .None {
-		free(obj)
-		return nil, perr2
+		return obj, perr2
 	}
 	for _ in 0 ..< nprops {
 		p, perr := read_propdef(r, names)
 		if perr != .None {
-			free(obj)
-			return nil, perr
+			return obj, perr
 		}
 		append(&obj.propdefs, p)
 	}
 
 	npropvals, pverr := read_num(r)
 	if pverr != .None {
-		free(obj)
-		return nil, pverr
+		return obj, pverr
 	}
 	for _ in 0 ..< npropvals {
 		pv, pverr2 := read_propval(r, version, str_intern)
 		if pverr2 != .None {
-			free(obj)
-			return nil, pverr2
+			return obj, pverr2
 		}
 		append(&obj.propvals, pv)
 	}
@@ -186,4 +185,24 @@ strip_prefix_num :: proc(s: string) -> string {
 		i += 1
 	}
 	return s[i:]
+}
+
+// object_abort releases a partially-read Object and everything it has taken ownership of so
+// far. Mirrors the per-object half of database_destroy; kept next to read_object so the two
+// stay in step.
+@(private = "file")
+object_abort :: proc(obj: ^Object) {
+	if obj == nil {
+		return
+	}
+	for v in obj.verbdefs {
+		delete(v.program_source)
+	}
+	delete(obj.verbdefs)
+	delete(obj.propdefs)
+	for pv in obj.propvals {
+		values.free_var(pv.value)
+	}
+	delete(obj.propvals)
+	free(obj)
 }

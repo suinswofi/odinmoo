@@ -25,6 +25,18 @@ load_database :: proc(path: string) -> (db: Database, lerr: Load_Error) {
 	return load_database_bytes(data)
 }
 
+// fail disposes of a half-built Database and reports the error. Loading a malformed file
+// stops part-way through by design, and everything read up to that point -- interned strings,
+// objects, their verbdefs/propdefs/propvals -- is already allocated; handing the caller a
+// wrecked Database and hoping it calls database_destroy anyway is how those became leaks
+// (visible as several hundred KB per rejected file when fuzzing the loader). No caller wants
+// a partial database, so this returns an empty one and owns the cleanup itself.
+@(private = "file")
+fail :: proc(db: ^Database, stage: string, err: Read_Error) -> (Database, Load_Error) {
+	database_destroy(db)
+	return Database{}, Load_Error{stage, err}
+}
+
 load_database_bytes :: proc(data: []byte) -> (db: Database, lerr: Load_Error) {
 	r := reader_make(data)
 	db.objects = make(map[values.Objid]^Object)
@@ -33,32 +45,38 @@ load_database_bytes :: proc(data: []byte) -> (db: Database, lerr: Load_Error) {
 
 	version, verr := read_header(&r)
 	if verr != .None {
-		return db, Load_Error{"header", verr}
+		return fail(&db, "header", verr)
 	}
 	if !check_db_version(version) {
-		return db, Load_Error{"header", .Bad_Format}
+		return fail(&db, "header", .Bad_Format)
 	}
 	db.version = version
 
 	nobjs, nprogs, _, nusers, herr := read_counts(&r)
 	if herr != .None {
-		return db, Load_Error{"counts", herr}
+		return fail(&db, "counts", herr)
 	}
 
-	users := make([]values.Objid, nusers)
+	if !plausible_count(&r, nusers) {
+		return fail(&db, "counts", .Bad_Format)
+	}
+	users, uerr := make([]values.Objid, nusers)
+	if uerr != nil {
+		return fail(&db, "users", .Bad_Format)
+	}
+	db.users = users // assigned before the loop so a failure below still frees it
 	for i in 0 ..< nusers {
 		o, oerr := read_objid(&r)
 		if oerr != .None {
-			return db, Load_Error{"users", oerr}
+			return fail(&db, "users", oerr)
 		}
 		users[i] = o
 	}
-	db.users = users
 
 	for i in 0 ..< nobjs {
 		obj, oerr := read_object(&r, version, &db.name_intern, &db.str_intern, values.Objid(i))
 		if oerr != .None {
-			return db, Load_Error{"objects", oerr}
+			return fail(&db, "objects", oerr)
 		}
 		if obj.id > db.max_oid {
 			db.max_oid = obj.id
@@ -73,26 +91,37 @@ load_database_bytes :: proc(data: []byte) -> (db: Database, lerr: Load_Error) {
 	for _ in 0 ..< nprogs {
 		oid, vnum, perr := read_program_header(&r)
 		if perr != .None {
-			return db, Load_Error{"programs", perr}
+			return fail(&db, "programs", perr)
 		}
 		obj, found := db.objects[oid]
 		if !found || vnum < 0 || vnum >= len(obj.verbdefs) {
-			return db, Load_Error{"programs", .Bad_Format}
+			return fail(&db, "programs", .Bad_Format)
 		}
 		src, serr := read_program_text(&r)
 		if serr != .None {
-			return db, Load_Error{"programs", serr}
+			return fail(&db, "programs", serr)
 		}
+		// A well-formed file names each verb at most once, but nothing in the format enforces
+		// it, and a file that names one twice would otherwise drop the first program's storage
+		// on the floor. Release it rather than leak it; last record wins, as in the original.
+		delete(obj.verbdefs[vnum].program_source)
 		obj.verbdefs[vnum].program_source = src
 		obj.verbdefs[vnum].has_program = true
 	}
 
 	if terr := read_task_queue(&r, version, &db); terr != .None {
-		return db, Load_Error{"task queue", terr}
+		return fail(&db, "task queue", terr)
 	}
 
 	if cerr := read_active_connections(&r, &db); cerr != .None {
-		return db, Load_Error{"active connections", cerr}
+		return fail(&db, "active connections", cerr)
+	}
+
+	// Establishes the invariant every object-graph walk in objdb relies on -- see
+	// validate.odin. Without it a damaged database loads fine and segfaults (or spins) later,
+	// somewhere far from the actual damage.
+	if verr := validate_hierarchies(&db); verr != .None {
+		return fail(&db, "object graph", verr)
 	}
 
 	return db, Load_Error{}

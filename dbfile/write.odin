@@ -160,11 +160,27 @@ save_database_bytes :: proc(db: ^Database) -> []byte {
 		}
 	}
 
+	// The player list is DERIVED from the live objects, not copied from db.users. db.users is
+	// only ever filled in at load and never maintained afterwards -- set_player_flag(),
+	// recycle() and renumber() all change who is a player without touching it -- so writing it
+	// back verbatim records whoever were players when the database was last LOADED. A player
+	// created during this run would be missing from every checkpoint the server writes, which
+	// matters precisely because these files are meant to be readable by the real LambdaMOO,
+	// where that list IS the authoritative all_users set. Recomputing costs one pass over a map
+	// we are already walking.
+	users := make([dynamic]values.Objid, 0, len(db.users))
+	defer delete(users)
+	for i in values.Objid(0) ..= max_oid {
+		if obj, ok := db.objects[i]; ok && (obj.flags & (1 << USER_FLAG_BIT)) != 0 {
+			append(&users, i)
+		}
+	}
+
 	write_num(&w, int(max_oid) + 1)
 	write_num(&w, nprogs)
 	write_num(&w, 0) // historical "dummy" field, matches the original
-	write_num(&w, len(db.users))
-	for u in db.users {
+	write_num(&w, len(users))
+	for u in users {
 		write_objid(&w, u)
 	}
 

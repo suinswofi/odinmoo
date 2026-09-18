@@ -11,6 +11,7 @@ package dbfile
 // than silently truncating or corrupting the read.
 
 import "../values"
+import "base:runtime"
 import "core:strconv"
 import "core:strings"
 
@@ -118,8 +119,14 @@ read_forked_task :: proc(r: ^Reader, version: int, db: ^Database) -> (ft: Forked
 // -10`-style placeholders left over from a removed field, per the original's own `dummy`
 // variable), then 4 discarded strings and 2 kept ones (verb, verbname).
 read_activ_as_pi :: proc(r: ^Reader, db: ^Database, ft: ^Forked_Task_Record) -> Read_Error {
-	if _, verr := read_var(r, db.version, &db.str_intern); verr != .None {
-		return verr
+	// The sentinel Var is ignored by the original too, but it still has to be RELEASED here:
+	// a well-formed file always writes the constant -111 (an Int, nothing to free), while a
+	// malformed one can put a string or a list there, and dropping the result on the floor
+	// leaks it.
+	sentinel, sverr := read_var(r, db.version, &db.str_intern)
+	values.free_var(sentinel)
+	if sverr != .None {
+		return sverr
 	}
 
 	line, lerr := read_line(r)
@@ -173,19 +180,44 @@ read_rt_env :: proc(r: ^Reader, version: int, db: ^Database) -> (names: []string
 	if cerr != .None {
 		return nil, nil, cerr
 	}
-	names = make([]string, count)
-	vals = make([]values.Var, count)
+	if !plausible_count(r, count) {
+		return nil, nil, .Bad_Format
+	}
+	nerr2, verr2: runtime.Allocator_Error
+	names, nerr2 = make([]string, count)
+	vals, verr2 = make([]values.Var, count)
+	if nerr2 != nil || verr2 != nil {
+		delete(names)
+		delete(vals)
+		return nil, nil, .Bad_Format
+	}
 	for i in 0 ..< count {
 		n, nerr := read_string(r)
 		if nerr != .None {
-			return names, vals, nerr
+			return abort_rt_env(names, vals, i, nerr)
 		}
 		names[i] = intern_name(&db.name_intern, n)
 		v, verr := read_var(r, version, &db.str_intern)
 		if verr != .None {
-			return names, vals, verr
+			return abort_rt_env(names, vals, i, verr)
 		}
 		vals[i] = v
 	}
 	return names, vals, .None
+}
+
+// abort_rt_env releases a half-read runtime environment. read_forked_task drops whatever
+// read_rt_env returns on an error (it never gets as far as storing it in the record, and a
+// record that failed to read is never appended to db.forked_tasks either), so without this
+// every malformed task-queue trailer leaks both arrays and the values already in them.
+// `filled` is the number of value slots actually populated; the name strings are interned and
+// owned by the Name_Intern table, not by this array.
+@(private = "file")
+abort_rt_env :: proc(names: []string, vals: []values.Var, filled: int, err: Read_Error) -> ([]string, []values.Var, Read_Error) {
+	for i in 0 ..< filled {
+		values.free_var(vals[i])
+	}
+	delete(names)
+	delete(vals)
+	return nil, nil, err
 }
