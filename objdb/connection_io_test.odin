@@ -26,6 +26,7 @@ Fake_Conn :: struct {
 	output_prefix:     string,
 	output_suffix:     string,
 	last_raw_notified: string, // last text handed to fake_notify_raw, for assertions
+	queued_output:     int, // what fake_buffered_output_length reports; netio measures a real buffer
 }
 
 @(private = "file")
@@ -139,6 +140,8 @@ fake_output_delimiters :: proc(user_data: rawptr, player: values.Objid) -> (pref
 wire_fake_conn :: proc(ow: ^Object_World, fc: ^Fake_Conn) {
 	ow.conn = Connection_Hooks{
 		user_data          = fc,
+		buffered_output_length = fake_buffered_output_length,
+		max_queued_output  = fake_max_queued_output,
 		connection_name    = fake_connection_name,
 		notify_raw         = fake_notify_raw,
 		try_dequeue_input  = fake_try_dequeue,
@@ -150,6 +153,24 @@ wire_fake_conn :: proc(ow: ^Object_World, fc: ^Fake_Conn) {
 		connection_option  = fake_get_option,
 		output_delimiters  = fake_output_delimiters,
 	}
+}
+
+// This fake treats player #2 as the one live connection, matching the rest of this file.
+@(private = "file")
+fake_buffered_output_length :: proc(user_data: rawptr, player: values.Objid) -> (n: int, found: bool) {
+	fc := (^Fake_Conn)(user_data)
+	if player != 2 {
+		return 0, false
+	}
+	return fc.queued_output, true
+}
+
+@(private = "file")
+FAKE_MAX_QUEUED_OUTPUT :: 65536
+
+@(private = "file")
+fake_max_queued_output :: proc(user_data: rawptr) -> int {
+	return FAKE_MAX_QUEUED_OUTPUT
 }
 
 @(private = "file")
@@ -489,4 +510,136 @@ test_notify_raw_sends_text_unmodified_and_checks_permission :: proc(t: ^testing.
 	testing.expect(t, !wr.raised)
 	values.free_var(wr.value)
 	testing.expect(t, fc.last_raw_notified == "from a wizard")
+}
+
+// ---- buffered_output_length() ----
+//
+// The two argument forms are different questions answered by different hooks (see
+// bf_buffered_output_length), so both need covering, as does the check ordering: a
+// non-object is E_TYPE, an object that isn't a live connection is E_INVARG, and only a
+// connection someone else owns is E_PERM.
+
+@(private = "file")
+call_bol :: proc(ow: ^Object_World, world: ^vm.World, progr: values.Objid, args: []values.Var) -> vm.Call_Result {
+	act := crud_root_activation(progr)
+	ctx := vm.Eval_Context{activation = &act, world = world}
+	buf := make([]values.Var, len(args))
+	copy(buf, args)
+	return bf_buffered_output_length(ow, values.list_val(buf), &ctx)
+}
+
+@(test)
+test_buffered_output_length_reports_queue_and_ceiling :: proc(t: ^testing.T) {
+	db := build_crud_world()
+	defer crud_world_destroy(&db)
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := object_world_init(&db, &sched)
+	defer object_world_destroy(&ow)
+	world := make_world(&ow)
+	fc := Fake_Conn{scheduler = &sched, queued_output = 1234}
+	defer fake_conn_destroy(&fc)
+	wire_fake_conn(&ow, &fc)
+
+	// No argument: the per-connection ceiling, not anybody's current queue.
+	r := call_bol(&ow, &world, 1, {})
+	testing.expect(t, !r.raised)
+	testing.expectf(t, r.value.type == .Int && r.value.data.num == FAKE_MAX_QUEUED_OUTPUT, "want the ceiling, got %v", r.value)
+	values.free_var(r.value)
+
+	// With a connection: how much is queued for it right now.
+	r2 := call_bol(&ow, &world, 1, {values.obj_val(2)})
+	testing.expect(t, !r2.raised)
+	testing.expectf(t, r2.value.type == .Int && r2.value.data.num == 1234, "want 1234, got %v", r2.value)
+	values.free_var(r2.value)
+}
+
+@(test)
+test_buffered_output_length_rejects_bad_arguments :: proc(t: ^testing.T) {
+	db := build_crud_world()
+	defer crud_world_destroy(&db)
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := object_world_init(&db, &sched)
+	defer object_world_destroy(&ow)
+	world := make_world(&ow)
+	fc := Fake_Conn{scheduler = &sched}
+	defer fake_conn_destroy(&fc)
+	wire_fake_conn(&ow, &fc)
+
+	cases := [?]struct {
+		label: string,
+		progr: values.Objid,
+		args:  []values.Var,
+		want:  values.Error,
+	} {
+		{"too many arguments", 1, {values.obj_val(2), values.int_val(0)}, .E_ARGS},
+		{"not an object", 1, {values.int_val(2)}, .E_TYPE},
+		{"not a connection", 1, {values.obj_val(3)}, .E_INVARG},
+		// #2 is the live connection and #3 is neither it nor a wizard (#1 is the wizard here).
+		{"someone else's connection", 3, {values.obj_val(2)}, .E_PERM},
+	}
+	for c in cases {
+		r := call_bol(&ow, &world, c.progr, c.args)
+		if !testing.expectf(t, r.raised, "%s: expected a raise", c.label) {
+			values.free_var(r.value)
+			continue
+		}
+		testing.expectf(t, r.code == c.want, "%s: want %v, got %v", c.label, c.want, r.code)
+		delete(r.msg)
+		values.free_var(r.rvalue)
+	}
+}
+
+// A caller may always ask about their OWN connection without being a wizard.
+@(test)
+test_buffered_output_length_allows_own_connection :: proc(t: ^testing.T) {
+	db := build_crud_world()
+	defer crud_world_destroy(&db)
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := object_world_init(&db, &sched)
+	defer object_world_destroy(&ow)
+	world := make_world(&ow)
+	fc := Fake_Conn{scheduler = &sched, queued_output = 7}
+	defer fake_conn_destroy(&fc)
+	wire_fake_conn(&ow, &fc)
+
+	r := call_bol(&ow, &world, 2, {values.obj_val(2)}) // #2 is not a wizard
+	testing.expect(t, !r.raised)
+	testing.expectf(t, r.value.type == .Int && r.value.data.num == 7, "want 7, got %v", r.value)
+	values.free_var(r.value)
+}
+
+// ---- db_disk_size() ----
+
+@(private = "file")
+fake_db_disk_size :: proc(user_data: rawptr) -> (size: i64, ok: bool) {
+	return 4242, true
+}
+
+@(test)
+test_db_disk_size_reports_the_hook_and_quotas_without_one :: proc(t: ^testing.T) {
+	db := build_crud_world()
+	defer crud_world_destroy(&db)
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := object_world_init(&db, &sched)
+	defer object_world_destroy(&ow)
+
+	// No Server_Hooks at all -- emergency mode, or any embedding with no server loop under
+	// it. There is no on-disk representation to measure, which is E_QUOTA, not a crash.
+	args := make([]values.Var, 0)
+	r := bf_db_disk_size(&ow, values.list_val(args))
+	testing.expect(t, r.raised)
+	testing.expectf(t, r.code == .E_QUOTA, "want E_QUOTA, got %v", r.code)
+	delete(r.msg)
+	values.free_var(r.rvalue)
+
+	ow.server_ctl = Server_Hooks{db_disk_size = fake_db_disk_size}
+	args2 := make([]values.Var, 0)
+	r2 := bf_db_disk_size(&ow, values.list_val(args2))
+	testing.expect(t, !r2.raised)
+	testing.expectf(t, r2.value.type == .Int && r2.value.data.num == 4242, "want 4242, got %v", r2.value)
+	values.free_var(r2.value)
 }

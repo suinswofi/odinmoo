@@ -101,8 +101,9 @@ Connection :: struct {
 // MAX_QUEUED_OUTPUT matches options.h's default (65536): the most outbound bytes a
 // connection may have buffered before the oldest are discarded (with a notice, like the
 // original's "lines of output flushed" message -- byte-counted here rather than line-
-// counted, since the buffer is a flat byte stream).
-@(private = "file")
+// counted, since the buffer is a flat byte stream). Not file-private: it is also the answer
+// buffered_output_length() gives in its no-argument form (login.odin's
+// hook_max_queued_output).
 MAX_QUEUED_OUTPUT :: 65536
 
 // MAX_QUEUED_INPUT is MAX_QUEUED_OUTPUT's inbound twin, and matches the same options.h

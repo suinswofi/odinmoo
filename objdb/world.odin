@@ -48,6 +48,15 @@ Connection_Hooks :: struct {
 	// listening_points backs listeners(); the netio server owns the actual socket, so it
 	// reports what it has bound. Owned slice.
 	listening_points: proc(user_data: rawptr) -> []Listening_Point,
+
+	// buffered_output_length/max_queued_output back buffered_output_length(), whose two
+	// argument forms are genuinely two different questions (see connection_io.odin's
+	// bf_buffered_output_length): how much is queued for ONE connection right now, and what
+	// the per-connection ceiling is. Both answers live in netio, which owns the outbound
+	// buffer and its MAX_QUEUED_OUTPUT bound; nil max_queued_output reports 0, the honest
+	// answer for a world with no network layer under it.
+	buffered_output_length: proc(user_data: rawptr, player: values.Objid) -> (n: int, found: bool),
+	max_queued_output:      proc(user_data: rawptr) -> int,
 }
 
 // Listening_Point is one entry of what listeners() reports, ported from server.c's
@@ -72,6 +81,13 @@ Server_Hooks :: struct {
 	user_data:          rawptr,
 	request_shutdown:   proc(user_data: rawptr, message: string),
 	request_checkpoint: proc(user_data: rawptr),
+
+	// db_disk_size backs db_disk_size(): the size of the database's most recent full on-disk
+	// representation. Only server/main.odin knows which file that is (the one it loaded, until
+	// a checkpoint has been written; the checkpoint after that), so it answers. ok=false means
+	// there is no such file to measure, which the built-in reports as E_QUOTA exactly as the
+	// original does.
+	db_disk_size: proc(user_data: rawptr) -> (size: i64, ok: bool),
 }
 
 Object_World :: struct {

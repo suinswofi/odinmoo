@@ -75,6 +75,30 @@ bf_dump_database :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Conte
 	return ok_result(values.int_val(0))
 }
 
+// bf_db_disk_size ports db_file.c's bf_db_disk_size(): the size in bytes of the database's
+// most recent full on-disk representation, or E_QUOTA when there isn't one to measure. Not
+// permission-checked, matching the original -- it reports a property of the server's own
+// files, not of anything in the database.
+//
+// Which file that is, is server/main.odin's business: the original's db_disk_size() stats
+// input_db_name until a dump has happened and dump_db_name afterwards (its dump_generation
+// test), and the hook behind this reproduces that. JHCore's #175:description is the caller,
+// printing it in the checkpointer's status line.
+bf_db_disk_size :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
+	defer values.free_var(args)
+	if values.list_len(args) != 0 {
+		return err_result_local(.E_ARGS, "Incorrect number of arguments")
+	}
+	if w.server_ctl.db_disk_size == nil {
+		return err_result_local(.E_QUOTA, "No database file(s) available")
+	}
+	size, ok := w.server_ctl.db_disk_size(w.server_ctl.user_data)
+	if !ok {
+		return err_result_local(.E_QUOTA, "No database file(s) available")
+	}
+	return ok_result(values.int_val(i32(size)))
+}
+
 // bf_load_server_options ports functions.c's bf_load_server_options(): wizard-only,
 // refreshes the original's in-memory `$server_options`-derived caches (protect_* flags,
 // misc numeric options). This port doesn't maintain any such cache -- there's no per-builtin

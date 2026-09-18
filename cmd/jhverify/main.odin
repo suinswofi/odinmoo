@@ -43,6 +43,7 @@ db_and_task_builtins := map[string]bool {
 	"load_server_options" = true, "read" = true, "force_input" = true,
 	"flush_input" = true, "set_connection_option" = true, "connection_option" = true,
 	"connection_options" = true, "output_delimiters" = true,
+	"buffered_output_length" = true, "db_disk_size" = true,
 	"open_network_connection" = true, "eval" = true, "listeners" = true,
 	"suspend" = true, "resume" = true, "kill_task" = true, "task_id" = true,
 }

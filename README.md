@@ -44,12 +44,17 @@ consequence of the concurrency redesign described below; a handful of `set_conne
 flags (`binary`, `disable-oob`) are accepted and stored but don't change wire behavior, since
 nothing else in this port implements what they'd toggle.
 
-Six built-ins JHCore references remain unimplemented, none on a path ordinary play reaches:
+Four built-ins JHCore references remain unimplemented, none on a path ordinary play reaches:
 `listen()`/`unlisten()` (creating and destroying listening points at runtime -- `listeners()`
 does work, reporting the single command-line listener the original also creates as
 `new_slistener(SYSTEM_OBJECT, port, 1, 0)`), `disassemble()` (there is no bytecode to
-disassemble here -- see the VM note below), `decode_binary()`, `db_disk_size()`, and
-`buffered_output_length()` (nothing in this port buffers output to measure).
+disassemble here -- see the VM note below), and `decode_binary()` (part of the binary-connection
+surface whose `set_connection_option()` flags are inert, above). Calling one raises `E_VERBNF`
+rather than failing to compile, since the compiler recognizes every name the original does.
+
+`db_disk_size()` and `buffered_output_length()` were on that list until the outbound side grew a
+real per-connection buffer to measure and the server started tracking which file its database
+most recently landed in; both now work as specified.
 
 ## Why a rewrite, and how it was approached
 

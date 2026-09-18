@@ -82,6 +82,9 @@ checkpoint_writer_proc :: proc(data: rawptr) {
 		fmt.eprintfln("CHECKPOINT: writing %s FAILED: %v", job.path, werr)
 	} else {
 		fmt.printfln("CHECKPOINT: finished writing %s", job.path)
+		// Only now does the checkpoint become the database's on-disk representation, which
+		// is what db_disk_size() reports on (main.odin's g_checkpoint_written).
+		note_checkpoint_written()
 	}
 }
 

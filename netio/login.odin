@@ -276,6 +276,32 @@ hook_listening_points :: proc(user_data: rawptr) -> []objdb.Listening_Point {
 	return points
 }
 
+// hook_buffered_output_length reports how many bytes are queued for a connection but not yet
+// written to its socket -- the outbound buffer enqueue_output appends to and the writer
+// thread drains (connection.odin). Both locks are needed and in this order: players_lock to
+// hold the ^Connection still (see the "Connection lifetime" note below), out_lock because the
+// writer thread swaps that buffer out from under readers.
+@(private = "file")
+hook_buffered_output_length :: proc(user_data: rawptr, player: values.Objid) -> (n: int, found: bool) {
+	s := (^Server)(user_data)
+	sync.mutex_lock(&s.players_lock)
+	defer sync.mutex_unlock(&s.players_lock)
+	conn, ok := s.players[player]
+	if !ok {
+		return 0, false
+	}
+	sync.mutex_lock(&conn.out_lock)
+	defer sync.mutex_unlock(&conn.out_lock)
+	return len(conn.out_buf), true
+}
+
+// hook_max_queued_output answers buffered_output_length()'s no-argument form: the ceiling any
+// one connection's buffer is allowed to reach before the backlog is discarded.
+@(private = "file")
+hook_max_queued_output :: proc(user_data: rawptr) -> int {
+	return MAX_QUEUED_OUTPUT
+}
+
 // wire_connection_hooks points an Object_World's notify/connection_name/boot_player/
 // connected_players/connected_seconds at this server's connection registry. Call once, after
 // object_world_init() and before server_start() -- server/main.odin does this at startup.
@@ -298,6 +324,8 @@ wire_connection_hooks :: proc(ow: ^objdb.Object_World, s: ^Server) {
 		connection_options = hook_connection_options,
 		output_delimiters  = hook_output_delimiters,
 		listening_points   = hook_listening_points,
+		buffered_output_length = hook_buffered_output_length,
+		max_queued_output  = hook_max_queued_output,
 	}
 }
 

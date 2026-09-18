@@ -41,6 +41,25 @@ g_checkpoint_requested: bool
 @(private = "file")
 g_shutdown_requested: bool
 
+// Which file db_disk_size() should measure, and the flag that selects between them. This
+// ports db_file.c's db_disk_size(), which stats input_db_name while dump_generation is 0 and
+// dump_db_name once it isn't: before any checkpoint, the database's most recent full on-disk
+// representation IS the file we loaded.
+//
+// The paths are written once, in main(), before anything that could read them exists; the
+// flag is set by the checkpoint writer on a background thread, hence the atomics. It is
+// deliberately set only after a write SUCCEEDS, which differs slightly from the original's
+// dump_generation (bumped when the dump starts). The original can hand out the name of a file
+// its forked child has not finished writing, and stat() then reports a partial size or fails;
+// waiting for success means this always names a file that is actually there, and reports the
+// loaded database in the meantime rather than an error.
+@(private = "file")
+g_initial_db_path: string
+@(private = "file")
+g_checkpoint_db_path: string
+@(private = "file")
+g_checkpoint_written: bool
+
 @(private = "file")
 on_sigusr2 :: proc "c" (sig: posix.Signal) {
 	sync.atomic_store(&g_checkpoint_requested, true)
@@ -68,6 +87,32 @@ hook_request_checkpoint :: proc(user_data: rawptr) {
 	sync.atomic_store(&g_checkpoint_requested, true)
 }
 
+// note_checkpoint_written is called by checkpoint.odin once a checkpoint file has actually
+// landed on disk, so db_disk_size() starts measuring it instead of the database we loaded.
+note_checkpoint_written :: proc() {
+	sync.atomic_store(&g_checkpoint_written, true)
+}
+
+// hook_db_disk_size backs objdb.Server_Hooks.db_disk_size -- see the globals above for which
+// file it measures and why. A failed stat (the file deleted underneath us, a checkpoint path
+// that was never writable) is reported as "no such representation", which the built-in turns
+// into E_QUOTA exactly as the original does.
+@(private = "file")
+hook_db_disk_size :: proc(user_data: rawptr) -> (size: i64, ok: bool) {
+	path := g_initial_db_path
+	if sync.atomic_load(&g_checkpoint_written) {
+		path = g_checkpoint_db_path
+	}
+	if len(path) == 0 {
+		return 0, false
+	}
+	fi, err := os.stat(path, context.temp_allocator)
+	if err != nil {
+		return 0, false
+	}
+	return fi.size, true
+}
+
 main :: proc() {
 	args := os.args[1:]
 	emergency := false
@@ -81,6 +126,9 @@ main :: proc() {
 	}
 	initial_db_path := args[0]
 	checkpoint_db_path := args[1]
+	// Recorded before anything that could ask for them is running -- see the globals above.
+	g_initial_db_path = initial_db_path
+	g_checkpoint_db_path = checkpoint_db_path
 	port := DEFAULT_PORT
 	if len(args) >= 3 {
 		if p, ok := strconv.parse_int(args[2], 10); ok {
@@ -121,6 +169,7 @@ main :: proc() {
 	ow.server_ctl = objdb.Server_Hooks{
 		request_shutdown   = hook_request_shutdown,
 		request_checkpoint = hook_request_checkpoint,
+		db_disk_size       = hook_db_disk_size,
 	}
 	if err := netio.server_start(&s, port, &sched, &world); err != nil {
 		fmt.eprintfln("LISTENING: failed to start on port %d: %v", port, err)
@@ -152,6 +201,9 @@ main :: proc() {
 	sync.mutex_lock(&sched.big_lock)
 	ok := dbfile.save_database(&db, checkpoint_db_path)
 	sync.mutex_unlock(&sched.big_lock)
+	if ok {
+		note_checkpoint_written()
+	}
 	fmt.printfln("DUMPING: %s", ok ? "done" : "FAILED")
 	fmt.println("DONE")
 }

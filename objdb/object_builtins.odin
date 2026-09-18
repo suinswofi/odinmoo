@@ -145,6 +145,10 @@ object_builtin :: proc(w: ^Object_World, name: string, args: values.Var, ctx: ^v
 		return bf_connection_options(w, args, ctx), true
 	case "output_delimiters":
 		return bf_output_delimiters(w, args, ctx), true
+	case "buffered_output_length":
+		return bf_buffered_output_length(w, args, ctx), true
+	case "db_disk_size":
+		return bf_db_disk_size(w, args), true
 	case "open_network_connection":
 		return bf_open_network_connection(args), true
 	case "eval":

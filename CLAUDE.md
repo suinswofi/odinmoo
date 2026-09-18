@@ -187,8 +187,10 @@ Two structural points that are easy to violate by accident:
   and friends check for it to prove they were called by `move()` and not by a player.
 - Deliberate, documented gaps: outbound `open_network_connection()` is disabled (matching the
   original's default non-`OUTBOUND_NETWORK` build); some `set_connection_option()` flags (`binary`,
-  `disable-oob`) are stored but inert; `listen()`/`unlisten()` are not implemented (`listeners()`
-  reports the single command-line listening point); `disassemble()` has no bytecode to report on.
+  `disable-oob`) are stored but inert, as is `decode_binary()` alongside them; `listen()`/
+  `unlisten()` are not implemented (`listeners()` reports the single command-line listening
+  point); `disassemble()` has no bytecode to report on. Those four are what `cmd/jhverify`
+  still reports against JHCore; LambdaCore calls none of them.
   Databases at format version 5+ (e.g. HellCore) are rejected cleanly at load — stock LambdaMOO's
   `DB_Version` stops at 4, and so does this.
 - **A database with a broken object graph is rejected at load** (`dbfile/validate.odin`): every

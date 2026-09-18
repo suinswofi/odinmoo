@@ -292,6 +292,49 @@ bf_output_delimiters :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_C
 	return ok_result(values.list_val(fields))
 }
 
+// bf_buffered_output_length ports server.c's bf_buffered_output_length(). The two argument
+// forms answer different questions and take different code paths, which is why the World
+// exposes them as two hooks (see Connection_Hooks in world.odin):
+//
+//   buffered_output_length()      -> the ceiling: the most bytes that will ever be buffered
+//                                    for any one connection, i.e. netio's MAX_QUEUED_OUTPUT.
+//   buffered_output_length(conn)  -> how many bytes are queued for THAT connection right now.
+//
+// Ordering of the checks is the original's: E_TYPE on a non-object, then E_INVARG if it isn't
+// a live connection, and only then E_PERM -- a caller may ask about their own connection, a
+// wizard about anybody's. JHCore's #210:close_safe is the real consumer, looping on this to
+// let a connection's output drain before it closes the socket.
+bf_buffered_output_length :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
+	defer values.free_var(args)
+	n := values.list_len(args)
+	if n > 1 {
+		return err_result_local(.E_ARGS, "Incorrect number of arguments")
+	}
+	if n == 0 {
+		max := 0
+		if w.conn.max_queued_output != nil {
+			max = w.conn.max_queued_output(w.conn.user_data)
+		}
+		return ok_result(values.int_val(i32(max)))
+	}
+	v := values.list_get(args, 1)
+	if v.type != .Obj {
+		return err_result_local(.E_TYPE, "Type mismatch")
+	}
+	if w.conn.buffered_output_length == nil {
+		return err_result_local(.E_INVARG, "Not a connected player")
+	}
+	queued, found := w.conn.buffered_output_length(w.conn.user_data, v.data.obj)
+	if !found {
+		return err_result_local(.E_INVARG, "Not a connected player")
+	}
+	progr := ctx.activation.programmer
+	if v.data.obj != progr && !is_wizard(w.db, progr) {
+		return err_result_local(.E_PERM, "Permission denied")
+	}
+	return ok_result(values.int_val(i32(queued)))
+}
+
 // bf_open_network_connection ports server.c's bf_open_network_connection(): the original is
 // itself compiled out (always E_PERM) unless the site defines OUTBOUND_NETWORK, which is NOT
 // the default -- and this port targets exactly that default "modern minimal" configuration
