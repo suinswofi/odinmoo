@@ -27,6 +27,13 @@ list_set :: proc(list: Var, value: Var, pos: int) -> Var {
 	l := list.data.list
 	free_var(l.items[pos - 1])
 	l.items[pos - 1] = value
+	// Raise the cached depth if the new element is deeper than anything the list held.
+	// Deliberately monotonic -- replacing the one deep element with a shallow one leaves an
+	// over-estimate behind rather than paying an O(n) rescan on every `l[i] = v` in a loop.
+	// MAX_VALUE_DEPTH is a safety ceiling, so an upper bound is exactly what it needs.
+	if d := value_depth(value) + 1; d > l.depth {
+		l.depth = d
+	}
 	return list
 }
 
@@ -62,6 +69,9 @@ do_insert :: proc(list: Var, value: Var, pos: int) -> Var {
 		delete(l.items)
 		grown[n] = value
 		l.items = grown
+		if d := value_depth(value) + 1; d > l.depth {
+			l.depth = d // same in-place depth maintenance as list_set's
+		}
 		return list
 	}
 	items := make([]Var, n + 1)

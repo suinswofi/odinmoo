@@ -23,6 +23,23 @@ bf_length :: proc(args: values.Var) -> vm.Call_Result {
 	return arg_type_error()
 }
 
+// nest_ok is the shared guard for the four built-ins that put a value INSIDE a list
+// (listappend/listinsert/listset/setadd) -- the builtin-level counterpart to the checks the
+// VM applies to `{x}` and `l[i] = v`. Every one of them deepens the result by a level and
+// so can be looped to build the pathologically nested values values.MAX_VALUE_DEPTH exists
+// to prevent; `grows` additionally covers the ones that lengthen the list, against
+// values.MAX_LIST_LEN.
+@(private = "file")
+nest_ok :: proc(list, value: values.Var, grows: bool) -> bool {
+	if values.value_depth(value) + 1 > values.MAX_VALUE_DEPTH {
+		return false
+	}
+	if grows && values.list_len(list) >= values.MAX_LIST_LEN {
+		return false
+	}
+	return true
+}
+
 // bf_listappend ports listappend(list, value [, pos]) -- inserts after `pos` (default: at
 // the end), unlike listinsert's "before pos" convention.
 bf_listappend :: proc(args: values.Var) -> vm.Call_Result {
@@ -36,6 +53,10 @@ bf_listappend :: proc(args: values.Var) -> vm.Call_Result {
 	if list.type != .List {
 		values.free_var(args)
 		return arg_type_error()
+	}
+	if !nest_ok(list, value, true) {
+		values.free_var(args)
+		return raise_err(.E_QUOTA, "Value too large")
 	}
 	list_owned := values.var_dup(list)
 	value_owned := values.var_ref(value)
@@ -65,6 +86,10 @@ bf_listinsert :: proc(args: values.Var) -> vm.Call_Result {
 	if list.type != .List {
 		values.free_var(args)
 		return arg_type_error()
+	}
+	if !nest_ok(list, value, true) {
+		values.free_var(args)
+		return raise_err(.E_QUOTA, "Value too large")
 	}
 	list_owned := values.var_dup(list)
 	value_owned := values.var_ref(value)
@@ -115,6 +140,9 @@ bf_listset :: proc(args: values.Var) -> vm.Call_Result {
 	if pos < 1 || pos > values.list_len(list) {
 		return raise_err(.E_RANGE, "Range error")
 	}
+	if !nest_ok(list, value, false) { // replaces an element, so the list doesn't lengthen
+		return raise_err(.E_QUOTA, "Value too large")
+	}
 	return vm.call_ok(values.list_set(values.var_dup(list), values.var_ref(value), pos))
 }
 
@@ -126,6 +154,9 @@ bf_setadd :: proc(args: values.Var) -> vm.Call_Result {
 	list := nth(args, 1)
 	if list.type != .List {
 		return arg_type_error()
+	}
+	if !nest_ok(list, nth(args, 2), true) {
+		return raise_err(.E_QUOTA, "Value too large")
 	}
 	return vm.call_ok(values.set_add(values.var_dup(list), values.var_ref(nth(args, 2))))
 }

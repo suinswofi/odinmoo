@@ -76,9 +76,13 @@ Moo_String :: struct {
 // header at slot 0 -- Odin slices already carry their own length, so that header slot would
 // be redundant and is a common source of off-by-one bugs in the original). MOO-level 1-based
 // indexing is a language-surface concern handled at the builtins/VM boundary, not here.
+//
+// `depth` is this port's own addition, and it is a memory-safety device rather than
+// bookkeeping -- see MAX_VALUE_DEPTH.
 Moo_List :: struct {
 	rc:    int,
 	items: []Var,
+	depth: int, // 1 + the greatest depth among items; a list of scalars has depth 1
 }
 
 Var_Data :: struct #raw_union {
@@ -142,12 +146,71 @@ str_val :: proc(s: string) -> Var {
 
 // list_val takes ownership of items (and, transitively, of the refcounts of every Var
 // inside it -- the caller must have already var_ref'd anything it wants to keep a
-// separate handle to).
+// separate handle to). It also computes the new list's nesting depth, which is why every
+// list in the system must be built through here: the depth of a list is only knowable from
+// its elements, and caching it is what makes checking it O(1) at the places that enforce
+// MAX_VALUE_DEPTH. The extra pass costs nothing asymptotically -- every caller has just
+// finished looping over these same items to build the slice.
 list_val :: proc(items: []Var) -> Var {
 	ml := new(Moo_List)
 	ml.rc = 1
 	ml.items = items
+	deepest := 0
+	for item in items {
+		if item.type == .List && item.data.list.depth > deepest {
+			deepest = item.data.list.depth
+		}
+	}
+	ml.depth = deepest + 1
 	return Var{type = .List, data = {list = ml}}
+}
+
+// MAX_VALUE_DEPTH caps how deeply MOO values may nest inside one another. Like the
+// compiler's MAX_PARSE_DEPTH and objdb's MAX_VERB_DEPTH it exists because something walks
+// this structure recursively on the native stack -- here it is nearly everything that
+// touches a value at all: free_var below, equality, var_dup, toliteral()/tostr(), the
+// property writer in dbfile, and value_bytes(). free_var and the database writer are the
+// two that make it a genuine denial of service rather than an awkward error:
+//
+//   x = {}; for i in [1..25000] x = {x}; endfor #0.prop = x;
+//
+// run a few dozen times (each run is a fresh task, so no per-task budget bounds the total)
+// builds a value around a million deep. Dropping it recurses a million frames and segfaults;
+// so does dumping it, which means the crash lands on the CHECKPOINT -- the server dies every
+// time it tries to save, and the database can't be written at all. Neither path has anywhere
+// to report an error to, so the limit has to be enforced where such values are BUILT.
+//
+// 256 is chosen the same way MAX_PARSE_DEPTH's 200 is: orders of magnitude above anything
+// real code does (nesting in either bundled core's data is in the single digits) and orders
+// of magnitude below what the stack can take. The original needs no such limit because its
+// values are freed and written iteratively over a task queue rather than by recursion.
+MAX_VALUE_DEPTH :: 256
+
+// MAX_LIST_LEN/MAX_STR_LEN bound a single value's size. They are not a quota system -- the
+// database's own ownership_quota is that, and a player can still hold many values -- they
+// exist to stop the DOUBLING constructions, which are the ones no other limit catches:
+// `x = x + x;` or `l = {@l, @l};` in a loop reaches the machine's memory in about thirty
+// iterations, far inside any tick budget. The original bounds the same two operations
+// through $server_options (max_string_concat/max_list_concat); these are fixed constants
+// here for the same reason MAX_VERB_DEPTH's ceiling is, and are set generously: no
+// legitimate MOO string is 16MB, and no legitimate MOO list has a million elements.
+MAX_LIST_LEN :: 1 << 20
+MAX_STR_LEN :: 1 << 24
+
+// value_depth reports how deeply v nests. Scalars are 0, so `{1, 2}` is 1 and `{{1}}` is 2.
+value_depth :: proc(v: Var) -> int {
+	if v.type == .List {
+		return v.data.list.depth
+	}
+	return 0
+}
+
+// too_deep is the guard every value-building operation applies to its RESULT. Checking
+// afterwards rather than before is deliberate: the result's depth is already cached by
+// list_val, so the test is a field read, and the operations that need it (list literals,
+// listappend, l[i] = v, ...) all consume their inputs on the way to producing it anyway.
+too_deep :: proc(v: Var) -> bool {
+	return value_depth(v) > MAX_VALUE_DEPTH
 }
 
 empty_list :: proc() -> Var {

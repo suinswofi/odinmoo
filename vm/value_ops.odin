@@ -59,11 +59,15 @@ simple_binary :: proc(a, b: values.Var, iop: proc(i32, i32) -> i32, fop: proc(f6
 	return err_result(.E_TYPE)
 }
 
-// do_string_concat ports OP_ADD's TYPE_STR branch (a plain string concatenation; the
-// original's SVO_MAX_STRING_CONCAT quota check is a $server_options-driven limit -- a
-// Phase 4/5 concern once the object DB providing $server_options exists, so it's not
-// enforced here yet).
+// do_string_concat ports OP_ADD's TYPE_STR branch, with the length ceiling the original
+// gets from $server_options.max_string_concat applied as a fixed constant instead (see
+// values.MAX_STR_LEN). Checking BEFORE concatenating, not after, is the point: `x = x + x`
+// in a loop is the construction this exists to stop, and by the time the allocation has
+// been made the damage is done.
 do_string_concat :: proc(a, b: values.Var) -> Op_Result {
+	if len(a.data.str.s) + len(b.data.str.s) > values.MAX_STR_LEN {
+		return err_result(.E_QUOTA)
+	}
 	return ok_result(values.str_val(strings.concatenate({a.data.str.s, b.data.str.s})))
 }
 
@@ -322,6 +326,14 @@ index_set :: proc(base, index, value: values.Var) -> Op_Result {
 		values.free_var(value)
 		return ok_result(values.str_val(string(buf)))
 	}
+	if values.value_depth(value) + 1 > values.MAX_VALUE_DEPTH {
+		// `l[i] = v` nests v one level inside l, so it can grow depth exactly like a list
+		// literal can -- see values.MAX_VALUE_DEPTH.
+		values.free_var(base)
+		values.free_var(index)
+		values.free_var(value)
+		return err_result(.E_QUOTA)
+	}
 	result := base
 	if sync.atomic_load(&base.data.list.rc) != 1 { // atomic: see values.odin's refcount note
 		result = values.var_dup(base)
@@ -357,6 +369,15 @@ range_set :: proc(base, from, to, value: values.Var) -> Op_Result {
 	if base.type == .Str {
 		left := f > 1 ? base.data.str.s[:f - 1] : ""
 		right := n > t ? base.data.str.s[t:] : ""
+		if len(left) + len(value.data.str.s) + len(right) > values.MAX_STR_LEN {
+			// The other half of the doubling guard in do_string_concat: `s[1..0] = s`
+			// grows a string just as fast as `s + s` does.
+			values.free_var(base)
+			values.free_var(from)
+			values.free_var(to)
+			values.free_var(value)
+			return err_result(.E_QUOTA)
+		}
 		joined := strings.concatenate({left, value.data.str.s, right})
 		values.free_var(base)
 		values.free_var(from)
@@ -364,7 +385,18 @@ range_set :: proc(base, from, to, value: values.Var) -> Op_Result {
 		values.free_var(value)
 		return ok_result(values.str_val(joined))
 	}
+	left_n := f > 1 ? f - 1 : 0
+	right_n := n > t ? n - t : 0
+	if left_n + values.list_len(value) + right_n > values.MAX_LIST_LEN {
+		values.free_var(base)
+		values.free_var(from)
+		values.free_var(to)
+		values.free_var(value)
+		return err_result(.E_QUOTA)
+	}
 	values.free_var(from)
 	values.free_var(to)
+	// list_range_set splices value's ELEMENTS in rather than nesting value itself, so the
+	// result can be no deeper than its two inputs already were -- no depth check needed.
 	return ok_result(values.list_range_set(base, f, t, value))
 }

@@ -137,7 +137,15 @@ expect_line :: proc(r: ^Reader, expected: string) -> Read_Error {
 // read_var ports dbio_read_var(): a type tag line, then type-dependent payload.
 // version is the DB_Version this file was written under (needed for the Prehistory-era
 // TYPE_ANY quirk, ported verbatim from db_io.c's dbio_read_var).
-read_var :: proc(r: ^Reader, version: int, intern: ^values.Intern_Table) -> (v: values.Var, err: Read_Error) {
+//
+// `depth` bounds the one place this function recurses -- a list element -- against
+// values.MAX_VALUE_DEPTH, and is the load-time half of that limit. The VM enforces it on
+// values MOO code builds, so no database this server writes can exceed it; a file from
+// anywhere else can, and a million-deep list would overflow the stack here rather than
+// being reported as the malformed input it is. Rejecting it is the same policy validate.odin
+// applies to a broken object graph: a database this server cannot safely handle does not get
+// loaded halfway.
+read_var :: proc(r: ^Reader, version: int, intern: ^values.Intern_Table, depth: int = 0) -> (v: values.Var, err: Read_Error) {
 	tag, terr := read_num(r)
 	if terr != .None {
 		return values.none_val(), terr
@@ -175,6 +183,9 @@ read_var :: proc(r: ^Reader, version: int, intern: ^values.Intern_Table) -> (v: 
 		f, ferr := read_float(r)
 		return values.float_val(f), ferr
 	case .List:
+		if depth >= values.MAX_VALUE_DEPTH {
+			return values.none_val(), .Bad_Format
+		}
 		n, nerr := read_num(r)
 		if nerr != .None {
 			return values.none_val(), nerr
@@ -187,7 +198,7 @@ read_var :: proc(r: ^Reader, version: int, intern: ^values.Intern_Table) -> (v: 
 			return values.none_val(), .Bad_Format
 		}
 		for i in 0 ..< n {
-			item, ierr := read_var(r, version, intern)
+			item, ierr := read_var(r, version, intern, depth + 1)
 			if ierr != .None {
 				// Release the elements already read -- this is a malformed-input path, and
 				// leaking a partial list on every one of them is how a rejected database still

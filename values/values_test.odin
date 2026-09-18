@@ -254,3 +254,63 @@ test_ascii_fold_helpers :: proc(t: ^testing.T) {
 	// byte-oriented comparisons rather than Unicode semantics.
 	testing.expect(t, ascii_compare_fold("é", "É") != 0)
 }
+
+// ---- Value size/nesting limits ----
+
+// mklist heap-allocates the element slice list_val takes ownership of. A slice literal
+// would be stack storage, which free_var would later delete().
+@(private = "file")
+mklist :: proc(items: ..Var) -> Var {
+	buf := make([]Var, len(items))
+	copy(buf, items)
+	return list_val(buf)
+}
+
+// A list's cached depth is what makes MAX_VALUE_DEPTH checkable in O(1) at every site that
+// builds a value, so it has to be right for every way a list can be constructed -- including
+// the two that mutate one in place.
+@(test)
+test_list_depth_is_tracked :: proc(t: ^testing.T) {
+	flat := mklist(int_val(1), int_val(2))
+	testing.expect(t, value_depth(flat) == 1)
+	testing.expect(t, value_depth(int_val(1)) == 0, "scalars are depth 0")
+
+	nested := mklist(var_ref(flat))
+	testing.expect(t, value_depth(nested) == 2)
+
+	// A list is as deep as its DEEPEST element, not its last or its first.
+	mixed := mklist(int_val(0), var_ref(nested), int_val(0))
+	testing.expect(t, value_depth(mixed) == 3)
+
+	// list_append's in-place fast path (refcount == 1, appending at the end) mutates rather
+	// than rebuilding, so it has to raise the cached depth itself.
+	grown := list_append(mklist(), var_ref(mixed))
+	testing.expect(t, value_depth(grown) == 4)
+
+	// So does list_set.
+	replaced := list_set(mklist(int_val(1)), var_ref(mixed), 1)
+	testing.expect(t, value_depth(replaced) == 4)
+
+	free_var(replaced)
+	free_var(grown)
+	free_var(mixed)
+	free_var(nested)
+	free_var(flat)
+}
+
+// Deep nesting must be cheap to detect: too_deep is the guard the VM and the list built-ins
+// apply, and the crash it prevents (recursive free_var / the database writer blowing the
+// native stack) has no error path of its own.
+@(test)
+test_too_deep_triggers_at_the_limit :: proc(t: ^testing.T) {
+	v := mklist()
+	for _ in 0 ..< MAX_VALUE_DEPTH - 1 {
+		v = mklist(v)
+	}
+	testing.expect(t, value_depth(v) == MAX_VALUE_DEPTH, "expected to have built exactly the limit")
+	testing.expect(t, !too_deep(v), "a value exactly at the limit is allowed")
+
+	one_more := mklist(v)
+	testing.expect(t, too_deep(one_more), "one level past the limit must be rejected")
+	free_var(one_more)
+}

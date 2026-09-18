@@ -251,7 +251,19 @@ eval_args_as_list :: proc(ctx: ^Eval_Context, args: []compiler.Arg) -> Expr_Resu
 	// allocator, which ignores the size on free, but quietly depends on that; this codebase has
 	// already been bitten once by an allocator assumption that held right up until it didn't.)
 	shrink(&acc)
-	return ok_expr(values.list_val(acc[:]))
+	if len(acc) > values.MAX_LIST_LEN {
+		fail(&acc)
+		return raise_or_value(ctx, .E_QUOTA)
+	}
+	result := values.list_val(acc[:])
+	// This is the one place a list literal is built, `{@a, @b}` splices included, so it is
+	// where both value limits have to be applied: the splice form is how a list is doubled
+	// (values.MAX_LIST_LEN), and `{x}` is how one is nested (values.MAX_VALUE_DEPTH).
+	if values.too_deep(result) {
+		values.free_var(result)
+		return raise_or_value(ctx, .E_QUOTA)
+	}
+	return ok_expr(result)
 }
 
 @(private = "file")
