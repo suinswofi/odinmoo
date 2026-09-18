@@ -102,6 +102,12 @@ Two structural points that are easy to violate by accident:
 - **The tree-walking interpreter replaces the bytecode layer.** There is no `code_gen.c` equivalent
   and no opcode table. Every task has its own native Odin call stack, which is what makes the next
   point possible.
+- **Anything recursive runs on the native stack, so every such recursion needs an explicit
+  ceiling** — this port turns what is a growable heap array (or a bison value stack) upstream into
+  a segfault that takes the whole server down. `compiler.MAX_PARSE_DEPTH` (nested expressions and
+  statement blocks — `.program`, `eval()`, `set_verb_code()` and a `.db`'s verb text all reach the
+  parser) and `objdb.MAX_VERB_DEPTH` (nested verb calls) are the two that exist for this reason.
+  Adding a new recursive walk over attacker-shaped input means asking which of these bounds it.
 - **Tasks are real OS threads, not a cooperative single-threaded loop with snapshotted activation
   stacks.** A single `Scheduler.big_lock` mutex guarantees only one task actively touches the object
   DB at a time, preserving the original's effective single-writer semantics. Anything touching the

@@ -286,3 +286,48 @@ test_malformed_programs_parse_without_memory_errors :: proc(t: ^testing.T) {
 		testing.expectf(t, false, "leaked %d bytes from %v", entry.size, entry.location)
 	}
 }
+
+@(private = "file")
+repeat_str :: proc(unit: string, n: int) -> string {
+	b := strings.builder_make()
+	for _ in 0 ..< n {
+		strings.write_string(&b, unit)
+	}
+	return strings.to_string(b)
+}
+
+// Over-deep nesting must come back as a parse ERROR, not a native stack overflow. This is a
+// recursive-descent parser on the real call stack, so before MAX_PARSE_DEPTH existed roughly
+// 4000 levels segfaulted the process outright -- from any string that gets compiled, which
+// includes `.program`, eval() and a verb's source in a .db file. See MAX_PARSE_DEPTH.
+@(test)
+test_deep_nesting_is_rejected_not_fatal :: proc(t: ^testing.T) {
+	cases := [?]struct {
+		label: string,
+		src:   string,
+	} {
+		{"parens", strings.concatenate({"return ", repeat_str("(", 50000), "1", repeat_str(")", 50000), ";"})},
+		{"unary", strings.concatenate({"return ", repeat_str("!", 50000), "1;"})},
+		{"list literals", strings.concatenate({"return ", repeat_str("{", 50000), "1", repeat_str("}", 50000), ";"})},
+		{"statement blocks", strings.concatenate({repeat_str("if (1)\n", 50000), "x = 1;", repeat_str("\nendif", 50000)})},
+	}
+	for c in cases {
+		defer delete(c.src)
+		r := parse_program(c.src, DBV_Float)
+		defer result_destroy(&r)
+		testing.expectf(t, len(r.errors) == 1, "%s: expected exactly one error, got %d", c.label, len(r.errors))
+		if len(r.errors) > 0 {
+			testing.expectf(t, strings.contains(r.errors[0], "too deeply nested"), "%s: unexpected error %q", c.label, r.errors[0])
+		}
+	}
+}
+
+// The ceiling must be comfortably above anything real code writes -- the corpus tests cover
+// both bundled cores, but this pins the intent.
+@(test)
+test_moderate_nesting_still_parses :: proc(t: ^testing.T) {
+	src := strings.concatenate({"return ", repeat_str("(", 100), "1", repeat_str(")", 100), ";"})
+	defer delete(src)
+	r := parse_ok(t, src)
+	result_destroy(&r)
+}

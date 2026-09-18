@@ -34,6 +34,11 @@ Parser :: struct {
 	errors:        [dynamic]string,
 	dollars_depth: int,
 	loop_stack:    [dynamic]Loop_Entry,
+
+	// Nesting depth of the constructs that parse by recursing (see MAX_PARSE_DEPTH), and the
+	// sticky flag set when it is exceeded.
+	depth:         int,
+	aborted:       bool,
 }
 
 parser_make :: proc(src: string, version: int) -> Parser {
@@ -54,6 +59,12 @@ parser_destroy :: proc(p: ^Parser) {
 
 @(private = "file")
 parser_error :: proc(p: ^Parser, msg: string) {
+	if p.aborted {
+		// The parse has already been cut off at EOF (abort_parse); every `expect` the
+		// unwinding recursion still runs on its way out would otherwise pile up one
+		// "unexpected EOF" per level on top of the one error that actually explains it.
+		return
+	}
 	append(&p.errors, fmt.aprintfln("Line %d:  %s", p.cur.line, msg))
 }
 
@@ -67,8 +78,69 @@ parser_errorf :: proc(p: ^Parser, format: string, args: ..any) {
 @(private = "file")
 advance :: proc(p: ^Parser) -> Token {
 	tok := p.cur
+	if p.aborted {
+		// abort_parse has already replaced p.cur with EOF; leaving it there is what makes
+		// every `for !at_block_end(p)` / operator loop in the parser terminate on its own
+		// as the recursion unwinds, instead of continuing to consume a program we have
+		// already rejected. The frozen token is a bare EOF, so handing it out repeatedly
+		// carries no owned storage and can't be double-freed (see expect's note).
+		return tok
+	}
 	p.cur = next_token(&p.lexer)
 	return tok
+}
+
+// MAX_PARSE_DEPTH caps how deeply the constructs that parse by RECURSING may nest --
+// parenthesised/braced/unary expressions, and statement blocks. It is a memory-safety
+// limit, not a style rule, and it is the compiler's counterpart to objdb's MAX_VERB_DEPTH:
+// this is a recursive-descent parser running on the native stack, so `((((...1...))))`
+// deep enough is not a syntax error, it is a stack overflow -- an immediate segfault that
+// takes the whole server down. It is reachable from anywhere a string becomes a program:
+// `.eval`, `.program`, the eval() built-in, set_verb_code(), and loading a .db whose verb
+// text was crafted that way. 4000 levels was enough to crash an 8MB main-thread stack, and
+// connection/task threads get less.
+//
+// The original doesn't need this: parser.y is a yacc/bison parser with an explicit,
+// bounded value stack (YYMAXDEPTH), so over-deep input there comes back as an ordinary
+// "parser stack overflow" error. This is that same ceiling, applied where this port's
+// recursion actually lives. 200 is far above anything real code reaches (the deepest
+// nesting in either bundled core is well under 20) and far below what the stack can take.
+@(private = "file")
+MAX_PARSE_DEPTH :: 200
+
+// enter_nesting/leave_nesting bracket one level of recursive descent. A false return means
+// the parse has been aborted and the caller must return IMMEDIATELY without recursing --
+// that is the whole point, so there is nothing to balance and leave_nesting must not run.
+@(private = "file")
+enter_nesting :: proc(p: ^Parser) -> bool {
+	p.depth += 1
+	if p.depth > MAX_PARSE_DEPTH {
+		abort_parse(p)
+		return false
+	}
+	return true
+}
+
+@(private = "file")
+leave_nesting :: proc(p: ^Parser) {
+	p.depth -= 1
+}
+
+// abort_parse records the error once and cuts the token stream off at EOF. The current
+// token is discarded here rather than left in place because .String/.Id tokens own their
+// str_val (token.odin) and nothing downstream will consume this one any more.
+@(private = "file")
+abort_parse :: proc(p: ^Parser) {
+	if p.aborted {
+		return
+	}
+	parser_error(p, "Program is too deeply nested") // before `aborted`, which silences it
+	p.aborted = true
+	#partial switch p.cur.kind {
+	case .String, .Id:
+		delete(p.cur.str_val)
+	}
+	p.cur = Token{kind = .EOF, line = p.cur.line}
 }
 
 // expect consumes the current token if it matches `kind`, else records an error and leaves
@@ -133,6 +205,10 @@ at_block_end :: proc(p: ^Parser) -> bool {
 
 parse_statements :: proc(p: ^Parser) -> []Stmt {
 	stmts: [dynamic]Stmt
+	if !enter_nesting(p) {
+		return stmts[:]
+	}
+	defer leave_nesting(p)
 	for !at_block_end(p) {
 		s, has := parse_statement(p)
 		if has {
@@ -581,6 +657,16 @@ vet_scatter :: proc(p: ^Parser, items: []Scatter_Item) {
 
 @(private = "file")
 parse_unary :: proc(p: ^Parser) -> Expr {
+	// Every nested expression reaches here: parse_expr calls it for each operand, and the
+	// `(`/`{`/backtick/arglist cases below it all route back through parse_expr. Guarding
+	// this one function therefore bounds the whole expression recursion, `!!!!x` chains
+	// included (which recurse into parse_unary directly, bypassing parse_expr).
+	if !enter_nesting(p) {
+		e := new(Expr_Var)
+		e.value = values.int_val(0)
+		return e
+	}
+	defer leave_nesting(p)
 	#partial switch p.cur.kind {
 	case .Bang:
 		advance(p)
