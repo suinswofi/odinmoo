@@ -12,6 +12,7 @@ import "../objdb"
 import "../tasks"
 import "../values"
 import "core:fmt"
+import "core:mem"
 import "core:net"
 import "core:strings"
 import "core:testing"
@@ -21,6 +22,8 @@ LAMBDACORE_PATH :: "LambdaCore.db"
 
 @(test)
 test_real_lambdacore_login :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
 	db, lerr := dbfile.load_database(LAMBDACORE_PATH)
 	if lerr.stage != "" {
 		fmt.printfln("skipping test_real_lambdacore_login: could not load %s: stage=%s err=%v", LAMBDACORE_PATH, lerr.stage, lerr.err)
@@ -60,6 +63,8 @@ test_real_lambdacore_login :: proc(t: ^testing.T) {
 // arg specs ignored, and LambdaCore's huh is `this none this`.
 @(test)
 test_real_lambdacore_unknown_command_reaches_db_huh :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
 	db, lerr := dbfile.load_database(LAMBDACORE_PATH)
 	if lerr.stage != "" {
 		fmt.printfln("skipping: could not load %s: stage=%s err=%v", LAMBDACORE_PATH, lerr.stage, lerr.err)

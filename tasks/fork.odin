@@ -10,22 +10,25 @@ import "../compiler"
 import "../values"
 import "../vm"
 import "core:sync"
-import "core:thread"
 import "core:time"
 
-// make_do_fork returns a vm.World-compatible do_fork hook bound to this scheduler. objdb's
-// Object_World wiring passes this in place of the nil stub from earlier phases.
-make_do_fork :: proc(s: ^Scheduler) -> proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^compiler.Name_Table, var_id: int, ctx: ^vm.Eval_Context) {
-	scheduler_for_fork = s
-	return do_fork
+// wire_do_fork points a vm.World's fork hook at this scheduler. objdb's Object_World wiring
+// calls this in place of the nil stub from earlier phases.
+//
+// The scheduler travels in the World's own fork_data slot rather than a package-level
+// global. It used to be a global -- vm.World's do_fork is a plain proc pointer with no
+// closure, and one server process has exactly one scheduler -- but "exactly one scheduler"
+// is an assumption the type system never enforced, and every additional World silently
+// re-pointed the global at ITS scheduler: whichever was wired last won, and forks belonging
+// to the others then took the wrong big_lock, i.e. ran MOO code against a database no lock
+// was serializing, and signalled the wrong active_forks group, so scheduler_destroy no
+// longer waited for them. Two Worlds in one process is exactly what `odin test` produces
+// when it runs tests in parallel, which is how this surfaced (as ~20% flaky netio runs,
+// and a ThreadSanitizer report on the global itself).
+wire_do_fork :: proc(w: ^vm.World, s: ^Scheduler) {
+	w.do_fork = do_fork
+	w.fork_data = s
 }
-
-// A package-level binding for the active scheduler, since vm.World's do_fork field is a
-// plain proc pointer with no closure/user-data slot of its own (the other hooks thread
-// state through `w.user_data`; do_fork historically didn't need to). Fine for a single
-// server process with one scheduler, which is the only configuration this port targets.
-@(private = "file")
-scheduler_for_fork: ^Scheduler
 
 @(private = "file")
 Fork_Job :: struct {
@@ -47,7 +50,7 @@ Fork_Job :: struct {
 
 @(private = "file")
 do_fork :: proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^compiler.Name_Table, var_id: int, ctx: ^vm.Eval_Context) {
-	s := scheduler_for_fork
+	s := (^Scheduler)(w.fork_data)
 	delay_secs := 0.0
 	#partial switch delay.type {
 	case .Int:
@@ -110,14 +113,33 @@ do_fork :: proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^
 	// hangs. Cost a good hour to track down via a bisected trace; worth a paragraph so it
 	// doesn't get "cleaned up" as noise later.
 	job_ptr := new_clone(job)
-	thread.create_and_start_with_data(job_ptr, fork_thread_proc, init_context = context, self_cleanup = true)
+	if !spawn_worker(job_ptr, fork_thread_proc) {
+		// The fork simply doesn't happen (the original drops a task it can't queue too), but
+		// everything this one had already reserved has to be given back by hand: the job's
+		// owned AST/name-table/locals copies, and above all the active_forks count, which
+		// scheduler_destroy would otherwise wait on forever.
+		compiler.free_stmts(job_ptr.body)
+		compiler.name_table_destroy(&job_ptr.names)
+		for v in job_ptr.locals {
+			values.free_var(v)
+		}
+		delete(job_ptr.locals)
+		free(job_ptr)
+		sync.wait_group_done(&s.active_forks)
+	}
 }
 
 @(private = "file")
 fork_thread_proc :: proc(data: rawptr) {
 	job := (^Fork_Job)(data)
+	s := job.s
+	// active_forks is signalled LAST, after every one of this thread's own frees. Defers are
+	// LIFO, so this one is registered FIRST. The order matters: active_forks is what
+	// scheduler_destroy (and tests) wait on before tearing down the scheduler and the
+	// allocator this thread has been using, so announcing "done" while frees are still
+	// pending invites those frees to land in an allocator that no longer exists.
+	defer sync.wait_group_done(&s.active_forks)
 	defer free(job)
-	defer sync.wait_group_done(&job.s.active_forks)
 	defer compiler.free_stmts(job.body)
 	defer compiler.name_table_destroy(&job.names)
 	// This thread exists only to run one forked task, so reclaim its scratch arena on the way
@@ -129,8 +151,8 @@ fork_thread_proc :: proc(data: rawptr) {
 		time.sleep(time.Duration(job.delay_secs * f64(time.Second)))
 	}
 
-	sync.mutex_lock(&job.s.big_lock)
-	defer sync.mutex_unlock(&job.s.big_lock)
+	sync.mutex_lock(&s.big_lock)
+	defer sync.mutex_unlock(&s.big_lock)
 
 	act := vm.Activation{
 		locals     = job.locals,

@@ -14,8 +14,11 @@ import "../dbfile"
 import "../objdb"
 import "../values"
 import "../tasks"
+import "core:fmt"
+import "core:mem"
 import "core:net"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 import "core:time"
 
@@ -62,6 +65,11 @@ build_login_db :: proc() -> dbfile.Database {
 	// verb's owner is the `programmer` its notify() calls run as, and notify() correctly
 	// requires wizard-or-self -- a #0-owned (non-wizard) login verb couldn't greet an
 	// unauthenticated (negative-id) connection at all.
+	// `connect wizard` is the usual path; `connect extraN` logs in as one of the extra
+	// player objects below, so a test that wants several connections at once can give each
+	// one its OWN player. Connecting twice as the SAME player is not a way to get two
+	// connections -- the server redirects, disconnecting the earlier one, exactly as
+	// server.c's player_connected() does.
 	add_verb(&db, sysobj, "do_login_command", 1, int(1 << uint(objdb.Verb_Flag.Exec)), `
 		if (callers())
 			return E_PERM;
@@ -71,6 +79,13 @@ build_login_db :: proc() -> dbfile.Database {
 			return 0;
 		elseif (length(args) == 2 && args[1] == "connect" && args[2] == "wizard")
 			return #1;
+		elseif (length(args) == 2 && args[1] == "connect" && index(args[2], "extra") == 1)
+			n = toint(args[2][6..$]);
+			if (n >= 1 && n <= 8)
+				return toobj(9 + n);
+			endif
+			notify(player, "Either that player does not exist, or has a different password.");
+			return 0;
 		else
 			notify(player, "Either that player does not exist, or has a different password.");
 			return 0;
@@ -88,6 +103,14 @@ build_login_db :: proc() -> dbfile.Database {
 	// ("look"), owned by the wizard, that .program's own permission check (VF_WRITE) accepts.
 	widget := mkobj(&db, 2, values.NOTHING, 1, "widget")
 	add_verb(&db, widget, "look", 1, int(1<<uint(objdb.Verb_Flag.Read)) | int(1<<uint(objdb.Verb_Flag.Write)) | int(1<<uint(objdb.Verb_Flag.Exec)), `return "before";`)
+
+	// #10..#17: spare players for `connect extra1`..`connect extra8`, so tests that want
+	// several simultaneous connections can hold one per player rather than stacking them all
+	// onto the wizard (which the server would treat as reconnects and redirect).
+	for i in 1 ..= 8 {
+		extra := mkobj(&db, values.Objid(9 + i), values.NOTHING, 1, "Extra")
+		extra.flags = 1 << uint(objdb.Object_Flag.User) | 1 << uint(objdb.Object_Flag.Wizard) | 1 << uint(objdb.Object_Flag.Programmer)
+	}
 
 	return db
 }
@@ -147,7 +170,15 @@ send_cmd :: proc(c: ^Test_Client, text: string) {
 // calling this, and #0:user_connected can itself notify() extra lines before or after the
 // literal "*** Connected ***" text. Shared with real_core_test.odin -- not file-private.
 log_in :: proc(t: ^testing.T, c: ^Test_Client) {
-	send_cmd(c, "connect wizard")
+	log_in_as(t, c, "wizard")
+}
+
+// log_in_as is log_in for a named player other than the wizard -- see build_login_db's
+// `connect extraN` accounts. Shared with real_core_test.odin -- not file-private.
+log_in_as :: proc(t: ^testing.T, c: ^Test_Client, who: string) {
+	cmd := strings.concatenate({"connect ", who})
+	send_cmd(c, cmd)
+	delete(cmd) // not deferred: fail_now below diverges, so a defer here never runs
 	for i in 0 ..< 20 {
 		line := recv_line(t, c)
 		defer delete(line)
@@ -160,6 +191,8 @@ log_in :: proc(t: ^testing.T, c: ^Test_Client) {
 
 @(test)
 test_telnet_style_session_evaluates_moo_expressions :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
 	db := build_login_db()
 	defer dbfile.database_destroy(&db)
 
@@ -208,6 +241,8 @@ test_telnet_style_session_evaluates_moo_expressions :: proc(t: ^testing.T) {
 
 @(test)
 test_ansi_color_default_on_and_toggle :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
 	db := build_login_db()
 	defer dbfile.database_destroy(&db)
 
@@ -261,6 +296,8 @@ test_ansi_color_default_on_and_toggle :: proc(t: ^testing.T) {
 
 @(test)
 test_multiple_concurrent_connections :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
 	db := build_login_db()
 	defer dbfile.database_destroy(&db)
 
@@ -286,7 +323,11 @@ test_multiple_concurrent_connections :: proc(t: ^testing.T) {
 		clients[i] = client_init(c)
 		banner := recv_line(t, &clients[i])
 		delete(banner)
-		log_in(t, &clients[i])
+		// One player per connection: connecting twice as the same player is a reconnect,
+		// which redirects (and disconnects) the earlier connection rather than giving you
+		// two live ones. This test is about per-connection independence, not about that.
+		who := fmt.tprintf("extra%d", i + 1)
+		log_in_as(t, &clients[i], who)
 	}
 	defer for &c in clients {
 		net.close(c.sock)
@@ -305,6 +346,8 @@ test_multiple_concurrent_connections :: proc(t: ^testing.T) {
 
 @(test)
 test_server_stop_closes_listener :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
 	db: dbfile.Database
 	db.objects = make(map[values.Objid]^dbfile.Object)
 	db.version = dbfile.Current_DB_Version
@@ -332,6 +375,8 @@ test_server_stop_closes_listener :: proc(t: ^testing.T) {
 
 @(test)
 test_program_intrinsic_command_edits_a_real_verb :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
 	db := build_login_db()
 	defer dbfile.database_destroy(&db)
 
@@ -398,6 +443,8 @@ test_program_intrinsic_command_edits_a_real_verb :: proc(t: ^testing.T) {
 
 @(test)
 test_prefix_suffix_wrap_command_output :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
 	db := build_login_db()
 	defer dbfile.database_destroy(&db)
 
@@ -459,6 +506,8 @@ test_prefix_suffix_wrap_command_output :: proc(t: ^testing.T) {
 // command dispatch, in order, on a thread that isn't the one holding the interpreter lock.
 @(test)
 test_force_input_drains_after_hold_cleared :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
 	db := build_login_db()
 	defer dbfile.database_destroy(&db)
 
@@ -506,4 +555,178 @@ test_force_input_drains_after_hold_cleared :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expectf(t, greeted == 2, "expected both queued lines to dispatch, saw %d", greeted)
+}
+
+// test_connection_churn_under_concurrent_hooks hammers the connection LIFECYCLE rather than
+// any one feature: clients connect, log in and drop abruptly in a loop, while the test thread
+// concurrently drives every Connection_Hooks entry point -- notify, connection_name,
+// connected_seconds, force_input, set/connection_option, output_delimiters and boot_player --
+// at those same connections, plus reconnects that displace a still-open session.
+//
+// Every one of those hooks reaches a ^Connection through Server.players, and a connection
+// being torn down on its own thread is exactly what they race. This is the test for the
+// lifetime contract documented in login.odin: unregister-then-free on the owning side,
+// look-up-and-use-entirely-under-players_lock on every other side. Run it under
+// `-sanitize:thread` or `-sanitize:address` for it to say much beyond "didn't hang or crash":
+// plain, it still catches a double close (the booted connection's descriptor being handed to
+// a new connection and torn down under it) as cross-talk or a lost session.
+@(private = "file")
+Churn_Args :: struct {
+	t:        ^testing.T,
+	endpoint: net.Endpoint,
+	player:   int, // which `connect extraN` account this worker owns
+	rounds:   int,
+	done:     ^sync.Wait_Group,
+}
+
+@(private = "file")
+churn_worker :: proc(data: rawptr) {
+	a := (^Churn_Args)(data)
+	done := a.done
+	who := fmt.aprintf("extra%d", a.player)
+	cmd := strings.concatenate({"connect ", who})
+	for round in 0 ..< a.rounds {
+		sock, derr := net.dial_tcp_from_endpoint(a.endpoint)
+		if derr != nil {
+			continue // the server is stopping, or the OS is out of ephemeral ports
+		}
+		net.send_tcp(sock, transmute([]byte)cmd)
+		net.send_tcp(sock, transmute([]byte)string("\r\n"))
+		// Read a little (or nothing at all, on alternate rounds) and then drop mid-stream,
+		// leaving buffered output undelivered -- the disconnect shape that actually races
+		// teardown, as opposed to a polite drain-then-close.
+		if round % 2 == 0 {
+			buf: [256]byte
+			net.recv_tcp(sock, buf[:])
+		}
+		net.send_tcp(sock, transmute([]byte)string(".eval 1 + 1\r\n"))
+		net.close(sock)
+	}
+	delete(cmd)
+	delete(who)
+	free(a)
+	sync.wait_group_done(done) // after the last free -- see spawn_worker's comment
+}
+
+@(test)
+test_connection_churn_under_concurrent_hooks :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
+	db := build_login_db()
+	defer dbfile.database_destroy(&db)
+
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := objdb.object_world_init(&db, &sched)
+	defer objdb.object_world_destroy(&ow)
+	world := objdb.make_world(&ow)
+
+	s: Server
+	wire_connection_hooks(&ow, &s)
+	err := server_start(&s, 0, &sched, &world, net.IP4_Loopback)
+	testing.expectf(t, err == nil, "server_start: %v", err)
+	defer server_stop(&s)
+
+	endpoint, _ := net.bound_endpoint(s.listener)
+
+	WORKERS :: 6
+	ROUNDS :: 12
+	churn_done: sync.Wait_Group
+	sync.wait_group_add(&churn_done, WORKERS)
+	for i in 1 ..= WORKERS {
+		a := new(Churn_Args)
+		a.t = t
+		a.endpoint = endpoint
+		a.player = i
+		a.rounds = ROUNDS
+		a.done = &churn_done
+		tasks.spawn_worker(a, churn_worker)
+	}
+
+	// Meanwhile, drive the hooks at those same players from this thread. Return values are
+	// deliberately unasserted: whether a given player is connected at a given instant is a
+	// race by construction, and that IS the point -- what is being checked is that every
+	// outcome is a clean found/not-found rather than a read of freed memory.
+	for _ in 0 ..< 400 {
+		for i in 1 ..= WORKERS {
+			player := values.Objid(9 + i)
+			ow.conn.notify(ow.conn.user_data, player, "%h%gping%n")
+			ow.conn.notify_raw(ow.conn.user_data, player, "raw ping")
+			if name, ok := ow.conn.connection_name(ow.conn.user_data, player); ok {
+				delete(name)
+			}
+			ow.conn.connected_seconds(ow.conn.user_data, player)
+			ow.conn.force_input(ow.conn.user_data, player, "look", false)
+			ow.conn.flush_input(ow.conn.user_data, player, false)
+			if v, ok := ow.conn.connection_option(ow.conn.user_data, player, "hold-input"); ok {
+				values.free_var(v)
+			}
+			hold := values.int_val(1)
+			ow.conn.set_connection_option(ow.conn.user_data, player, "hold-input", hold)
+			values.free_var(hold)
+			if opts, ok := ow.conn.connection_options(ow.conn.user_data, player); ok {
+				values.free_var(opts)
+			}
+			if p, sfx, ok := ow.conn.output_delimiters(ow.conn.user_data, player); ok {
+				delete(p)
+				delete(sfx)
+			}
+			// Boot a fraction of them: this is the path that used to close a descriptor the
+			// connection's own thread would then close a second time.
+			if i % 3 == 0 {
+			ow.conn.boot_player(ow.conn.user_data, player)
+			}
+		}
+		ids := ow.conn.connected_players(ow.conn.user_data, true)
+		delete(ids)
+	}
+
+	sync.wait_group_wait(&churn_done)
+
+	// The server survived all of that: a fresh session still logs in and dispatches. (Had a
+	// double close handed a live descriptor to someone else, this is where it shows up.)
+	sock, derr := net.dial_tcp_from_endpoint(endpoint)
+	testing.expectf(t, derr == nil, "dial after churn: %v", derr)
+	defer net.close(sock)
+	client := client_init(sock)
+	defer client_destroy(&client)
+	banner := recv_line(t, &client)
+	delete(banner)
+	log_in(t, &client)
+	send_cmd(&client, ".eval 2 + 2")
+	r := recv_line(t, &client)
+	defer delete(r)
+	testing.expectf(t, r == "4", "server unusable after churn: got %q", r)
+}
+
+// ---- thread-safe test allocator ----
+//
+// Every test in this package starts real server threads (accept loop, one per connection,
+// output writers, input drains, forked MOO tasks) and each of those inherits the calling
+// test's `context`, allocator included. Under `odin test` that allocator is a per-test
+// Tracking_Allocator over a Rollback_Stack -- neither of which is thread-safe -- so those
+// threads and the test body allocate from one non-thread-safe allocator at once. That is not
+// a theoretical hazard: it hands the same block out twice, and it showed up as a
+// ThreadSanitizer report inside rollback_stack_allocator and as roughly one-in-five spurious
+// netio failures.
+//
+// The threads cannot simply be given a different allocator: they and the test body share
+// ownership of the same values (a connection thread allocates a Var that database_destroy
+// later frees on the test thread), so they must all use ONE allocator -- it just has to be a
+// thread-safe one. In production it already is (the plain heap allocator); this makes it so
+// under the test runner too, while keeping the tracking allocator's leak reporting intact.
+//
+// Usage, as the first two lines of a test:
+//
+//	mu: mem.Mutex_Allocator
+//	context.allocator = thread_safe_allocator(&mu)
+//
+// `mu` lives on the test's stack, so every spawned thread must be joined before the test
+// returns -- which they all are (server_stop waits for connection threads,
+// scheduler_destroy for forks).
+// Package-private, not file-private: real_core_test.odin's tests need it too.
+@(private)
+thread_safe_allocator :: proc(mu: ^mem.Mutex_Allocator) -> mem.Allocator {
+	mem.mutex_allocator_init(mu, context.allocator)
+	return mem.mutex_allocator(mu)
 }

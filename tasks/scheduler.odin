@@ -27,7 +27,9 @@ package tasks
 
 import "../values"
 import "../vm"
+import "base:runtime"
 import "core:sync"
+import "core:thread"
 import "core:time"
 
 Scheduler :: struct {
@@ -59,6 +61,37 @@ Task_Info :: struct {
 
 scheduler_init :: proc() -> Scheduler {
 	return Scheduler{tasks = make(map[int]^Task_Info)}
+}
+
+// scheduler_shutdown brings outstanding tasks to an end and waits for them, so the caller can
+// safely tear down the database they are running against. Call it once, after the network
+// layer has stopped (so nothing new arrives), and before destroying the World/Database.
+//
+// Without this, shutdown races every forked task still in flight: `active_forks` existed to be
+// waited on but nothing ever waited on it, so a `fork` body could still be executing verb code
+// against the object DB while main() was freeing it. The final checkpoint is unaffected (it is
+// taken under big_lock), but the process could still crash on the way out, and a task could
+// still be halfway through mutating the DB at the instant it was dumped.
+//
+// Suspended tasks are killed rather than waited for: they are threads parked on a condition
+// variable with no deadline, so waiting would simply never return. They are not lost work in
+// any sense the DB file records either -- this port cannot serialize a native call stack, so
+// the "suspended tasks" trailer is written back exactly as it was loaded regardless (see
+// dbfile/task_queue.odin). Killing them makes each one's suspend() raise, which unwinds it
+// normally, which is what lets the wait below terminate.
+//
+// One thing it cannot bound: a forked task in an unterminating loop. This port has no tick
+// budget to cut one off with, so shutdown would wait on it. That is the same exposure the
+// server already has while running, not a new one introduced here.
+scheduler_shutdown :: proc(s: ^Scheduler) {
+	sync.mutex_lock(&s.meta_lock)
+	for _, info in s.tasks {
+		info.killed = true
+		sync.cond_signal(&info.cond)
+	}
+	sync.mutex_unlock(&s.meta_lock)
+	sync.wait_group_wait(&s.active_forks)
+	reap_workers()
 }
 
 scheduler_destroy :: proc(s: ^Scheduler) {
@@ -157,4 +190,90 @@ task_snapshot :: proc(s: ^Scheduler, id: int) -> (Task_Snapshot, bool) {
 		return {}, false
 	}
 	return snapshot_of(info), true
+}
+
+// spawn_worker starts a background thread running `fn(data)`, with two deliberate choices
+// that every worker thread in this server depends on.
+//
+// 1. The thread BODY inherits the caller's context, allocator included, and that is
+//    required: a worker and the thread that spawned it co-own MOO values (a connection's
+//    drain worker allocates Vars that end up in the database, which some other thread frees
+//    later), so they have to allocate and free through one and the same allocator.
+//
+//    The thread's own bookkeeping struct does not, and must not: core:thread allocates it
+//    from context.allocator at create time and frees it in the thread's epilogue -- AFTER
+//    `fn` has returned, and therefore after whatever wait group `fn` used to announce that
+//    it was finished. Any allocator narrower than the process itself can be torn down
+//    between those two points. In the server proper this never bites (context.allocator is
+//    the heap allocator and outlives everything), but it does under `odin test`, whose
+//    allocator is per-test. Pinning the bookkeeping allocation to the heap allocator costs
+//    nothing and makes the lifetime obviously correct rather than incidentally correct.
+//
+// 2. Threads are NOT created with core:thread's `self_cleanup`, even though these are all
+//    fire-and-forget workers that nobody joins, because that path has a use-after-free:
+//    a self-cleaning thread frees its own ^Thread as its last act, while thread.start() is
+//    still touching that same struct from the spawning thread (it posts the start
+//    semaphore the new thread was waiting on, and a semaphore post keeps reading the
+//    semaphore after the waiter is released). ThreadSanitizer reports it as a write-to-freed
+//    race between free() and sync.atomic_sema_post, and this server's hottest spawn sites
+//    are per-connection and per-input-burst, so it is not a corner nobody reaches.
+//
+//    Instead each handle is kept and destroyed later, by a subsequent spawn, once the
+//    thread has actually finished (thread.destroy joins first). Reaping on spawn keeps the
+//    list bounded without a dedicated reaper thread: anything finished is collected the next
+//    time any worker anywhere is started, and reap_workers() below covers shutdown.
+@(private = "file")
+worker_lock: sync.Mutex
+@(private = "file")
+workers: [dynamic]^thread.Thread
+
+//
+// Returns false if the thread could not be started at all (the OS refusing a new thread under
+// load or an rlimit is the realistic case). Callers MUST handle that: every one of them
+// registers the worker with a wait group BEFORE starting it, and something else later blocks
+// until that group drains -- a connection's teardown on its drains and its output writer,
+// server_stop on every connection, scheduler_destroy on outstanding forks. Silently dropping
+// a failed spawn leaves the corresponding counter permanently above zero, which is not a lost
+// worker but a server that never finishes shutting down.
+spawn_worker :: proc(data: rawptr, fn: proc(data: rawptr)) -> (ok: bool) {
+	body_context := context
+	context.allocator = runtime.heap_allocator() // see (1): bookkeeping only, not the body
+
+	sync.mutex_lock(&worker_lock)
+	defer sync.mutex_unlock(&worker_lock)
+	reap_finished_locked()
+	t := thread.create_and_start_with_data(data, fn, init_context = body_context)
+	if t == nil {
+		return false
+	}
+	append(&workers, t)
+	return true
+}
+
+// reap_workers joins and frees every worker thread that has finished. Called on spawn (so
+// the list self-limits during normal operation) and worth calling at shutdown, after the
+// waits that guarantee the workers are done, to leave nothing outstanding.
+reap_workers :: proc() {
+	sync.mutex_lock(&worker_lock)
+	defer sync.mutex_unlock(&worker_lock)
+	reap_finished_locked()
+}
+
+@(private = "file")
+reap_finished_locked :: proc() {
+	// `workers` is heap-allocated (spawn_worker pins the allocator before the first append),
+	// so the resize below has to be made through the same allocator no matter which thread --
+	// and which context -- got here. Freeing a heap block through a caller's arena is the
+	// allocator mismatch this file's header is otherwise about avoiding.
+	context.allocator = runtime.heap_allocator()
+	kept := 0
+	for t in workers {
+		if thread.is_done(t) {
+			thread.destroy(t) // joins, then frees the handle
+		} else {
+			workers[kept] = t
+			kept += 1
+		}
+	}
+	resize(&workers, kept)
 }

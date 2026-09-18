@@ -80,37 +80,43 @@ Object_World :: struct {
 	scheduler:  ^tasks.Scheduler, // nil is valid: fork/suspend/resume/kill_task/task_id just won't be available
 	conn:       Connection_Hooks, // zero value is valid: notify/connection_name/boot_player just won't be available
 	server_ctl: Server_Hooks, // zero value is valid: shutdown/dump_database just won't be available
+
+	// trace_errors: set MOO_TRACE_ERRORS=1 in the environment to log every error raised out
+	// of a verb body to stderr, innermost frame first -- the port has no per-line traceback
+	// like the original's log_traceback(), so this is the tool for "which verb raised
+	// E_INVARG?" when a core's command chain misbehaves. Read once per world at init; off by
+	// default. Per-world rather than a package global purely so that constructing a second
+	// Object_World isn't a write to state other threads are concurrently reading.
+	trace_errors: bool,
 }
 
 object_world_init :: proc(db: ^dbfile.Database, scheduler: ^tasks.Scheduler = nil) -> Object_World {
-	trace_errors = os.get_env("MOO_TRACE_ERRORS", context.temp_allocator) != ""
-	return Object_World{db = db, cache = compile_cache_init(), scheduler = scheduler}
+	return Object_World{
+		db           = db,
+		cache        = compile_cache_init(),
+		scheduler    = scheduler,
+		trace_errors = os.get_env("MOO_TRACE_ERRORS", context.temp_allocator) != "",
+	}
 }
-
-// trace_errors: set MOO_TRACE_ERRORS=1 in the environment to log every error raised out of
-// a verb body to stderr, innermost frame first -- the port has no per-line traceback like
-// the original's log_traceback(), so this is the tool for "which verb raised E_INVARG?"
-// when a core's command chain misbehaves. Read once at world init; off by default.
-@(private = "file")
-trace_errors: bool
 
 object_world_destroy :: proc(w: ^Object_World) {
 	compile_cache_destroy(&w.cache)
 }
 
 make_world :: proc(w: ^Object_World) -> vm.World {
-	do_fork: proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^compiler.Name_Table, var_id: int, ctx: ^vm.Eval_Context)
-	if w.scheduler != nil {
-		do_fork = tasks.make_do_fork(w.scheduler)
-	}
-	return vm.World{
+	out := vm.World{
 		user_data = w,
 		get_prop = world_get_prop,
 		set_prop = world_set_prop,
 		call_verb = world_call_verb,
 		call_builtin = world_call_builtin,
-		do_fork = do_fork,
 	}
+	if w.scheduler != nil {
+		// Fills in both do_fork and fork_data; the scheduler rides in the World rather than
+		// in a global inside `tasks` (see wire_do_fork's comment).
+		tasks.wire_do_fork(&out, w.scheduler)
+	}
+	return out
 }
 
 @(private = "file")
@@ -368,7 +374,7 @@ call_verb_from :: proc(w: ^Object_World, vw: ^vm.World, this_obj, search_from: v
 	case .Raised:
 		// The verb body ran and raised: this unwinds through the caller regardless of the
 		// caller's `d` flag (execute.c's unwind_stack), unlike a dispatch failure above.
-		if trace_errors {
+		if w.trace_errors {
 			// Innermost frame prints first, so reading the log top-down walks the unwind --
 			// a poor man's version of the traceback the original logs for uncaught errors.
 			fmt.eprintfln("TRACE: #%d:%s (defined on #%d, programmer #%d) raised %s: %s", this_obj, name, vh.definer, act.programmer, compiler.error_name(r.err.code), r.err.msg)

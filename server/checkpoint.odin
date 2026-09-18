@@ -23,7 +23,6 @@ import "../tasks"
 import "core:fmt"
 import "core:os"
 import "core:sync"
-import "core:thread"
 
 @(private = "file")
 Checkpoint_Job :: struct {
@@ -49,7 +48,14 @@ checkpoint :: proc(db: ^dbfile.Database, scheduler: ^tasks.Scheduler, path: stri
 	job.path = strings_clone(path)
 	sync.wait_group_add(&checkpoint_pending, 1)
 	fmt.printfln("CHECKPOINT: snapshot taken (%d bytes), writing %s in background", len(data), path)
-	thread.create_and_start_with_data(job, checkpoint_writer_proc, init_context = context, self_cleanup = true)
+	if !tasks.spawn_worker(job, checkpoint_writer_proc) {
+		// No writer thread available: write it here instead rather than drop the checkpoint or
+		// leave checkpoint_pending raised forever (checkpoint_wait, and therefore shutdown,
+		// blocks on it). Synchronous is the wrong trade-off in general -- it stalls the MOO for
+		// the length of a disk write -- but it is strictly better than losing the snapshot.
+		fmt.eprintln("CHECKPOINT: no thread available, writing synchronously")
+		checkpoint_writer_proc(job)
+	}
 	return true
 }
 
@@ -62,10 +68,14 @@ checkpoint_wait :: proc() {
 @(private = "file")
 checkpoint_writer_proc :: proc(data: rawptr) {
 	job := (^Checkpoint_Job)(data)
+	// checkpoint_pending is released LAST, after this thread's own frees -- defers are LIFO, so
+	// it is registered FIRST. checkpoint_wait() is the shutdown path's signal that the writer
+	// is finished with everything, and main() goes on to dump the database and exit; releasing
+	// it while frees are still pending means those frees race the process tearing down.
+	defer sync.wait_group_done(&checkpoint_pending)
 	defer free(job)
 	defer delete(job.data)
 	defer delete(job.path)
-	defer sync.wait_group_done(&checkpoint_pending)
 
 	werr := os.write_entire_file(job.path, job.data)
 	if werr != nil {

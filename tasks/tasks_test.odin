@@ -15,6 +15,7 @@ package tasks
 import "../compiler"
 import "../values"
 import "../vm"
+import "core:mem"
 import "core:strings"
 import "core:sync"
 import "core:testing"
@@ -25,16 +26,16 @@ import "core:time"
 // exercise real bytecode (arithmetic, a shared counter via a package-level pointer smuggled
 // through a closure-free builtin -- see counter_world_call_builtin below).
 //
-// IMPORTANT: this package's do_fork wiring (make_do_fork -> fork.odin's scheduler_for_fork)
-// and this file's scheduler_from_test global both assume a single active Scheduler, matching
-// production (one server process, one scheduler). Odin's test runner runs tests in parallel
-// by default, which would make independent tests here stomp on each other's globals: one
-// test's forks would run against another test's (possibly already-destroyed) scheduler, its
-// wait group would never finish, and the whole run would hang rather than fail. ODIN_TEST_*
-// knobs are compile-time defines, not env vars, so "remember the right flag" proved
-// unreliable in practice (it locked up real sessions twice) -- instead every test below
-// takes `serial_tests` for its whole body, so a plain `odin test tasks` is safe at any
-// runner thread count.
+// IMPORTANT: this file's counter_target/counter_lock globals (the shared counter the
+// big-lock tests assert on) assume one test runs at a time. Odin's test runner runs tests in
+// parallel by default, so independent tests here would stomp on each other's counter and
+// report bogus totals. ODIN_TEST_* knobs are compile-time defines, not env vars, so
+// "remember the right flag" proved unreliable in practice (it locked up real sessions
+// twice) -- instead every test below takes `serial_tests` for its whole body, so a plain
+// `odin test tasks` is safe at any runner thread count.
+//
+// The do_fork wiring itself no longer needs this: the scheduler travels in each World's
+// fork_data slot (see fork.odin's wire_do_fork), so two Schedulers in one process are fine.
 @(private = "file")
 serial_tests: sync.Mutex
 @(private = "file")
@@ -65,7 +66,9 @@ counter_world_call_builtin :: proc(w: ^vm.World, name: string, is_known: bool, a
 
 @(private = "file")
 make_test_world :: proc(s: ^Scheduler) -> vm.World {
-	return vm.World{user_data = s, call_builtin = counter_world_call_builtin, do_fork = make_do_fork(s)}
+	w := vm.World{user_data = s, call_builtin = counter_world_call_builtin}
+	wire_do_fork(&w, s)
+	return w
 }
 
 @(private = "file")
@@ -91,6 +94,8 @@ scheduler_from_test: ^Scheduler
 
 @(test)
 test_fork_runs_independently_and_does_not_block_caller :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
 	sync.mutex_lock(&serial_tests)
 	defer sync.mutex_unlock(&serial_tests)
 	s := scheduler_init()
@@ -113,6 +118,8 @@ test_fork_runs_independently_and_does_not_block_caller :: proc(t: ^testing.T) {
 
 @(test)
 test_big_lock_serializes_concurrent_tasks :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
 	sync.mutex_lock(&serial_tests)
 	defer sync.mutex_unlock(&serial_tests)
 	s := scheduler_init()
@@ -140,6 +147,8 @@ test_big_lock_serializes_concurrent_tasks :: proc(t: ^testing.T) {
 
 @(test)
 test_suspend_blocks_until_resumed_from_another_thread :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
 	sync.mutex_lock(&serial_tests)
 	defer sync.mutex_unlock(&serial_tests)
 	s := scheduler_init()
@@ -170,13 +179,17 @@ test_suspend_blocks_until_resumed_from_another_thread :: proc(t: ^testing.T) {
 
 	runner :: proc(data: rawptr) {
 		a := (^Args)(data)
-		defer free(a)
 		sync.mutex_lock(&scheduler_from_test.big_lock)
 		a.box.r = run_src(a.t, a.world, a.task_id, `x = suspend(); return x + 1;`)
 		sync.mutex_unlock(&scheduler_from_test.big_lock)
-		sync.wait_group_done(&a.box.done)
+		// Freed BEFORE the wait group is signalled, not in a defer after it: `done` is what
+		// the test body waits on before returning, and returning tears down the allocator
+		// this free goes through.
+		box := a.box
+		free(a)
+		sync.wait_group_done(&box.done)
 	}
-	thread.create_and_start_with_data(args, runner, init_context = context, self_cleanup = true)
+	spawn_worker(args, runner)
 
 	// Give the suspending thread a moment to actually park, then confirm it's registered.
 	for _ in 0 ..< 200 {
@@ -204,6 +217,8 @@ test_suspend_blocks_until_resumed_from_another_thread :: proc(t: ^testing.T) {
 
 @(test)
 test_suspend_with_timeout :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
 	sync.mutex_lock(&serial_tests)
 	defer sync.mutex_unlock(&serial_tests)
 	s := scheduler_init()
@@ -224,6 +239,8 @@ test_suspend_with_timeout :: proc(t: ^testing.T) {
 
 @(test)
 test_kill_task_raises_in_suspended_task :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
 	sync.mutex_lock(&serial_tests)
 	defer sync.mutex_unlock(&serial_tests)
 	s := scheduler_init()
@@ -254,13 +271,14 @@ test_kill_task_raises_in_suspended_task :: proc(t: ^testing.T) {
 
 	runner :: proc(data: rawptr) {
 		args := (^Args)(data)
-		defer free(args)
 		sync.mutex_lock(&scheduler_from_test.big_lock)
 		args.box.r = run_src(args.t, args.world, args.task_id, `suspend(); return 1;`)
 		sync.mutex_unlock(&scheduler_from_test.big_lock)
-		sync.wait_group_done(&args.box.done)
+		box := args.box // freed before signalling -- see the same pattern above
+		free(args)
+		sync.wait_group_done(&box.done)
 	}
-	thread.create_and_start_with_data(a, runner, init_context = context, self_cleanup = true)
+	spawn_worker(a, runner)
 
 	for _ in 0 ..< 200 {
 		if task_exists(&s, task_id) {
@@ -285,6 +303,8 @@ test_kill_task_raises_in_suspended_task :: proc(t: ^testing.T) {
 
 @(test)
 test_task_id_builtin :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
 	sync.mutex_lock(&serial_tests)
 	defer sync.mutex_unlock(&serial_tests)
 	s := scheduler_init()
@@ -306,6 +326,8 @@ test_task_id_builtin :: proc(t: ^testing.T) {
 // freed: value leaked, input line lost, nobody told.
 @(test)
 test_resume_after_timeout_is_invarg :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
 	sync.mutex_lock(&serial_tests)
 	defer sync.mutex_unlock(&serial_tests)
 	s := scheduler_init()
@@ -339,6 +361,8 @@ test_resume_after_timeout_is_invarg :: proc(t: ^testing.T) {
 // resume's value.
 @(test)
 test_double_resume_is_invarg :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
 	sync.mutex_lock(&serial_tests)
 	defer sync.mutex_unlock(&serial_tests)
 	s := scheduler_init()
@@ -374,4 +398,34 @@ test_double_resume_is_invarg :: proc(t: ^testing.T) {
 	delete_key(&s.tasks, task_id)
 	sync.mutex_unlock(&s.meta_lock)
 	free(info)
+}
+
+// ---- thread-safe test allocator ----
+//
+// Every test in this package starts real task threads (forks, and the threads that resume
+// suspended tasks) and each of those inherits the calling test's `context`, allocator
+// included. Under `odin test` that allocator is a per-test
+// Tracking_Allocator over a Rollback_Stack -- neither of which is thread-safe -- so those
+// threads and the test body allocate from one non-thread-safe allocator at once. That is not
+// a theoretical hazard: it hands the same block out twice, and it showed up as a
+// ThreadSanitizer report inside rollback_stack_allocator and in this package's sibling netio tests as
+// roughly one-in-five spurious failures.
+//
+// The threads cannot simply be given a different allocator: they and the test body share
+// ownership of the same values (a connection thread allocates a Var that database_destroy
+// later frees on the test thread), so they must all use ONE allocator -- it just has to be a
+// thread-safe one. In production it already is (the plain heap allocator); this makes it so
+// under the test runner too, while keeping the tracking allocator's leak reporting intact.
+//
+// Usage, as the first two lines of a test:
+//
+//	mu: mem.Mutex_Allocator
+//	context.allocator = thread_safe_allocator(&mu)
+//
+// `mu` lives on the test's stack, so every spawned thread must be joined before the test
+// returns -- which they all are (scheduler_destroy waits for forks).
+@(private = "file")
+thread_safe_allocator :: proc(mu: ^mem.Mutex_Allocator) -> mem.Allocator {
+	mem.mutex_allocator_init(mu, context.allocator)
+	return mem.mutex_allocator(mu)
 }

@@ -34,7 +34,6 @@ import "../vm"
 import "core:net"
 import "core:strings"
 import "core:sync"
-import "core:thread"
 import "core:time"
 
 Connection :: struct {
@@ -43,6 +42,19 @@ Connection :: struct {
 	ansi_enabled: bool,
 	player:       values.Objid, // a negative placeholder ID until do_login_command() returns a valid player (id >= 0)
 	connect_time: time.Time, // set by finish_login(); zero until then -- backs connected_seconds()
+
+	// closing is set once, by connection_teardown, in the same players_lock hold that removes
+	// this connection from Server.players; it is read under that same lock. It exists because
+	// removal alone is not enough to make a connection unreachable: a drain worker that is
+	// still finishing a login will REGISTER it again (finish_login's s.players[player] = conn)
+	// moments later, putting a connection that is already tearing down -- and about to be
+	// freed -- back into the map for every hook and for server_stop to find. That leaves a
+	// dangling entry behind, and the connections still genuinely live are the ones that then
+	// never get shut down, so server_stop waits on conns_done forever.
+	//
+	// Guarded by Server.players_lock, NOT io_lock: the invariant it protects is about the
+	// registry, and it has to be tested and acted on inside the same hold that touches it.
+	closing: bool,
 
 	// Input-queue state backing read()/force_input()/flush_input()/set_connection_option()
 	// (see input_queue.odin's header for the full design). Protected by io_lock throughout.
@@ -174,40 +186,86 @@ send_line_raw :: proc(conn: ^Connection, text: string) {
 	enqueue_output(conn, transmute([]byte)msg)
 }
 
+// connection_handler owns one connection for its whole life: it runs the recv loop and then
+// performs teardown, in a deliberate order spelled out inline below.
+//
+// The socket, ansi_enabled, options and the pre-login placeholder player id are all set up
+// by accept_loop before this thread starts (see server.odin for why registration has to
+// happen there), so this begins with the connection already live and reachable.
 connection_handler :: proc(data: rawptr) {
 	conn := (^Connection)(data)
-	defer free(conn)
-	defer net.close(conn.socket)
-	defer unregister_player(conn.server, conn.player)
-	defer sync.wait_group_done(&conn.server.conns_done)
-	defer connection_io_destroy(conn)
-	defer program_state_destroy(conn)
-	// Registered LAST so it runs FIRST (defers are LIFO): a drain thread (see
-	// input_queue.odin's spawn_drain) holds this same `conn` pointer and dispatches queued
-	// input on it, so everything below -- freeing the connection's queues and options, and
-	// ultimately free(conn) itself -- has to wait for any in-flight drain to finish, or it's a
-	// use-after-free the moment a force_input()'d line races a disconnect.
-	defer sync.wait_group_wait(&conn.drains)
-	conn.ansi_enabled = true
-	conn.options = init_option_defaults()
-	conn.player = allocate_connection_id(conn.server, conn)
 
-	// Spawn the outbound writer (see enqueue_output/output_writer_proc above). The defer
-	// tells it to flush-and-exit, unblocks any in-flight send via shutdown(), and joins it
-	// -- registered here, after the cleanup defers above, so it runs BEFORE them (LIFO):
-	// the writer is gone before the socket closes and conn is freed.
+	// Spawn the outbound writer (see enqueue_output/output_writer_proc above).
 	sync.wait_group_add(&conn.out_done, 1)
-	thread.create_and_start_with_data(conn, output_writer_proc, init_context = context, self_cleanup = true)
-	defer {
+	if !tasks.spawn_worker(conn, output_writer_proc) {
+		// Without a writer nothing can be sent, so the connection is useless -- but it must
+		// still tear down cleanly rather than block teardown on a wait group no thread will
+		// ever complete. Mark the output side closed (enqueue_output then drops everything)
+		// and release the count here.
 		sync.mutex_lock(&conn.out_lock)
 		conn.out_closing = true
-		sync.cond_signal(&conn.out_cond)
 		sync.mutex_unlock(&conn.out_lock)
-		net.shutdown(conn.socket, .Both) // unblocks a send_tcp mid-stall
-		sync.wait_group_wait(&conn.out_done)
-		delete(conn.out_buf)
+		sync.wait_group_done(&conn.out_done)
 	}
 
+	connection_read_loop(conn)
+	connection_teardown(conn)
+}
+
+// connection_teardown runs once the recv loop has ended, and the ORDER of these steps is the
+// whole point -- each one is what makes the next one safe:
+//
+//  1. unregister_conn: after this, no other thread can obtain this ^Connection (every route
+//     goes through Server.players under players_lock -- see login.odin's lifetime note), and
+//     no new drain worker can be spawned, since every spawn_drain caller is map-gated too.
+//     It has to come FIRST: it used to run near the end, which left a window where notify(),
+//     force_input() or set_connection_option() could still find the connection in the map
+//     while its option map and input queue had already been freed.
+//  2. Wait for in-flight drain workers, which hold this same `conn` and are dispatching
+//     queued input on it. Step 1 guarantees this set can no longer grow, so the wait
+//     terminates. (Waiting on a wait group that a concurrent spawn could still add to is
+//     itself a race, which the old order had.)
+//  3. Free the per-connection state nothing can reach any more.
+//  4. Drain and stop the writer thread, THEN close the socket. Draining after step 2 rather
+//     than before it is what lets a last line produced by a drain worker actually reach the
+//     client.
+//  5. Signal conns_done, and only then free the Connection. conns_done is what server_stop
+//     waits on before deleting the players map and letting its caller free the World, so
+//     nothing may touch conn.server after it is signalled.
+@(private = "file")
+connection_teardown :: proc(conn: ^Connection) {
+	s := conn.server
+
+	unregister_conn(s, conn)
+	sync.wait_group_wait(&conn.drains)
+	connection_io_destroy(conn)
+	program_state_destroy(conn)
+
+	// Give the writer a bounded chance to flush whatever is still buffered (a "*** Booted
+	// ***", a last :tell from a disconnect verb) before the socket goes away. The timeout is
+	// the bound: the writer sends with a blocking socket, and a client that has stopped
+	// reading but not closed can otherwise stall that send indefinitely -- which would hang
+	// this thread, and with it server_stop's conns_done wait, i.e. shutdown itself.
+	net.set_option(conn.socket, .Send_Timeout, 2 * time.Second)
+	sync.mutex_lock(&conn.out_lock)
+	conn.out_closing = true
+	sync.cond_signal(&conn.out_cond)
+	sync.mutex_unlock(&conn.out_lock)
+	sync.wait_group_wait(&conn.out_done)
+	delete(conn.out_buf)
+
+	net.shutdown(conn.socket, .Both)
+	net.close(conn.socket) // the one and only close of this descriptor -- see server_stop
+
+	// free first, THEN announce. conns_done is what server_stop waits on before letting its
+	// caller tear down the World -- and, under the test runner, the allocator this thread has
+	// been using. Nothing this thread allocated may still be outstanding once it is signalled.
+	free(conn)
+	sync.wait_group_done(&s.conns_done)
+}
+
+@(private = "file")
+connection_read_loop :: proc(conn: ^Connection) {
 	// Mirrors server_new_connection() dispatching an empty command through do_login_task():
 	// this is what makes $login:welcome's notify()-based banner appear, rather than netio
 	// hardcoding any welcome text of its own.

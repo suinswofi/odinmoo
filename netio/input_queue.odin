@@ -36,7 +36,6 @@ import "../values"
 import "core:net"
 import "core:strings"
 import "core:sync"
-import "core:thread"
 
 @(private = "file")
 option_types := map[string]values.Var_Type {
@@ -182,7 +181,15 @@ spawn_drain :: proc(conn: ^Connection) {
 		return
 	}
 	sync.wait_group_add(&conn.drains, 1)
-	thread.create_and_start_with_data(conn, drain_thread_proc, init_context = context, self_cleanup = true)
+	if !tasks.spawn_worker(conn, drain_thread_proc) {
+		// No drain worker means the queued lines just sit there until the next line arrives
+		// and tries again -- degraded, but survivable. Leaving the counter raised is not:
+		// connection teardown waits on conn.drains before it frees anything.
+		sync.mutex_lock(&conn.io_lock)
+		conn.drain_running = false
+		sync.mutex_unlock(&conn.io_lock)
+		sync.wait_group_done(&conn.drains)
+	}
 }
 
 @(private = "file")
@@ -235,17 +242,23 @@ send_telnet_echo_negotiation :: proc(conn: ^Connection, echo_on: bool) {
 
 // ---- Connection_Hooks implementations (wired in login.odin's wire_connection_hooks) ----
 
+// find_conn_locked looks a connection up in the registry. The caller MUST already hold
+// s.players_lock, and must keep holding it for as long as it uses the returned pointer --
+// that lock is the only thing standing between this pointer and the connection's own thread
+// freeing it (see login.odin's "Connection lifetime" note). Every hook below is written that
+// way: lock, look up, do the whole job, unlock.
+//
 // Not file-private: login.odin's hook_output_delimiters uses this too.
-find_conn :: proc(s: ^Server, player: values.Objid) -> (^Connection, bool) {
-	sync.mutex_lock(&s.players_lock)
-	defer sync.mutex_unlock(&s.players_lock)
+find_conn_locked :: proc(s: ^Server, player: values.Objid) -> (^Connection, bool) {
 	conn, ok := s.players[player]
 	return conn, ok
 }
 
 hook_try_dequeue_input :: proc(user_data: rawptr, player: values.Objid) -> (line: string, ok: bool) {
 	s := (^Server)(user_data)
-	conn, found := find_conn(s, player)
+	sync.mutex_lock(&s.players_lock)
+	defer sync.mutex_unlock(&s.players_lock)
+	conn, found := find_conn_locked(s, player)
 	if !found {
 		return "", false
 	}
@@ -254,7 +267,9 @@ hook_try_dequeue_input :: proc(user_data: rawptr, player: values.Objid) -> (line
 
 hook_register_reader :: proc(user_data: rawptr, player: values.Objid, task_id: int) -> bool {
 	s := (^Server)(user_data)
-	conn, found := find_conn(s, player)
+	sync.mutex_lock(&s.players_lock)
+	defer sync.mutex_unlock(&s.players_lock)
+	conn, found := find_conn_locked(s, player)
 	if !found {
 		return false
 	}
@@ -266,7 +281,9 @@ hook_register_reader :: proc(user_data: rawptr, player: values.Objid, task_id: i
 
 hook_unregister_reader :: proc(user_data: rawptr, player: values.Objid, task_id: int) {
 	s := (^Server)(user_data)
-	conn, found := find_conn(s, player)
+	sync.mutex_lock(&s.players_lock)
+	defer sync.mutex_unlock(&s.players_lock)
+	conn, found := find_conn_locked(s, player)
 	if !found {
 		return
 	}
@@ -286,7 +303,9 @@ hook_unregister_reader :: proc(user_data: rawptr, player: values.Objid, task_id:
 
 hook_force_input :: proc(user_data: rawptr, player: values.Objid, line: string, at_front: bool) -> bool {
 	s := (^Server)(user_data)
-	conn, found := find_conn(s, player)
+	sync.mutex_lock(&s.players_lock)
+	defer sync.mutex_unlock(&s.players_lock)
+	conn, found := find_conn_locked(s, player)
 	if !found {
 		return false
 	}
@@ -296,7 +315,9 @@ hook_force_input :: proc(user_data: rawptr, player: values.Objid, line: string, 
 
 hook_flush_input :: proc(user_data: rawptr, player: values.Objid, show_messages: bool) -> bool {
 	s := (^Server)(user_data)
-	conn, found := find_conn(s, player)
+	sync.mutex_lock(&s.players_lock)
+	defer sync.mutex_unlock(&s.players_lock)
+	conn, found := find_conn_locked(s, player)
 	if !found {
 		return false
 	}
@@ -314,7 +335,9 @@ hook_flush_input :: proc(user_data: rawptr, player: values.Objid, show_messages:
 
 hook_set_connection_option :: proc(user_data: rawptr, player: values.Objid, option: string, value: values.Var) -> bool {
 	s := (^Server)(user_data)
-	conn, found := find_conn(s, player)
+	sync.mutex_lock(&s.players_lock)
+	defer sync.mutex_unlock(&s.players_lock)
+	conn, found := find_conn_locked(s, player)
 	if !found {
 		return false
 	}
@@ -341,7 +364,9 @@ hook_set_connection_option :: proc(user_data: rawptr, player: values.Objid, opti
 
 hook_connection_option :: proc(user_data: rawptr, player: values.Objid, option: string) -> (value: values.Var, found: bool) {
 	s := (^Server)(user_data)
-	conn, ok := find_conn(s, player)
+	sync.mutex_lock(&s.players_lock)
+	defer sync.mutex_unlock(&s.players_lock)
+	conn, ok := find_conn_locked(s, player)
 	if !ok {
 		return {}, false
 	}
@@ -356,7 +381,9 @@ hook_connection_option :: proc(user_data: rawptr, player: values.Objid, option: 
 
 hook_connection_options :: proc(user_data: rawptr, player: values.Objid) -> (list: values.Var, found: bool) {
 	s := (^Server)(user_data)
-	conn, ok := find_conn(s, player)
+	sync.mutex_lock(&s.players_lock)
+	defer sync.mutex_unlock(&s.players_lock)
+	conn, ok := find_conn_locked(s, player)
 	if !ok {
 		return {}, false
 	}

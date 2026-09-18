@@ -173,4 +173,14 @@ World :: struct {
 	// before snapshotting them, so both the parent and the forked task see it (tasks.c's
 	// enqueue_forked_task2 mutates the shared rt_env before copy_rt_env).
 	do_fork:      proc(w: ^World, delay: values.Var, body: []compiler.Stmt, names: ^compiler.Name_Table, var_id: int, ctx: ^Eval_Context),
+	// fork_data is do_fork's own opaque state, kept separate from user_data because the two
+	// hooks belong to different layers: user_data is the object-DB implementation (objdb's
+	// Object_World), while do_fork is supplied by the scheduler (tasks), which the DB layer
+	// only wires in. Without a slot of its own, the scheduler implementation has nowhere to
+	// put the scheduler pointer except a package-level global -- which silently makes "one
+	// scheduler per process" a correctness requirement rather than merely the production
+	// configuration, and misroutes every fork the moment a second World exists (two servers
+	// in one process, or just two tests running in parallel: the fork then locks the WRONG
+	// big_lock and runs MOO code on a database nobody is serializing access to).
+	fork_data:    rawptr,
 }

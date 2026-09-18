@@ -29,6 +29,13 @@ DEFAULT_PORT :: 7777
 // Signal handlers must do the absolute minimum (POSIX signal-safety rules: no allocation,
 // no locking) -- exactly like the original's checkpoint_signal()/shutdown handlers, which
 // just set a flag for the main loop to notice. These globals are the Odin equivalent.
+//
+// Accessed with sync.atomic_* rather than as plain bools. Two different kinds of writer reach
+// them: a signal handler, which can interrupt the main loop between any two instructions, and
+// -- via the Server_Hooks below -- MOO code calling shutdown()/dump_database() on some task's
+// own thread. Plain loads and stores across threads are a data race, and a compiler is within
+// its rights to hoist the `for !g_shutdown_requested` test out of the loop entirely, in which
+// case the server simply never notices the request.
 @(private = "file")
 g_checkpoint_requested: bool
 @(private = "file")
@@ -36,12 +43,12 @@ g_shutdown_requested: bool
 
 @(private = "file")
 on_sigusr2 :: proc "c" (sig: posix.Signal) {
-	g_checkpoint_requested = true
+	sync.atomic_store(&g_checkpoint_requested, true)
 }
 
 @(private = "file")
 on_shutdown_signal :: proc "c" (sig: posix.Signal) {
-	g_shutdown_requested = true
+	sync.atomic_store(&g_shutdown_requested, true)
 }
 
 // hook_request_shutdown/hook_request_checkpoint back objdb.Server_Hooks (see its header
@@ -53,12 +60,12 @@ hook_request_shutdown :: proc(user_data: rawptr, message: string) {
 	if len(message) > 0 {
 		fmt.printfln("SHUTDOWN: requested from within the database: %s", message)
 	}
-	g_shutdown_requested = true
+	sync.atomic_store(&g_shutdown_requested, true)
 }
 
 @(private = "file")
 hook_request_checkpoint :: proc(user_data: rawptr) {
-	g_checkpoint_requested = true
+	sync.atomic_store(&g_checkpoint_requested, true)
 }
 
 main :: proc() {
@@ -121,9 +128,8 @@ main :: proc() {
 	}
 	fmt.printfln("LISTENING on port %d (SIGINT/SIGTERM to shut down cleanly, SIGUSR2 to checkpoint now)", port)
 
-	for !g_shutdown_requested {
-		if g_checkpoint_requested {
-			g_checkpoint_requested = false
+	for !sync.atomic_load(&g_shutdown_requested) {
+		if sync.atomic_exchange(&g_checkpoint_requested, false) {
 			checkpoint(&db, &sched, checkpoint_db_path)
 			// Scratch memory used while writing a checkpoint isn't needed afterwards, and
 			// context.temp_allocator is a growing arena that's only ever reclaimed explicitly
@@ -135,6 +141,12 @@ main :: proc() {
 
 	fmt.println("SHUTTING DOWN: signal received")
 	netio.server_stop(&s)
+	// Stop the network first (no new commands), THEN quiesce the tasks already running, and
+	// only then dump. Forked tasks are ordinary threads executing verb code against the
+	// object DB; letting them run on while main() dumps and then frees the database is a
+	// use-after-free, and dumping mid-mutation would record a half-applied change.
+	fmt.println("SHUTTING DOWN: waiting for running tasks")
+	tasks.scheduler_shutdown(&sched)
 	fmt.println("DUMPING: final checkpoint before exit")
 	checkpoint_wait() // let any in-flight background checkpoint write finish first
 	sync.mutex_lock(&sched.big_lock)

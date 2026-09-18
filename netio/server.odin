@@ -36,12 +36,15 @@ import "../vm"
 import "core:net"
 import "core:strings"
 import "core:sync"
-import "core:thread"
 
 Server :: struct {
 	listener:      net.TCP_Socket,
 	scheduler:     ^tasks.Scheduler,
 	world:         ^vm.World,
+	// running is read by the accept loop on its own thread and cleared by server_stop on
+	// another, so both ends go through sync.atomic_* rather than a plain load/store: a
+	// non-atomic bool shared across threads is a data race by definition (ThreadSanitizer
+	// flags it), and nothing guarantees the accept loop ever observes a plain store.
 	running:       bool,
 	accept_done:   sync.Wait_Group, // lets server_stop know the accept loop has actually exited
 	conns_done:    sync.Wait_Group, // lets server_stop know every connection thread has actually exited
@@ -70,11 +73,21 @@ server_start :: proc(s: ^Server, port: int, scheduler: ^tasks.Scheduler, world: 
 	s.listener = listener
 	s.scheduler = scheduler
 	s.world = world
-	s.running = true
+	sync.atomic_store(&s.running, true)
 	s.players = make(map[values.Objid]^Connection)
 	s.next_unconnected = values.NOTHING - 1
 	sync.wait_group_add(&s.accept_done, 1)
-	thread.create_and_start_with_data(s, accept_loop, init_context = context, self_cleanup = true)
+	if !tasks.spawn_worker(s, accept_loop) {
+		// No accept loop means no server at all, and leaving accept_done raised would hang
+		// server_stop on a thread that was never started. Undo and report failure so the
+		// caller (main) can exit with a message instead of listening to nothing.
+		sync.wait_group_done(&s.accept_done)
+		sync.atomic_store(&s.running, false)
+		delete(s.players)
+		s.players = nil
+		net.close(listener)
+		return net.Create_Socket_Error.Insufficient_Resources
+	}
 	return nil
 }
 
@@ -95,15 +108,25 @@ server_start :: proc(s: ^Server, port: int, scheduler: ^tasks.Scheduler, world: 
 // enough to unblock every connection thread's recv_tcp; each then notices the error, runs its
 // own defers (including unregistering itself), and exits.
 server_stop :: proc(s: ^Server) {
-	s.running = false
+	sync.atomic_store(&s.running, false)
 	if endpoint, err := net.bound_endpoint(s.listener); err == nil {
 		if dummy, derr := net.dial_tcp_from_endpoint(endpoint); derr == nil {
 			net.close(dummy)
 		}
 	}
 	net.close(s.listener)
+	// Waited on BEFORE the players sweep below, and that ordering is load-bearing: once the
+	// accept loop has exited, no further connection can be registered, so the sweep is
+	// guaranteed to see every connection that will ever exist. (accept_loop registers each
+	// connection in `players` itself, before starting its thread, precisely so there is no
+	// window where an accepted-but-not-yet-running connection is invisible here -- it would
+	// never be shut down, and the conns_done wait below would hang forever.)
 	sync.wait_group_wait(&s.accept_done)
 
+	// players_lock is held across the whole sweep, which is what makes touching these
+	// `conn` pointers safe at all: a connection frees itself only after removing itself
+	// from this map under this same lock (see connection.odin's teardown), so nothing here
+	// can be looking at a freed Connection.
 	sync.mutex_lock(&s.players_lock)
 	for _, conn in s.players {
 		// A task parked in read() (objdb/connection_io.odin's bf_read) is blocked on a
@@ -123,39 +146,71 @@ server_stop :: proc(s: ^Server) {
 		if tid != 0 {
 			wake_reader(s.scheduler, tid, strings.clone(""))
 		}
-		// shutdown() before close(): a thread blocked in recv_tcp() on this socket is not
-		// reliably woken by another thread merely close()ing the fd on Linux (the same class
-		// of accept()-vs-close() quirk noted above, for recv() instead) -- shutdown(Both) is
-		// the documented, reliable way to force a concurrent blocking read to return
-		// immediately (as a 0-byte EOF), which is what actually unblocks connection_handler's
-		// loop below instead of leaving it (and thus server_stop) hung until the remote end
-		// closes its side on its own.
+		// shutdown(), and deliberately NOT close(): a thread blocked in recv_tcp() on this
+		// socket is not reliably woken by another thread merely close()ing the fd on Linux
+		// (the same class of accept()-vs-close() quirk noted above, for recv() instead) --
+		// shutdown(Both) is the documented, reliable way to force a concurrent blocking read
+		// to return immediately (as a 0-byte EOF), which is what actually unblocks
+		// connection_handler's loop below.
+		//
+		// The close belongs to the connection's own thread and to nobody else. Closing it
+		// here too would be a double close of the same descriptor from two threads, and a
+		// descriptor is a reusable small integer: between this close and the owner's, the
+		// accept loop (or any library doing a file open) can be handed the very same number,
+		// and the owner's close then tears down that unrelated connection instead. Rare, but
+		// silent and unbounded in consequence when it does happen, so the rule is one closer
+		// per socket -- everyone else only ever shuts down.
 		net.shutdown(conn.socket, .Both)
-		net.close(conn.socket)
 	}
 	sync.mutex_unlock(&s.players_lock)
 	sync.wait_group_wait(&s.conns_done)
 
 	delete(s.players)
+	// Every worker this server started (accept loop, connection threads, their writers and
+	// drains) has been waited for above, so this collects all of their thread handles rather
+	// than leaving them for whatever happens to be spawned next.
+	tasks.reap_workers()
 }
 
 @(private = "file")
 accept_loop :: proc(data: rawptr) {
 	s := (^Server)(data)
 	defer sync.wait_group_done(&s.accept_done)
-	for s.running {
+	for sync.atomic_load(&s.running) {
 		client, _, err := net.accept_tcp(s.listener)
 		if err != nil {
 			break // listener closed (server_stop) or a real accept error -- stop either way
 		}
-		if !s.running {
+		if !sync.atomic_load(&s.running) {
 			net.close(client) // this was server_stop's own wake-up connection
 			break
 		}
 		conn := new(Connection)
 		conn.socket = client
 		conn.server = s
+		conn.ansi_enabled = true
+		conn.options = init_option_defaults()
+		// Registered here, on the accept thread, rather than as the first thing the
+		// connection thread does: server_stop's sweep can only shut down connections it can
+		// see in `players`, and it runs as soon as this loop exits. A connection registered
+		// by its own thread would be invisible for however long the OS took to schedule that
+		// thread -- and one that slipped through that window would sit blocked in recv_tcp
+		// forever with nobody to wake it, hanging server_stop's conns_done wait for good.
+		// Everything here happens before accept_done is signalled, so the sweep sees it all.
+		conn.player = allocate_connection_id(s, conn)
 		sync.wait_group_add(&s.conns_done, 1)
-		thread.create_and_start_with_data(conn, connection_handler, init_context = context, self_cleanup = true)
+		if !tasks.spawn_worker(conn, connection_handler) {
+			// No thread for this connection: undo everything set up for it by hand, in the
+			// same order its own teardown would have. Skipping the conns_done release here
+			// would hang server_stop on a connection that never existed.
+			unregister_conn(s, conn)
+			net.close(conn.socket)
+			for _, v in conn.options {
+				values.free_var(v)
+			}
+			delete(conn.options)
+			free(conn)
+			sync.wait_group_done(&s.conns_done)
+		}
 	}
 }

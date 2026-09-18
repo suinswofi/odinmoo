@@ -99,9 +99,15 @@ is_player_object :: proc(world: ^vm.World, obj: values.Objid) -> bool {
 @(private = "file")
 hook_notify :: proc(user_data: rawptr, player: values.Objid, text: string) -> bool {
 	s := (^Server)(user_data)
+	// players_lock is held ACROSS the send, not just across the map lookup. See the
+	// "Connection lifetime" note at the bottom of this file: the lock is the only thing
+	// keeping `conn` from being freed underneath us, so a pattern of "look it up, unlock,
+	// then use it" is a use-after-free waiting for a player to disconnect at the wrong
+	// moment. Safe to hold because send_line only ever appends to a buffer -- it never
+	// touches the network (see enqueue_output).
 	sync.mutex_lock(&s.players_lock)
+	defer sync.mutex_unlock(&s.players_lock)
 	conn, ok := s.players[player]
-	sync.mutex_unlock(&s.players_lock)
 	if !ok {
 		return false
 	}
@@ -114,9 +120,9 @@ hook_notify :: proc(user_data: rawptr, player: values.Objid, text: string) -> bo
 @(private = "file")
 hook_notify_raw :: proc(user_data: rawptr, player: values.Objid, text: string) -> bool {
 	s := (^Server)(user_data)
-	sync.mutex_lock(&s.players_lock)
+	sync.mutex_lock(&s.players_lock) // held across the send -- see hook_notify
+	defer sync.mutex_unlock(&s.players_lock)
 	conn, ok := s.players[player]
-	sync.mutex_unlock(&s.players_lock)
 	if !ok {
 		return false
 	}
@@ -127,9 +133,9 @@ hook_notify_raw :: proc(user_data: rawptr, player: values.Objid, text: string) -
 @(private = "file")
 hook_connection_name :: proc(user_data: rawptr, player: values.Objid) -> (name: string, found: bool) {
 	s := (^Server)(user_data)
-	sync.mutex_lock(&s.players_lock)
+	sync.mutex_lock(&s.players_lock) // held across the peer lookup -- see hook_notify
+	defer sync.mutex_unlock(&s.players_lock)
 	conn, ok := s.players[player]
-	sync.mutex_unlock(&s.players_lock)
 	if !ok {
 		return "", false
 	}
@@ -150,29 +156,48 @@ hook_connection_name :: proc(user_data: rawptr, player: values.Objid) -> (name: 
 hook_boot_player :: proc(user_data: rawptr, player: values.Objid) {
 	s := (^Server)(user_data)
 	sync.mutex_lock(&s.players_lock)
+	defer sync.mutex_unlock(&s.players_lock) // held throughout -- see hook_notify
 	conn, ok := s.players[player]
-	if ok {
-		delete_key(&s.players, player)
+	if !ok {
+		return
 	}
-	sync.mutex_unlock(&s.players_lock)
-	if ok {
-		send_line(conn, "%r*** Booted ***%n")
-		// A task parked in read() on this connection can't be woken by closing its socket
-		// (it's blocked on a condition variable, not a socket call) -- same issue and same
-		// fix as server.odin's server_stop; without this, boot_player()ing a player mid-read()
-		// would leave that thread parked forever.
-		sync.mutex_lock(&conn.io_lock)
-		tid := conn.reader_task_id
-		conn.reader_task_id = 0
-		sync.mutex_unlock(&conn.io_lock)
-		if tid != 0 {
-			wake_reader(s.scheduler, tid, strings.clone(""))
-		}
-		// shutdown() before close(): see server.odin's server_stop for why close() alone
-		// isn't reliable at waking a concurrent blocked recv_tcp() on Linux.
-		net.shutdown(conn.socket, .Both)
-		net.close(conn.socket)
+	delete_key(&s.players, player)
+	disconnect_conn(s, conn, "%r*** Booted ***%n")
+}
+
+// disconnect_conn forcibly ends a connection that has ALREADY been removed from `players`
+// (caller's job, under players_lock, which the caller must still hold): send a final line,
+// wake anything parked on it, and shut the socket down so the connection's own thread
+// notices and tears itself down. Shared by boot_player() and by finish_login()'s
+// displaced-reconnect path.
+//
+// Deliberately no net.close() here -- only net.shutdown(). The descriptor belongs to the
+// connection's own thread, which closes it exactly once during teardown; closing it from
+// here as well is a double close, and the number can be handed straight back out by accept()
+// in between (see server_stop's comment for the full reasoning).
+//
+// Shutting down only the RECEIVE half leaves the write half open, so the final line above
+// actually reaches the client: the writer thread drains what is buffered and the connection
+// thread's own teardown does the final shutdown(Both) once that drain is done. Shutting both
+// halves here (which is what this used to do) discarded the buffered "*** Booted ***" almost
+// every time -- the message was enqueued a few microseconds earlier and the writer thread had
+// not been scheduled yet. Receive alone is still enough to unblock the connection thread's
+// recv_tcp, which is what makes it tear down at all.
+@(private = "file")
+disconnect_conn :: proc(s: ^Server, conn: ^Connection, final_line: string) {
+	send_line(conn, final_line)
+	// A task parked in read() on this connection can't be woken by closing its socket
+	// (it's blocked on a condition variable, not a socket call) -- same issue and same
+	// fix as server.odin's server_stop; without this, boot_player()ing a player mid-read()
+	// would leave that thread parked forever.
+	sync.mutex_lock(&conn.io_lock)
+	tid := conn.reader_task_id
+	conn.reader_task_id = 0
+	sync.mutex_unlock(&conn.io_lock)
+	if tid != 0 {
+		wake_reader(s.scheduler, tid, strings.clone(""))
 	}
+	net.shutdown(conn.socket, .Receive)
 }
 
 // hook_connected_players ports the shandle-list scan behind connected_players(): every
@@ -200,9 +225,9 @@ hook_connected_players :: proc(user_data: rawptr, include_all: bool) -> []values
 @(private = "file")
 hook_connected_seconds :: proc(user_data: rawptr, player: values.Objid) -> (secs: i64, found: bool) {
 	s := (^Server)(user_data)
-	sync.mutex_lock(&s.players_lock)
+	sync.mutex_lock(&s.players_lock) // held across the read of conn -- see hook_notify
+	defer sync.mutex_unlock(&s.players_lock)
 	conn, ok := s.players[player]
-	sync.mutex_unlock(&s.players_lock)
 	if !ok || player < 0 {
 		return 0, false
 	}
@@ -216,10 +241,18 @@ hook_connected_seconds :: proc(user_data: rawptr, player: values.Objid) -> (secs
 @(private = "file")
 hook_output_delimiters :: proc(user_data: rawptr, player: values.Objid) -> (prefix: string, suffix: string, found: bool) {
 	s := (^Server)(user_data)
-	conn, ok := find_conn(s, player)
+	sync.mutex_lock(&s.players_lock) // held across the read -- see hook_notify
+	defer sync.mutex_unlock(&s.players_lock)
+	conn, ok := find_conn_locked(s, player)
 	if !ok {
 		return "", "", false
 	}
+	// io_lock, not just players_lock: these two strings are REPLACED (old one freed, new one
+	// cloned) by a PREFIX/SUFFIX command running on the connection's drain worker, which is a
+	// different thread from this one and holds no players_lock. Reading them unsynchronised
+	// races that swap, and cloning from a pointer the swap just freed is a use-after-free.
+	sync.mutex_lock(&conn.io_lock)
+	defer sync.mutex_unlock(&conn.io_lock)
 	return strings.clone(conn.output_prefix), strings.clone(conn.output_suffix), true
 }
 
@@ -277,10 +310,34 @@ wire_connection_hooks :: proc(ow: ^objdb.Object_World, s: ^Server) {
 // reason: this port's do_login_command support only covers the `connect` path against
 // existing players.
 finish_login :: proc(s: ^Server, conn: ^Connection, player: values.Objid) {
-	unregister_player(s, conn.player) // drop the pre-login negative placeholder ID
+	sync.mutex_lock(&s.players_lock)
+	if conn.closing {
+		// This connection's own thread has already started tearing it down -- the client hung
+		// up while its `connect ...` line was still being processed on a drain worker, which is
+		// routine. Registering it now would put a Connection that is about to be freed back
+		// into the map for every hook and for server_stop to find; worse, the teardown that
+		// is already under way will not remove it again, so the entry outlives the memory. The
+		// observable symptom was a shutdown that never completed. Abandon the login instead:
+		// there is nobody on the other end of it any more.
+		sync.mutex_unlock(&s.players_lock)
+		return
+	}
+	delete_key(&s.players, conn.player) // drop the pre-login negative placeholder ID
+	// An already-connected player logging in again on a second connection: the registry is
+	// keyed by player id, so the two connections would otherwise share one key -- only the
+	// newer reachable by notify(), and the older one's eventual teardown deleting the key
+	// out from under the live connection, silently cutting the player off from all output
+	// while they were still typing. Full reconnect redirection (server.c:1049-1079's
+	// "*** Redirected ***" handover, complete with $login:redirected_task) is out of scope
+	// here, but a stale connection MUST not be left sharing the key: disconnect it.
+	if old_conn, ok := s.players[player]; ok && old_conn != conn {
+		delete_key(&s.players, player)
+		disconnect_conn(s, old_conn, "*** Redirected ***")
+	}
 	conn.player = player
 	conn.connect_time = time.now()
-	register_player(s, player, conn)
+	s.players[player] = conn
+	sync.mutex_unlock(&s.players_lock)
 
 	send_line(conn, "*** Connected ***")
 
@@ -310,18 +367,30 @@ finish_login :: proc(s: ^Server, conn: ^Connection, player: values.Objid) {
 	}
 }
 
-// register_player and unregister_player maintain the registry that the hooks above read.
-// Called from connection.odin on successful login / connection teardown.
-register_player :: proc(s: ^Server, player: values.Objid, conn: ^Connection) {
+// unregister_conn removes a connection from the registry the hooks above read, called from
+// connection.odin as the FIRST step of connection teardown.
+//
+// Identity-checked: it deletes the key only if the key still maps to THIS connection. A
+// plain delete_key(player) is wrong because the key is a player id, not a connection id,
+// and two connections can briefly share one -- a player reconnecting while their previous
+// session is still shutting down. Whichever connection died second would then evict the
+// live one, leaving a connected player that notify() can no longer reach at all.
+//
+// This is also the point after which no other thread can obtain this Connection (every
+// route to one goes through `players` under this lock), which is what makes the rest of
+// teardown -- freeing the connection's queues, options and buffers, and finally the
+// Connection itself -- safe to do at all. See the "Connection lifetime" note below.
+unregister_conn :: proc(s: ^Server, conn: ^Connection) {
 	sync.mutex_lock(&s.players_lock)
-	s.players[player] = conn
-	sync.mutex_unlock(&s.players_lock)
-}
-
-unregister_player :: proc(s: ^Server, player: values.Objid) {
-	sync.mutex_lock(&s.players_lock)
-	delete_key(&s.players, player)
-	sync.mutex_unlock(&s.players_lock)
+	defer sync.mutex_unlock(&s.players_lock)
+	// Set in the same hold as the removal, and this is the half that makes removal stick: a
+	// drain worker part-way through finish_login is about to re-register this connection under
+	// its new player id, and the only way to stop it is a mark it checks under this same lock.
+	// See Connection.closing and finish_login.
+	conn.closing = true
+	if current, ok := s.players[conn.player]; ok && current == conn {
+		delete_key(&s.players, conn.player)
+	}
 }
 
 // allocate_connection_id hands out the next negative placeholder ID (server.c's
@@ -336,3 +405,23 @@ allocate_connection_id :: proc(s: ^Server, conn: ^Connection) -> values.Objid {
 	sync.mutex_unlock(&s.players_lock)
 	return id
 }
+
+// ---- Connection lifetime ----
+//
+// A ^Connection is owned by its own thread (connection.odin's connection_handler), which
+// allocates it (via accept_loop) and frees it. Every OTHER thread that touches one -- every
+// hook in this file, every hook in input_queue.odin, server_stop's shutdown sweep -- reaches
+// it through Server.players, and the rule that makes that safe is:
+//
+//	A Connection may be dereferenced by a thread other than its own ONLY while that
+//	thread holds players_lock, and never after it releases it.
+//
+// The other half of the contract lives in connection_handler's teardown: unregister_conn()
+// runs first, under players_lock, and only then is any of the connection's state (its input
+// queue, its option map, its output buffer, the Connection itself) torn down. So a hook
+// either gets the lock first and finds a fully live connection, or gets it after teardown
+// and finds nothing in the map.
+//
+// This is why the hooks above hold players_lock across their whole body instead of just the
+// map lookup, and it is also why nothing here calls net.close() on a connection's socket:
+// closing is teardown, and teardown belongs to the owning thread.

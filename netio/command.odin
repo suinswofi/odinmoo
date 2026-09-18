@@ -41,12 +41,10 @@ handle_intrinsic_command :: proc(conn: ^Connection, ow: ^objdb.Object_World, pc:
 		}
 		return true
 	case strings.equal_fold(pc.verb, "PREFIX"), strings.equal_fold(pc.verb, "OUTPUTPREFIX"):
-		delete(conn.output_prefix)
-		conn.output_prefix = strings.clone(pc.argstr)
+		set_output_delimiter(conn, &conn.output_prefix, pc.argstr)
 		return true
 	case strings.equal_fold(pc.verb, "SUFFIX"), strings.equal_fold(pc.verb, "OUTPUTSUFFIX"):
-		delete(conn.output_suffix)
-		conn.output_suffix = strings.clone(pc.argstr)
+		set_output_delimiter(conn, &conn.output_suffix, pc.argstr)
 		return true
 	}
 	return false
@@ -81,12 +79,19 @@ dispatch_command :: proc(conn: ^Connection, line: string) {
 	// do_command_task() sending output_prefix before and output_suffix after everything
 	// else, unconditionally, regardless of which of #0:do_command/verb-dispatch/"I couldn't
 	// understand that" ends up handling the line below.
-	if len(conn.output_prefix) > 0 {
-		send_line(conn, conn.output_prefix)
+	// Snapshot both under io_lock rather than reading conn.output_prefix/suffix directly at
+	// each use: output_delimiters() reads them from another thread (login.odin's
+	// hook_output_delimiters) and a PREFIX command frees the old string as it installs a new
+	// one, so the value has to be copied out under the lock that orders those two.
+	prefix, suffix := output_delimiters_snapshot(conn)
+	defer delete(prefix)
+	defer delete(suffix)
+	if len(prefix) > 0 {
+		send_line(conn, prefix)
 	}
 	defer {
-		if len(conn.output_suffix) > 0 {
-			send_line(conn, conn.output_suffix)
+		if len(suffix) > 0 {
+			send_line(conn, suffix)
 		}
 	}
 
@@ -218,4 +223,28 @@ words_to_owned_list :: proc(words: []string) -> values.Var {
 		items[i] = values.str_val(strings.clone(w))
 	}
 	return values.list_val(items)
+}
+
+// set_output_delimiter installs a new PREFIX/SUFFIX string, freeing the one it replaces,
+// under io_lock -- see output_delimiters_snapshot.
+@(private = "file")
+set_output_delimiter :: proc(conn: ^Connection, slot: ^string, text: string) {
+	replacement := strings.clone(text)
+	sync.mutex_lock(&conn.io_lock)
+	old := slot^
+	slot^ = replacement
+	sync.mutex_unlock(&conn.io_lock)
+	delete(old)
+}
+
+// output_delimiters_snapshot returns owned copies of this connection's PREFIX and SUFFIX.
+// These two strings are the one piece of per-connection state that is both written by the
+// connection's own drain worker (a PREFIX/SUFFIX command) and read by arbitrary MOO tasks on
+// other threads (the output_delimiters() builtin), so unlike the rest of the `.program`/
+// prefix block in Connection they need a lock; io_lock is the connection's existing one.
+@(private = "file")
+output_delimiters_snapshot :: proc(conn: ^Connection) -> (prefix: string, suffix: string) {
+	sync.mutex_lock(&conn.io_lock)
+	defer sync.mutex_unlock(&conn.io_lock)
+	return strings.clone(conn.output_prefix), strings.clone(conn.output_suffix)
 }
