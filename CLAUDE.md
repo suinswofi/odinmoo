@@ -42,6 +42,10 @@ odin test <package> -extra-linker-flags:"-lcrypt"              # test one packag
   longer needs `-define:ODIN_TEST_THREADS=1`.
 - The Odin compiler ships as rolling nightly source builds, so it may not be on `PATH`; use the path
   to your own checkout's `./odin` if `odin` is not found.
+- Shutdown order is deliberate: `server_stop()` (no new input, every connection thread joined),
+  then `tasks.scheduler_shutdown()` (suspended tasks killed, forked tasks waited for), and only
+  then the final dump. Letting forked tasks run on while the database is dumped and freed is a
+  use-after-free, and `active_forks` had nothing waiting on it before.
 - `./bin/moo <core.db> <checkpoint.db> [port]` runs the server directly (default port 7777). Never
   point the checkpoint at the same file as the initial DB — a crash mid-write destroys the only
   copy. `./bin/moo -e <core.db>` is emergency wizard mode: a local stdin/stdout MOO-expression REPL
@@ -108,6 +112,13 @@ Two structural points that are easy to violate by accident:
   inline: `send_line` appends to a bounded per-connection buffer drained by a dedicated writer
   thread (`enqueue_output` in `netio/connection.odin`), because senders usually hold `big_lock`
   and a blocking `send` there would let one stalled client freeze every task.
+- **A `^Connection` may only be dereferenced by another thread while holding `players_lock`**, and
+  never after releasing it — that lock is the only thing standing between the pointer and the
+  connection's own thread freeing it. The other half of the rule lives in `connection_teardown`:
+  unregister from `Server.players` FIRST, then wait for drain workers, then free anything. The
+  full contract is the "Connection lifetime" note at the bottom of `netio/login.odin`; also:
+  only the owning thread ever `close()`s a socket (everyone else `shutdown()`s — a double close
+  hands a live descriptor number to an unrelated connection).
 - **Every path that executes MOO code or reads the object DB must hold `Scheduler.big_lock`** —
   including "just a lookup" like `parse_command`'s object matching or an `is_player` check on a
   connection thread. When adding an entry point, grep for `vm.run`/`call_root_verb` and copy an
@@ -116,7 +127,11 @@ Two structural points that are easy to violate by accident:
   raw integers in `.db` files. Never reorder or insert into them.
 - **List copy-on-write is MOO-visible aliasing behavior**, not an optimization: mutate in place only
   when `refcount == 1`, otherwise rebuild. Refcounts use an explicit `rc` field in an allocation
-  header, not the original's `((int*)ptr)[-1]` pointer arithmetic.
+  header, not the original's `((int*)ptr)[-1]` pointer arithmetic, and are maintained
+  **atomically** (`values/values.odin`): the original needs no atomics because it is
+  single-threaded, but here a Var's refcount is touched outside `big_lock` in the connection
+  layer (a connection's option store, and the value `read()` is resumed with), so a plain
+  `++`/`--` is a double free waiting for a disconnect at the wrong moment.
 - **The verb `d` (debug) flag is load-bearing, not legacy.** In a verb with `d` clear, an error
   from that verb's *own* operation — a built-in returning an error, an undispatchable verb call,
   a missing property — becomes the value of the expression rather than raising (`call_to_expr`
@@ -131,6 +146,13 @@ Two structural points that are easy to violate by accident:
   reports the single command-line listening point); `disassemble()` has no bytecode to report on.
   Databases at format version 5+ (e.g. HellCore) are rejected cleanly at load — stock LambdaMOO's
   `DB_Version` stops at 4, and so does this.
+- **A database with a broken object graph is rejected at load** (`dbfile/validate.odin`): every
+  parent/child/sibling/location/contents/next link must name a live object or `NOTHING`, and no
+  parent or location chain may loop. This is a precondition, not a nicety — every graph walk in
+  `objdb` indexes `db.objects` with an id taken straight from another object's link field, so a
+  dangling link is a nil dereference and a cycle is an infinite loop, both surfacing far from
+  the damage. `cmd/jhverify` reports on the same invariants; this enforces them. All bundled
+  cores pass unchanged.
 
 ## Working in this codebase
 
@@ -146,7 +168,7 @@ Two structural points that are easy to violate by accident:
   a scratch directory that imports `dbfile`/`objdb`/`compiler`/`vm`, loads the `.db`, and dumps a
   verb or runs a snippet through `vm.run` with `this`/`player`/`caller` bound manually. Much faster
   than rebuilding the whole server to add print statements. `cmd/dumpverb`, `cmd/loadcheck`,
-  `cmd/replserver`, `cmd/jhverify`, and `cmd/dbscript` already exist for the common cases
+  `cmd/replserver`, `cmd/jhverify`, `cmd/dbscript`, and `cmd/fuzz` already exist for the common cases
   (`odin run cmd/replserver ...` from the root). `dbscript` doubles as a MOO probe: a script of
   `;return <expr>;` lines runs against any core with wizard perms and prints each result — but
   note the wizard is not *connected* there, so JHCore's room `enterfunc` bounces `move(player,
@@ -154,6 +176,20 @@ Two structural points that are easy to violate by accident:
   `cmd/jhverify <db>` is the compatibility auditor: object graph, property-inheritance invariant,
   value types, every verb compiling, and every built-in those verbs call being implemented — run
   it against a core before assuming it works.
+- **`cmd/fuzz` is the memory-safety harness**, and it must be built as a plain binary under
+  AddressSanitizer, not as a test: `odin test`'s allocator is a rollback stack that never
+  returns memory to the OS, so ASan cannot see a use-after-free under it at all. Build with
+  `odin build cmd/fuzz -sanitize:address -debug -extra-linker-flags:"-lcrypt" -out:bin/fuzz`,
+  then run any of its three modes from the repo root:
+  - `./bin/fuzz 300000` — random input to `ansi.translate`, `split_command_words`, the MOO
+    compiler and the regex engine, i.e. the paths hostile input reaches from the network.
+    `./bin/fuzz -f <file>` parses one file, for reducing a failure to a minimal case.
+  - `./bin/fuzz -db <core.db>` — mutated/truncated `.db` files through the loader.
+  - `./bin/fuzz -moo <core.db>` — random MOO programs (builtins with wrong types and argument
+    counts, out-of-range indices, invalid objects) actually RUN against that database, plus
+    `parse_command`/`match_object` on random command lines. `while`/`for` are deliberately
+    absent from the generated grammar: there is no tick budget, so a generated infinite loop
+    would hang the fuzzer rather than fail it.
 - **Test-reported allocator leaks are real bugs.** `core:testing`'s tracking allocator runs on every
   test; a package that starts reporting leaks or double-frees after a change has regressed, and
   should not be treated as noise.
