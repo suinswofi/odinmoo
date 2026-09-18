@@ -49,6 +49,14 @@ Activation :: struct {
 	// activ_stack[top_activ_stack-1].progr; see world_call_verb's `act.caller_programmer =
 	// ctx.activation.programmer`.
 
+	// budget is the task's shared tick/wall-clock allowance (budget.odin). Every activation
+	// in one task points at the SAME Task_Budget -- call_verb_from and bf_eval copy the
+	// pointer from their caller -- so a runaway recursion or a loop that spans a dozen verbs
+	// is charged as one task, which is the only accounting that actually bounds anything.
+	// nil means unmetered; run() fills it in for a task's root activation, so the only
+	// callers that ever see nil are ones driving exec_stmt directly (this package's tests).
+	budget: ^Task_Budget,
+
 	parent: ^Activation, // the CALLING activation (nil for a task's root), giving callers()
 	// the real frame chain to walk -- the explicit-pointer equivalent of the original's
 	// activ_stack array indexing. Only valid while the callee is executing (each Activation
@@ -116,6 +124,12 @@ Error_Info :: struct {
 	code:  values.Error,
 	msg:   string, // owned
 	value: values.Var, // owned; the `value` argument to raise(), or int(0) by default
+	// uncatchable marks an error that try/except and `!`-catch must NOT intercept and that
+	// the `d` flag must not turn into an inline value -- it unwinds the task and nothing
+	// else. Only the task-budget abort sets it (budget.odin explains why a catchable one
+	// would be useless), mirroring the fact that the original kills an out-of-ticks task
+	// outright rather than raising anything MOO code could handle.
+	uncatchable: bool,
 }
 
 error_info_destroy :: proc(e: ^Error_Info) {
@@ -149,6 +163,7 @@ Call_Result :: struct {
 	// returning an error, a verb call that couldn't be dispatched, a property that isn't
 	// there). Only the latter is subject to the caller's `d` flag -- see call_to_expr.
 	unwinding: bool,
+	uncatchable: bool, // see Error_Info.uncatchable; carried across the verb-call boundary
 }
 
 call_ok :: proc(v: values.Var) -> Call_Result {return Call_Result{value = v}}

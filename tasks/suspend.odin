@@ -66,6 +66,7 @@ bf_suspend :: proc(s: ^Scheduler, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	id := ctx.activation.task_id
 	info := register_task(s, id, ctx.activation)
 	resume_value, killed := park_wait(s, id, info, seconds)
+	vm.budget_renew(ctx.activation.budget) // parked time isn't the task's to pay for -- see budget_renew
 
 	if killed {
 		values.free_var(resume_value)

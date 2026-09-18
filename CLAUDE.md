@@ -115,6 +115,20 @@ Two structural points that are easy to violate by accident:
   DB at a time, preserving the original's effective single-writer semantics. Anything touching the
   DB must hold it. The visible cost: `queued_tasks()`/`task_stack()` see only genuinely-suspended
   tasks and report one frame rather than a full chain.
+- **Every task runs under a tick/wall-clock budget (`vm/budget.odin`), and that is load-bearing
+  here in a way it isn't upstream.** A running task holds `big_lock`, so an unterminating loop is
+  not a slow task but a dead server — and nothing can preempt it (`kill_task()` only reaches
+  *suspended* tasks, and `scheduler_shutdown()` waits on the very thread that is spinning). A
+  "tick" is one executed statement, charged in `exec_stmt`, plus one per loop iteration
+  (`charge_iteration`) — the second is not redundant: `while (1) endwhile` runs no statements at
+  all. The limits are the original's defaults (30000 ticks / 5s) but are fixed constants, not
+  `$server_options`-driven. The abort is **uncatchable** (`Error_Info.uncatchable`, honored by
+  `exec_try_except`/`exec_try_finally`/`eval_catch` and by `call_to_expr`'s `d`-flag branch) —
+  a catchable one would be swallowed by `try ... except (ANY)` and buy nothing. A task's budget
+  is shared by every nested verb call (`call_verb_from` and `bf_eval` copy the pointer) and
+  renewed when it comes back from `suspend()`/`read()`. `ticks_left()`/`seconds_left()` report
+  against it truthfully, which is what makes core code's `$command_utils:suspend_if_needed()`
+  work; they used to return constants.
 - **Values are bounded in size and nesting depth** (`values.MAX_VALUE_DEPTH`, `MAX_LIST_LEN`,
   `MAX_STR_LEN`), enforced where values are *built* — the list literal in `eval_args_as_list`,
   `index_set`/`range_set`, and `listappend`/`listinsert`/`listset`/`setadd`. Depth is cached on
@@ -209,8 +223,9 @@ Two structural points that are easy to violate by accident:
   - `./bin/fuzz -moo <core.db>` — random MOO programs (builtins with wrong types and argument
     counts, out-of-range indices, invalid objects) actually RUN against that database, plus
     `parse_command`/`match_object` on random command lines. `while`/`for` are deliberately
-    absent from the generated grammar: there is no tick budget, so a generated infinite loop
-    would hang the fuzzer rather than fail it.
+    absent from the generated grammar, historically because a generated infinite loop would
+    hang the fuzzer rather than fail it; the per-task tick budget now bounds them, so that
+    exclusion is worth revisiting.
 - **Test-reported allocator leaks are real bugs.** `core:testing`'s tracking allocator runs on every
   test; a package that starts reporting leaks or double-frees after a change has regressed, and
   should not be treated as noise.

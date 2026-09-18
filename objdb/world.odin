@@ -305,6 +305,10 @@ call_verb_from :: proc(w: ^Object_World, vw: ^vm.World, this_obj, search_from: v
 	act.caller_programmer = ctx.activation.programmer
 	act.task_id = ctx.activation.task_id
 	act.depth = ctx.activation.depth + 1
+	// The callee shares the caller's tick/second allowance: one task, one budget, however
+	// many verbs it spans (vm/budget.odin). A fresh budget per verb call would mean a task
+	// could run forever simply by calling verbs.
+	act.budget = ctx.activation.budget
 	act.parent = ctx.activation
 	act.verb_loc = vh.definer
 	// The DISPATCH name (`name`, e.g. "find_only" -- what the caller actually wrote), not
@@ -379,7 +383,7 @@ call_verb_from :: proc(w: ^Object_World, vw: ^vm.World, this_obj, search_from: v
 			// a poor man's version of the traceback the original logs for uncaught errors.
 			fmt.eprintfln("TRACE: #%d:%s (defined on #%d, programmer #%d) raised %s: %s", this_obj, name, vh.definer, act.programmer, compiler.error_name(r.err.code), r.err.msg)
 		}
-		return vm.Call_Result{raised = true, code = r.err.code, msg = r.err.msg, rvalue = r.err.value, unwinding = true}
+		return vm.Call_Result{raised = true, code = r.err.code, msg = r.err.msg, rvalue = r.err.value, unwinding = true, uncatchable = r.err.uncatchable}
 	case .Normal, .Break, .Continue:
 		return vm.call_ok(values.int_val(0))
 	}

@@ -78,10 +78,10 @@ bf_dump_database :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Conte
 // bf_load_server_options ports functions.c's bf_load_server_options(): wizard-only,
 // refreshes the original's in-memory `$server_options`-derived caches (protect_* flags,
 // misc numeric options). This port doesn't maintain any such cache -- there's no per-builtin
-// "protected" table (see introspection_stats.odin's function_description note) and no
-// $server_options-driven tick/second-budget or fairness-queue system (see
-// tasks/scheduler.odin's header "Scope cut" note) -- so there is genuinely nothing to
-// refresh. A true, honest no-op: permission-checked, does nothing, matching what the original
+// "protected" table (see introspection_stats.odin's function_description note), and while the
+// tick/second budget IS enforced (vm/budget.odin), its limits are fixed constants rather than
+// values read out of $server_options, so nothing here is derived from the database and there
+// is genuinely nothing to refresh. A true, honest no-op: permission-checked, does nothing, matching what the original
 // itself would do if none of its cached options had changed.
 bf_load_server_options :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	defer values.free_var(args)

@@ -53,12 +53,15 @@ propagate :: proc(ctx: ^Eval_Context, r: Op_Result) -> Expr_Result {
 // activation whose own built-in raised, never of the frames it unwinds past.
 call_to_expr :: proc(ctx: ^Eval_Context, r: Call_Result) -> Expr_Result {
 	if r.raised {
-		if !ctx.activation.debug && !r.unwinding {
+		// `uncatchable` overrides the `d` flag as well as try/except: a non-debug verb whose
+		// callee ran out of ticks must not go on executing with E_QUOTA as the value of the
+		// expression, which is exactly what this branch would otherwise do.
+		if !ctx.activation.debug && !r.unwinding && !r.uncatchable {
 			delete(r.msg)
 			values.free_var(r.rvalue)
 			return ok_expr(values.err_val(r.code))
 		}
-		return Expr_Result{raised = true, err = Error_Info{code = r.code, msg = r.msg, value = r.rvalue}}
+		return Expr_Result{raised = true, err = Error_Info{code = r.code, msg = r.msg, value = r.rvalue, uncatchable = r.uncatchable}}
 	}
 	return ok_expr(r.value)
 }
@@ -394,6 +397,9 @@ eval_catch :: proc(ctx: ^Eval_Context, c: ^compiler.Expr_Catch) -> Expr_Result {
 	result := eval_expr(ctx, c.try)
 	if !result.raised {
 		return result
+	}
+	if result.err.uncatchable {
+		return result // a task-budget abort is not catchable here either -- see exec_try_except
 	}
 	if !error_code_matches(ctx, c.codes, result.err.code) {
 		return result

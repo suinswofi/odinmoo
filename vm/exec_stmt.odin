@@ -42,6 +42,23 @@ raised_stmt :: proc(code: values.Error, msg: string) -> Stmt_Result {
 	return Stmt_Result{signal = .Raised, err = Error_Info{code = code, msg = strings.clone(msg), value = values.int_val(0)}}
 }
 
+// charge_iteration bills one tick for going round a loop, and is the reason the budget
+// holds for EVERY loop rather than most of them. exec_stmt's per-statement charge covers a
+// loop whose body does something, but `while (1) endwhile` and `for i in [1..n] endfor` have
+// no statements in them at all: exec_stmts runs over an empty slice, exec_stmt is never
+// reached, and the loop spins forever uncharged -- holding big_lock and wedging the whole
+// server, which is precisely what the budget exists to prevent. (Not hypothetical: an
+// empty-bodied `while (1)` typed at a live JHCore server did exactly that, while the same
+// loop with a statement in it aborted correctly.) Every construct that can repeat calls
+// this before running its body.
+@(private = "file")
+charge_iteration :: proc(ctx: ^Eval_Context) -> (r: Stmt_Result, exhausted: bool) {
+	if budget_charge(ctx.activation.budget) {
+		return {}, false
+	}
+	return Stmt_Result{signal = .Raised, err = budget_abort_error(ctx.activation.budget)}, true
+}
+
 exec_stmts :: proc(ctx: ^Eval_Context, stmts: []compiler.Stmt) -> Stmt_Result {
 	for s in stmts {
 		r := exec_stmt(ctx, s)
@@ -53,6 +70,14 @@ exec_stmts :: proc(ctx: ^Eval_Context, stmts: []compiler.Stmt) -> Stmt_Result {
 }
 
 exec_stmt :: proc(ctx: ^Eval_Context, s: compiler.Stmt) -> Stmt_Result {
+	// One tick per statement -- see budget.odin for what a tick means in a tree-walker and
+	// why the abort is uncatchable. This charge covers the bulk of it (a verb call is always
+	// reached from a statement, so recursion is billed too), but NOT quite everything: a loop
+	// with an empty body executes no statements at all, which is what charge_iteration above
+	// is for. Both are needed.
+	if !budget_charge(ctx.activation.budget) {
+		return Stmt_Result{signal = .Raised, err = budget_abort_error(ctx.activation.budget)}
+	}
 	switch v in s {
 	case ^compiler.Stmt_Cond:
 		for arm in v.arms {
@@ -163,6 +188,9 @@ exec_list_loop :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_List_Loop) -> Stmt_
 	}
 
 	for i in 1 ..= n {
+		if r, exhausted := charge_iteration(ctx); exhausted {
+			return r
+		}
 		item: values.Var
 		if list_r.value.type == .List {
 			item = values.var_ref(values.list_get(list_r.value, i))
@@ -209,6 +237,9 @@ exec_range_loop :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_Range_Loop) -> Stm
 	i := from_r.value.data.num
 	to := to_r.value.data.num
 	for i <= to {
+		if r, exhausted := charge_iteration(ctx); exhausted {
+			return r
+		}
 		values.free_var(ctx.activation.locals[v.var_id])
 		ctx.activation.locals[v.var_id] = values.int_val(i)
 
@@ -224,9 +255,10 @@ exec_range_loop :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_Range_Loop) -> Stm
 		// and i32 addition wraps, so the increment after the last iteration used to produce
 		// min(i32) -- still <= to -- and the loop restarted from the bottom of the range and
 		// never finished. `for i in [2147483645..2147483647]`, which the language says runs
-		// exactly three times, ran forever. Not the same thing as this port's documented lack
-		// of a tick budget: that makes an unbounded loop possible, this made a BOUNDED one
-		// non-terminating.
+		// exactly three times, ran forever. A different bug from an unbounded loop, and not
+		// one the tick budget above would excuse: this made a loop the language says is
+		// BOUNDED fail to terminate, i.e. gave a wrong answer, rather than letting an
+		// intentionally-unbounded one run.
 		if i == to {
 			break
 		}
@@ -239,6 +271,9 @@ exec_range_loop :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_Range_Loop) -> Stm
 exec_while :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_While) -> Stmt_Result {
 	my_name := loop_name_of(ctx, v.var_id)
 	for {
+		if r, exhausted := charge_iteration(ctx); exhausted {
+			return r
+		}
 		cond_r := eval_expr(ctx, v.condition)
 		if cond_r.raised {
 			return raised_from_expr(cond_r)
@@ -273,6 +308,13 @@ exec_try_except :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_Try_Except) -> Stm
 	if r.signal != .Raised {
 		return r
 	}
+	if r.err.uncatchable {
+		// A task-budget abort is not an exception the program gets a say in. Letting
+		// `except (ANY)` see it would make the whole budget ineffective: the handler
+		// returns, the enclosing loop goes round again, and the task carries on holding
+		// big_lock exactly as it did before there was a budget.
+		return r
+	}
 	for arm in v.excepts {
 		if !error_code_matches(ctx, arm.codes, r.err.code) {
 			continue
@@ -304,6 +346,14 @@ raised_tuple :: proc(e: Error_Info) -> values.Var {
 @(private = "file")
 exec_try_finally :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_Try_Finally) -> Stmt_Result {
 	body_r := exec_stmts(ctx, v.body)
+	if body_r.signal == .Raised && body_r.err.uncatchable {
+		// The handler is skipped deliberately. It is ordinary MOO code, so running it would
+		// mean running statements for a task that has already exhausted its budget -- each
+		// one immediately re-aborting (the exhaustion is sticky), and a `finally` body
+		// containing a loop would spin through it. The original doesn't face the question
+		// because an out-of-ticks task is killed where it stands, not unwound.
+		return body_r
+	}
 	handler_r := exec_stmts(ctx, v.handler)
 	if handler_r.signal != .Normal {
 		if body_r.signal == .Raised {

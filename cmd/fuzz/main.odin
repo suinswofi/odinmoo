@@ -193,9 +193,10 @@ fuzz_db_loader :: proc(base_path: string) {
 // numbers. Every builtin does its own argument checking by hand, which is exactly the kind of
 // code where one missing check is a crash rather than an E_TYPE.
 //
-// Deliberately excluded from the generated grammar: `while`/`for` (this has no tick limit, so
-// a generated infinite loop would hang the fuzzer rather than fail it) and `fork` (spawns
-// threads). The scheduler is nil, which also makes suspend()/read() unavailable rather than
+// Deliberately excluded from the generated grammar: `while`/`for` and `fork` (which spawns
+// threads). The loops were excluded because a generated infinite one would hang the fuzzer
+// rather than fail it; vm/budget.odin's per-task tick budget now bounds them, so this is a
+// candidate to revisit -- it is left as-is only because nothing has exercised it yet. The scheduler is nil, which also makes suspend()/read() unavailable rather than
 // blocking. Everything else -- including verb calls, property access, indexing, scatter
 // assignment and try/except -- is in scope.
 @(private = "file")

@@ -514,3 +514,116 @@ test_integer_division_at_the_overflow_boundary :: proc(t: ^testing.T) {
 	expect_return_int(t, `return -7 / 2;`, -3)
 	expect_return_int(t, `return -7 % 3;`, -1)
 }
+
+// ---- Task budget (budget.odin) ----
+
+@(private = "file")
+expect_budget_abort :: proc(t: ^testing.T, label: string, src: string) {
+	local_world := World{}
+	result := run_src(t, src, &local_world)
+	defer {
+		if result.signal == .Return {
+			values.free_var(result.value)
+		} else if result.signal == .Raised {
+			error_info_destroy_local(&result.err)
+		}
+	}
+	if !testing.expectf(t, result.signal == .Raised, "%s: expected the task to be aborted, got %v", label, result.signal) {
+		return
+	}
+	testing.expectf(t, result.err.uncatchable, "%s: the abort must be uncatchable", label)
+	testing.expectf(t, result.err.code == .E_QUOTA, "%s: expected E_QUOTA, got %v", label, result.err.code)
+}
+
+// Every shape of unterminating loop has to be charged. An empty-bodied one is the case that
+// matters most and is easiest to miss: it runs no statements at all, so a budget charged
+// only per statement never touches it (see charge_iteration in exec_stmt.odin). In the real
+// server such a loop holds big_lock forever, which is not a hung task but a hung server.
+@(test)
+test_unterminating_loops_are_aborted :: proc(t: ^testing.T) {
+	expect_budget_abort(t, "while with a body", "x = 0; while (1) x = x + 1; endwhile return x;")
+	expect_budget_abort(t, "empty while", "while (1) endwhile return 1;")
+	expect_budget_abort(t, "empty range for", "for i in [1..2000000000] endfor return 1;")
+	expect_budget_abort(t, "nested empty while", "while (1) while (1) endwhile endwhile return 1;")
+}
+
+// The abort must not be interceptable, or the budget buys nothing: a handler that swallows
+// it puts the task straight back into the loop it was aborted out of.
+@(test)
+test_budget_abort_is_not_catchable :: proc(t: ^testing.T) {
+	expect_budget_abort(t, "except (ANY)", "while (1) try x = 1; except (ANY) endtry endwhile return 1;")
+	expect_budget_abort(t, "try/except around the loop", "try while (1) endwhile except (ANY) return 2; endtry return 1;")
+	expect_budget_abort(t, "try/finally", "try while (1) endwhile finally return 3; endtry")
+}
+
+// eval_catch (the `expr ! codes => handler'` form) has its own copy of the same guard, on the
+// expression side rather than the statement side. Reaching it needs a call, since no bare
+// expression can loop -- so the loop lives in a verb the mock world dispatches to.
+@(test)
+test_budget_abort_is_not_catchable_by_backtick :: proc(t: ^testing.T) {
+	m := mock_world_init()
+	defer mock_world_destroy(&m)
+	mock_define_verb(&m, 1, "spin", "while (1) endwhile return 1;")
+	world := make_mock_world(&m)
+	result := run_src(t, "return `#1:spin() ! ANY => 0';", &world)
+	defer {
+		if result.signal == .Return {
+			values.free_var(result.value)
+		} else if result.signal == .Raised {
+			error_info_destroy_local(&result.err)
+		}
+	}
+	if !testing.expectf(t, result.signal == .Raised, "expected the abort to pass through the catch, got %v", result.signal) {
+		return
+	}
+	testing.expect(t, result.err.uncatchable)
+}
+
+// One task, one allowance. A verb that spends most of the budget must leave the rest of the
+// task short of it -- if each call were handed a fresh Task_Budget, "call another verb" would
+// be all it took to run forever. Each call below burns ~20000 of the 30000 ticks, so the
+// first can succeed and the second cannot.
+//
+// (Deliberately NOT tested by unbounded verb RECURSION: the ceiling on that is objdb's
+// MAX_VERB_DEPTH, which this package's mock World has no equivalent of, so recursing here
+// overflows the native stack long before any budget runs out.)
+@(test)
+test_budget_is_shared_across_verb_calls :: proc(t: ^testing.T) {
+	m := mock_world_init()
+	defer mock_world_destroy(&m)
+	mock_define_verb(&m, 1, "spend", "for i in [1..20000] endfor return 1;")
+	world := make_mock_world(&m)
+	result := run_src(t, "a = #1:spend(); b = #1:spend(); return 1;", &world)
+	defer {
+		if result.signal == .Return {
+			values.free_var(result.value)
+		} else if result.signal == .Raised {
+			error_info_destroy_local(&result.err)
+		}
+	}
+	if !testing.expectf(t, result.signal == .Raised, "the second call should exhaust the shared budget, got %v", result.signal) {
+		return
+	}
+	testing.expect(t, result.err.uncatchable)
+}
+
+// Ordinary errors stay catchable -- the uncatchable flag must be specific to the budget.
+@(test)
+test_ordinary_errors_remain_catchable :: proc(t: ^testing.T) {
+	expect_return_int(t, "try return 1/0; except (E_DIV) return 7; endtry", 7)
+	expect_return_int(t, "return `(1/0) ! ANY => 9';", 9)
+}
+
+// A loop well inside the allowance runs to completion, and ticks_left() reports against the
+// real remainder rather than a constant -- which is what makes the in-database
+// suspend_if_needed idiom work.
+@(test)
+test_budget_leaves_ordinary_work_alone :: proc(t: ^testing.T) {
+	expect_return_int(t, "x = 0; for i in [1..1000] x = x + 1; endfor return x;", 1000)
+	local_world := World{}
+	r := run_src(t, "n = 0; for i in [1..100] n = n + 1; endfor return n;", &local_world)
+	defer {
+		if r.signal == .Return {values.free_var(r.value)} else if r.signal == .Raised {error_info_destroy_local(&r.err)}
+	}
+	testing.expect(t, r.signal == .Return)
+}

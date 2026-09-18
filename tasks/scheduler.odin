@@ -20,10 +20,13 @@ package tasks
 // genuinely means "not competing for the DB," not just "not making progress."
 //
 // Scope cut, stated plainly: this does not reproduce the original's per-connection round-
-// robin fairness queues or $server_options tick/second budgets -- those are entangled with
-// Phase 7's networking layer (which connection a task belongs to) and aren't meaningful
-// without it. What's here is the concurrency core: fork, suspend, resume, kill_task,
-// task_id, all genuinely working and tested under real concurrent load.
+// robin fairness queues, nor the $server_options plumbing that lets a database override the
+// tick/second limits -- the fairness queues are entangled with Phase 7's networking layer
+// (which connection a task belongs to) and aren't meaningful without it. The limits
+// themselves ARE enforced, per task, with the original's default values: see vm/budget.odin,
+// which is what stops a runaway task holding big_lock forever. What's here is the
+// concurrency core: fork, suspend, resume, kill_task, task_id, all genuinely working and
+// tested under real concurrent load.
 
 import "../values"
 import "../vm"
@@ -80,9 +83,10 @@ scheduler_init :: proc() -> Scheduler {
 // dbfile/task_queue.odin). Killing them makes each one's suspend() raise, which unwinds it
 // normally, which is what lets the wait below terminate.
 //
-// One thing it cannot bound: a forked task in an unterminating loop. This port has no tick
-// budget to cut one off with, so shutdown would wait on it. That is the same exposure the
-// server already has while running, not a new one introduced here.
+// A forked task in an unterminating loop used to be the one thing this could not bound --
+// there was no tick budget to cut one off with, so shutdown waited on it forever. There is
+// one now (vm/budget.odin), and a forked task gets its own the same way any other task does,
+// so such a loop ends on its own and this wait terminates.
 scheduler_shutdown :: proc(s: ^Scheduler) {
 	sync.mutex_lock(&s.meta_lock)
 	for _, info in s.tasks {

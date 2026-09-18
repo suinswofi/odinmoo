@@ -103,6 +103,11 @@ world_call_verb :: proc(w: ^World, obj: values.Objid, name: string, args: values
 	act := activation_make(len(mv.names.names))
 	defer activation_destroy(&act)
 	act.this = obj
+	// Mirror objdb's call_verb_from: the callee shares the caller's task budget, so a loop
+	// spread across verb calls is charged as one task rather than getting a fresh allowance
+	// per call. Without this the mock would disagree with the real World on exactly the
+	// property the budget tests are checking.
+	act.budget = ctx.activation.budget
 	args_slot := compiler.find(&mv.names, "args")
 	if args_slot >= 0 {
 		act.locals[args_slot] = values.var_ref(args)
@@ -112,7 +117,7 @@ world_call_verb :: proc(w: ^World, obj: values.Objid, name: string, args: values
 	case .Return:
 		return call_ok(r.value)
 	case .Raised:
-		return Call_Result{raised = true, code = r.err.code, msg = r.err.msg, rvalue = r.err.value}
+		return Call_Result{raised = true, code = r.err.code, msg = r.err.msg, rvalue = r.err.value, uncatchable = r.err.uncatchable}
 	case .Normal, .Break, .Continue:
 		return call_ok(values.int_val(0))
 	}

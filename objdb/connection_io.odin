@@ -127,6 +127,7 @@ bf_read :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	}
 
 	value, killed := tasks.park_wait(w.scheduler, task_id, info, -1)
+	vm.budget_renew(ctx.activation.budget) // as in bf_suspend: waiting for input costs the task nothing
 	if w.conn.unregister_reader != nil {
 		w.conn.unregister_reader(w.conn.user_data, conn_oid, task_id)
 	}
@@ -359,6 +360,7 @@ bf_eval :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	act.debug = true
 	act.task_id = ctx.activation.task_id
 	act.depth = ctx.activation.depth + 1
+	act.budget = ctx.activation.budget // eval()'d code spends the calling task's budget, like a verb call
 	act.parent = ctx.activation
 	defer vm.activation_destroy(&act)
 
@@ -413,7 +415,7 @@ bf_eval :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	case .Raised:
 		// Like a verb call, eval()'d code runs in its own activation, so a raise inside it
 		// unwinds through eval()'s caller rather than becoming that caller's inline value.
-		return vm.Call_Result{raised = true, code = result.err.code, msg = result.err.msg, rvalue = result.err.value, unwinding = true}
+		return vm.Call_Result{raised = true, code = result.err.code, msg = result.err.msg, rvalue = result.err.value, unwinding = true, uncatchable = result.err.uncatchable}
 	case .Normal, .Break, .Continue:
 		items := make([]values.Var, 2)
 		items[0] = values.int_val(1)

@@ -62,9 +62,9 @@ object_builtin :: proc(w: ^Object_World, name: string, args: values.Var, ctx: ^v
 	case "connected_seconds":
 		return bf_connected_seconds(w, args), true
 	case "ticks_left":
-		return bf_ticks_left(args), true
+		return bf_ticks_left(args, ctx), true
 	case "seconds_left":
-		return bf_seconds_left(args), true
+		return bf_seconds_left(args, ctx), true
 	case "create":
 		return bf_create(w, args, ctx), true
 	case "recycle":
@@ -809,30 +809,32 @@ bf_connected_players :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Resu
 	return ok_result(values.list_val(items))
 }
 
-// bf_ticks_left ports the tick-budget introspection builtin: this port doesn't enforce a
-// tick budget at all (no bytecode+PC to count against -- see vm/activation.odin's header
-// note), so there's no real number to report. Returns a constant matching the original's
-// default max_ticks for a foreground task, which is an honest-enough "you have plenty left"
-// answer for the truthiness/threshold checks real verb code uses this for.
+// bf_ticks_left reports the running task's remaining tick allowance (vm/budget.odin). It
+// used to return a constant, because there was no budget to report on; now that there is,
+// reporting it truthfully is what makes the in-database half of the mechanism work.
+// $command_utils:suspend_if_needed and every long core loop that calls it are written as
+// "if ticks_left() < N, suspend and continue in a fresh task" -- against a constant they
+// never fired, so a long-but-legitimate operation had no way to yield and would now simply
+// hit the ceiling and abort. Against the real number they do exactly what they were
+// written to do.
 @(private = "file")
-bf_ticks_left :: proc(args: values.Var) -> vm.Call_Result {
+bf_ticks_left :: proc(args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	defer values.free_var(args)
 	if values.list_len(args) != 0 {
 		return err_result_local(.E_ARGS, "Incorrect number of arguments")
 	}
-	return ok_result(values.int_val(30000))
+	return ok_result(values.int_val(i32(vm.budget_ticks_left(ctx.activation.budget))))
 }
 
-// bf_seconds_left is ticks_left's wall-clock counterpart -- same "not actually enforced,
-// honest constant" approach, using options.h's DEFAULT_FG_SECONDS since foreground is the
-// common case for verb code that bothers to check.
+// bf_seconds_left is ticks_left's wall-clock counterpart, reporting against the same
+// budget's deadline.
 @(private = "file")
-bf_seconds_left :: proc(args: values.Var) -> vm.Call_Result {
+bf_seconds_left :: proc(args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	defer values.free_var(args)
 	if values.list_len(args) != 0 {
 		return err_result_local(.E_ARGS, "Incorrect number of arguments")
 	}
-	return ok_result(values.int_val(5))
+	return ok_result(values.int_val(i32(vm.budget_seconds_left(ctx.activation.budget))))
 }
 
 // bf_move ports objects.c's do_move()/bf_move(): unlike the original (which spreads this
