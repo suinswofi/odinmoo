@@ -61,6 +61,7 @@ Connection :: struct {
 	io_lock:        sync.Mutex,
 	reader_task_id: int, // 0 = no task currently parked in read() on this connection
 	pending_lines:  [dynamic]string, // queued while "hold-input" is set, or awaiting a non-blocking read()
+	pending_bytes:  int, // total length of pending_lines, kept incrementally so the MAX_QUEUED_INPUT check stays O(1)
 	options:        map[string]values.Var, // connection-option store, see input_queue.odin's option_defaults
 	drains:         sync.Wait_Group, // outstanding drain threads (input_queue.odin's spawn_drain)
 	drain_running:  bool, // guards against spawning a second drain thread while one is working
@@ -102,6 +103,26 @@ Connection :: struct {
 // counted, since the buffer is a flat byte stream).
 @(private = "file")
 MAX_QUEUED_OUTPUT :: 65536
+
+// MAX_QUEUED_INPUT is MAX_QUEUED_OUTPUT's inbound twin, and matches the same options.h
+// default (65536). It bounds two things that were previously unbounded, both of them
+// reachable BEFORE a client has authenticated -- i.e. by anyone who can open a TCP
+// connection, with no database object and no password:
+//
+//  - the partial line being accumulated in connection_read_loop: bytes with no '\n' in
+//    them are just appended, so a client that never sends a newline could grow one
+//    connection's buffer until the process ran out of memory.
+//  - a connection's pending_lines queue (input_queue.odin): lines arrive on the recv
+//    thread and are dispatched by a drain worker, so a client sending faster than its
+//    commands execute -- or one that simply sets "hold-input" and then types -- grows the
+//    queue without limit.
+//
+// The original bounds both with this same constant in one place, because its input is one
+// flat per-connection buffer that pull_input() splits lazily; here the two halves are
+// separate, so each is checked against it. Over-limit policy matches the original's
+// (net_multi.c's "input flushed" handling) and this file's own output side: drop what is
+// queued, tell the client, keep the connection alive.
+MAX_QUEUED_INPUT :: 65536
 
 // enqueue_output appends msg to conn's outbound buffer and wakes the writer thread. Never
 // blocks on the network, so it's safe to call while holding big_lock (which is exactly what
@@ -274,6 +295,10 @@ connection_read_loop :: proc(conn: ^Connection) {
 	buf: [4096]byte
 	pending := strings.builder_make()
 	defer strings.builder_destroy(&pending)
+	// Set once the current line has outgrown MAX_QUEUED_INPUT: the rest of it is consumed
+	// and discarded (rather than buffered) until its terminating newline arrives, so the
+	// connection resynchronizes on the next line instead of being dropped mid-stream.
+	overlong := false
 
 	for {
 		n, err := net.recv_tcp(conn.socket, buf[:])
@@ -283,6 +308,13 @@ connection_read_loop :: proc(conn: ^Connection) {
 		for i in 0 ..< n {
 			c := buf[i]
 			if c == '\n' {
+				if overlong {
+					send_line(conn, ">> Line too long: input discarded <<")
+					overlong = false
+					strings.builder_reset(&pending)
+					free_all(context.temp_allocator)
+					continue
+				}
 				line := strings.trim_right(strings.to_string(pending), "\r")
 				on_incoming_line(conn, line)
 				strings.builder_reset(&pending)
@@ -294,8 +326,12 @@ connection_read_loop :: proc(conn: ^Connection) {
 				// works in owned Vars, and the compiler clones every string it keeps), so this
 				// is safe here and belongs at exactly this boundary.
 				free_all(context.temp_allocator)
-			} else {
+			} else if !overlong {
 				strings.write_byte(&pending, c)
+				if strings.builder_len(pending) > MAX_QUEUED_INPUT {
+					overlong = true
+					strings.builder_reset(&pending)
+				}
 			}
 		}
 	}

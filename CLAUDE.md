@@ -117,7 +117,11 @@ Two structural points that are easy to violate by accident:
   multiplexing loop. There is no event loop to add a descriptor to. Outbound writes never happen
   inline: `send_line` appends to a bounded per-connection buffer drained by a dedicated writer
   thread (`enqueue_output` in `netio/connection.odin`), because senders usually hold `big_lock`
-  and a blocking `send` there would let one stalled client freeze every task.
+  and a blocking `send` there would let one stalled client freeze every task. Input is bounded
+  the same way and for the same reason (`MAX_QUEUED_INPUT`, the twin of `MAX_QUEUED_OUTPUT`):
+  both the partial line being accumulated in `connection_read_loop` and a connection's
+  `pending_lines` queue, since both grow on an unauthenticated connection's say-so. Over-limit
+  policy matches the output side — drop what is queued, tell the client, keep the connection.
 - **A `^Connection` may only be dereferenced by another thread while holding `players_lock`**, and
   never after releasing it — that lock is the only thing standing between the pointer and the
   connection's own thread freeing it. The other half of the rule lives in `connection_teardown`:

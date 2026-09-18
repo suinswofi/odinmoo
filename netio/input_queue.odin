@@ -70,6 +70,7 @@ connection_io_destroy :: proc(conn: ^Connection) {
 		delete(line)
 	}
 	delete(conn.pending_lines)
+	conn.pending_bytes = 0
 	sync.mutex_unlock(&conn.io_lock)
 	if tid != 0 {
 		// The connection is gone while a task was parked in read() on it -- wake it with an
@@ -113,6 +114,27 @@ deliver :: proc(conn: ^Connection, line: string, at_front: bool, from_other_thre
 	}
 	hold := values.is_true(conn.options["hold-input"])
 	if hold || from_other_thread {
+		if conn.pending_bytes + len(line) > MAX_QUEUED_INPUT {
+			// The queue has outrun whatever is meant to be draining it: a client typing
+			// faster than its commands run, one that set "hold-input" and then kept typing,
+			// or a verb in a force_input() loop. Same policy as the outbound side's
+			// overflow (connection.odin's enqueue_output) and as the original's input
+			// flush: drop the backlog, say so, keep the newest line. Dropping the OLDEST
+			// is what makes this recoverable -- the connection stays usable and the command
+			// the player just typed is the one that survives.
+			for l in conn.pending_lines {
+				delete(l)
+			}
+			clear(&conn.pending_lines)
+			conn.pending_bytes = 0
+			// Safe to notify without dropping io_lock: send_line only ever reaches
+			// out_lock (connection.odin's enqueue_output), and nothing anywhere takes
+			// io_lock while holding out_lock, so there is no inversion to create. Keeping
+			// the hold also keeps this atomic with the append below, so a line arriving
+			// concurrently can't slip in between the flush and the refill.
+			send_line(conn, ">> Input buffer overflow: previous input from you has been lost <<")
+		}
+		conn.pending_bytes += len(line)
 		if at_front {
 			old := conn.pending_lines
 			new_lines: [dynamic]string
@@ -209,6 +231,7 @@ drain_thread_proc :: proc(data: rawptr) {
 		line := conn.pending_lines[0]
 		copy(conn.pending_lines[:], conn.pending_lines[1:])
 		resize(&conn.pending_lines, len(conn.pending_lines) - 1)
+		conn.pending_bytes -= len(line)
 		sync.mutex_unlock(&conn.io_lock)
 		dispatch_now(conn, line)
 	}
@@ -224,6 +247,7 @@ try_dequeue :: proc(conn: ^Connection) -> (line: string, ok: bool) {
 	line = conn.pending_lines[0]
 	copy(conn.pending_lines[:], conn.pending_lines[1:])
 	resize(&conn.pending_lines, len(conn.pending_lines) - 1)
+	conn.pending_bytes -= len(line)
 	return line, true
 }
 
@@ -326,6 +350,7 @@ hook_flush_input :: proc(user_data: rawptr, player: values.Objid, show_messages:
 		delete(l)
 	}
 	clear(&conn.pending_lines)
+	conn.pending_bytes = 0
 	sync.mutex_unlock(&conn.io_lock)
 	if show_messages {
 		send_line(conn, "*** Flushed ***")
