@@ -8,6 +8,8 @@ package values
 // to let free_var/var_ref/var_dup skip a switch for scalar types; we get the same fast path
 // from Odin's #partial switch without needing to smuggle a flag bit into the type tag.
 
+import "core:sync"
+
 Objid :: distinct i32
 
 SYSTEM_OBJECT :: Objid(0)
@@ -50,6 +52,21 @@ Var_Type :: enum i32 {
 // Refcounted heap payloads. Unlike the C original (ref_count.h's `((int*)ptr)[-1]` header
 // trick), the refcount is an explicit struct field -- same semantics, no pointer arithmetic
 // over allocation boundaries.
+//
+// The refcount is manipulated ATOMICALLY (see var_ref/free_var), which the original has no
+// need for: LambdaMOO is single-threaded, so a plain `++`/`--` is all it ever requires. This
+// port isn't -- tasks are real OS threads (tasks/scheduler.odin) -- and while the big lock
+// serializes everything that executes MOO code, a Var's refcount is NOT only touched there.
+// It crosses the big lock's boundary in at least two routine places: a connection's option
+// store, whose values are shared between a task that read them (holding big_lock) and the
+// connection's own thread that frees them (holding only io_lock); and read()'s resumed value,
+// which netio's wake_reader creates and releases on a connection thread while the woken task
+// releases its own reference under big_lock. A torn non-atomic refcount there is a double
+// free or a leak of live data, which is exactly what a churn of connects/disconnects against
+// concurrent notify()/connection_options() produced in practice.
+//
+// Cost is one lock-prefixed add per ref/unref, against a tree-walking interpreter that does
+// far more work than that per node -- not a hot path worth keeping unsafe.
 Moo_String :: struct {
 	rc: int,
 	s:  string, // owned; freed as a unit with this struct
@@ -142,26 +159,27 @@ empty_list :: proc() -> Var {
 var_ref :: proc(v: Var) -> Var {
 	#partial switch v.type {
 	case .Str:
-		v.data.str.rc += 1
+		sync.atomic_add(&v.data.str.rc, 1)
 	case .List:
-		v.data.list.rc += 1
+		sync.atomic_add(&v.data.list.rc, 1)
 	}
 	return v
 }
 
 free_var :: proc(v: Var) {
+	// atomic_sub returns the value BEFORE the subtraction, so "was 1" is what identifies the
+	// last owner. Testing the post-decrement value with a separate load instead would let two
+	// threads dropping the last two references both read 0 and both free.
 	#partial switch v.type {
 	case .Str:
 		s := v.data.str
-		s.rc -= 1
-		if s.rc <= 0 {
+		if sync.atomic_sub(&s.rc, 1) <= 1 {
 			delete(s.s)
 			free(s)
 		}
 	case .List:
 		l := v.data.list
-		l.rc -= 1
-		if l.rc <= 0 {
+		if sync.atomic_sub(&l.rc, 1) <= 1 {
 			for item in l.items {
 				free_var(item)
 			}
@@ -190,9 +208,9 @@ var_dup :: proc(v: Var) -> Var {
 refcount :: proc(v: Var) -> int {
 	#partial switch v.type {
 	case .Str:
-		return v.data.str.rc
+		return sync.atomic_load(&v.data.str.rc)
 	case .List:
-		return v.data.list.rc
+		return sync.atomic_load(&v.data.list.rc)
 	case:
 		return 1
 	}

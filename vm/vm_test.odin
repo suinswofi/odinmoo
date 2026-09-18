@@ -459,3 +459,58 @@ test_caught_statement_type_error_frees_its_message :: proc(t: ^testing.T) {
 		mem.tracking_allocator_destroy(&track)
 	}
 }
+
+// Labelled break/continue must target the NAMED loop, not the innermost one. This was broken
+// for as long as it existed: the parser registered a loop's variable in the name table only
+// AFTER parsing the loop body, so `break i` inside the body resolved `i` with find() against a
+// table that did not contain it yet, got -1, and silently degraded to an unlabelled break.
+//
+// The reason it survived the 4456-verb corpus test is worth keeping in mind for anything
+// similar: that test checks parse -> unparse -> reparse SHAPE, never runtime behaviour, and
+// the bug only bites when the body does not otherwise mention the loop variable before
+// breaking on it -- which real verb code, reading the variable it is iterating, almost always
+// does. Every case below is written so the label is the only reference.
+@(test)
+test_labelled_break_targets_the_named_loop :: proc(t: ^testing.T) {
+	expect_return_int(t, `n = 0; for i in [1..3] for j in [1..3] break i; endfor n = n + 100; endfor return n;`, 0)
+	expect_return_int(t, `n = 0; for i in [1..3] for j in [1..3] break j; endfor n = n + 100; endfor return n;`, 300)
+	expect_return_int(t, `n = 0; for i in [1..3] for j in [1..3] break; endfor n = n + 100; endfor return n;`, 300)
+	expect_return_int(t, `n = 0; for i in ({1, 2, 3}) for j in ({1, 2}) break i; endfor n = n + 100; endfor return n;`, 0)
+	expect_return_int(t, `n = 0; a = 0; while lbl (a < 3) a = a + 1; while (1) break lbl; endwhile n = n + 100; endwhile return n;`, 0)
+}
+
+@(test)
+test_labelled_continue_targets_the_named_loop :: proc(t: ^testing.T) {
+	// `continue i` abandons the rest of the inner loop AND the rest of this outer iteration.
+	expect_return_int(t, `n = 0; for i in [1..3] for j in [1..3] if (j == 2) continue i; endif n = n + 1; endfor endfor return n;`, 3)
+	// ... where the unlabelled form only skips the rest of the inner iteration: 2 per outer.
+	expect_return_int(t, `n = 0; for i in [1..3] for j in [1..3] if (j == 2) continue; endif n = n + 1; endfor endfor return n;`, 6)
+}
+
+// A range loop is bounded by definition, so it must terminate even when its bound is the
+// largest representable integer. It used to increment past `to` before re-testing, and i32
+// addition wraps: the counter went from max(i32) to min(i32), which is still <= to, and the
+// loop restarted from the bottom of the range and never finished. Distinct from this port's
+// documented lack of a tick budget -- that allows an unbounded loop to be WRITTEN; this made
+// a loop the language guarantees is finite run forever.
+@(test)
+test_range_loop_terminates_at_integer_limits :: proc(t: ^testing.T) {
+	expect_return_int(t, `n = 0; for i in [2147483645..2147483647] n = n + 1; endfor return n;`, 3)
+	expect_return_int(t, `n = 0; for i in [-2147483647 - 1 .. -2147483646] n = n + 1; endfor return n;`, 3)
+	expect_return_int(t, `n = 0; for i in [1..3] n = n + 1; endfor return n;`, 3)
+	expect_return_int(t, `n = 0; for i in [3..1] n = n + 1; endfor return n;`, 0) // empty range
+}
+
+// INT_MIN / -1 and INT_MIN % -1 overflow, and on x86 that is a hardware trap (the same SIGFPE
+// as dividing by zero), not a wrong answer -- it took the whole server down from any MOO
+// expression, with no error to catch. Wrapping matches what this port already does at the same
+// boundary for -(-2147483648) and abs(-2147483648).
+@(test)
+test_integer_division_at_the_overflow_boundary :: proc(t: ^testing.T) {
+	expect_return_int(t, `x = -2147483647 - 1; return x / -1;`, -2147483648)
+	expect_return_int(t, `x = -2147483647 - 1; return x % -1;`, 0)
+	// Ordinary division is unaffected, including MOO's truncate-toward-zero convention.
+	expect_return_int(t, `return 7 / 2;`, 3)
+	expect_return_int(t, `return -7 / 2;`, -3)
+	expect_return_int(t, `return -7 % 3;`, -1)
+}

@@ -1,5 +1,7 @@
 package values
 
+import "core:sync"
+
 // MOO list operations, ported from src/list.c. MOO-level positions are 1-based (matching
 // the language surface); internally we index into a 0-based Odin slice (pos-1). All `list`
 // (and where noted, `value`/`base`) parameters are *consumed*: ownership transfers in,
@@ -51,7 +53,10 @@ list_append :: proc(list: Var, value: Var) -> Var {
 do_insert :: proc(list: Var, value: Var, pos: int) -> Var {
 	l := list.data.list
 	n := len(l.items)
-	if l.rc == 1 && pos == n + 1 {
+	// Atomic load: the refcount is maintained atomically (see values.odin's Moo_String note).
+	// Reading 1 here still means "this is the only reference", since nobody else holds one to
+	// take a second from.
+	if sync.atomic_load(&l.rc) == 1 && pos == n + 1 {
 		grown := make([]Var, n + 1)
 		copy(grown, l.items)
 		delete(l.items)

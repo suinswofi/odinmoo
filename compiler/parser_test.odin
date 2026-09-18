@@ -1,5 +1,6 @@
 package compiler
 
+import "core:mem"
 import "core:strings"
 import "core:testing"
 
@@ -225,5 +226,63 @@ test_unparse_restores_dollar_sugar :: proc(t: ^testing.T) {
 		testing.expectf(t, strings.trim_space(text) == c[1], "unparse(%s) = %q, want %q", c[0], strings.trim_space(text), c[1])
 		delete(text)
 		result_destroy(&r)
+	}
+}
+
+// Malformed input must be handled without corrupting memory, not merely "report an error".
+// Both of the cases below were real crashes (found by fuzzing the parser under
+// -sanitize:address) and neither needs anything more exotic than a typo in verb code:
+//
+//   - `expect()` used to return the CURRENT token on a mismatch, and callers of
+//     expect(p, .Id) take ownership of the token's string -- so a misplaced string or
+//     identifier was freed twice (see expect's comment in parser.odin).
+//   - parse_program used to read p.lexer.errors AFTER lexer_destroy had freed that array,
+//     which every program with a lexical error reaches.
+//
+// The tracking allocator `odin test` runs under is what actually judges this test: a
+// regression shows up as a double free / bad free / leak report, not as a failed assertion.
+@(test)
+test_malformed_programs_parse_without_memory_errors :: proc(t: ^testing.T) {
+	cases := []string{
+		`'.1'" `, // the original fuzz repro: stray quotes plus an unterminated string
+		`"`, // unterminated string at EOF
+		`"abc`, // unterminated string with content
+		`x."abc";`, // a string where a property name (.Id) is required
+		`x:"abc"();`, // a string where a verb name (.Id) is required
+		`for "s" in (x) endfor`, // a string where a loop variable is required
+		`fork "s" (0) endfork`,
+		`x = "unterminated`,
+		`.`,
+		`$`,
+		`#`,
+		`;;;`,
+		`if`,
+		`while (`,
+		`try except`,
+		"\"a\\", // trailing backslash inside a string
+		`{1,2,3`,
+		`x[1..`,
+	}
+	// Judged by a tracking allocator this test owns, rather than by the one `odin test`
+	// installs: the runner only PRINTS bad frees and leaks, so a regression would scroll past
+	// a green run. These assertions make it an actual failure.
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	track.bad_free_callback = mem.tracking_allocator_bad_free_callback_add_to_array
+	defer mem.tracking_allocator_destroy(&track)
+	context.allocator = mem.tracking_allocator(&track)
+
+	for src in cases {
+		r := parse_program(src, DBV_Float)
+		// No assertion on the outcome: some of these legitimately parse, some report errors.
+		// The point is that destroying the result is safe and balanced.
+		result_destroy(&r)
+	}
+
+	for bf in track.bad_free_array {
+		testing.expectf(t, false, "invalid free of %p from %v", bf.memory, bf.location)
+	}
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "leaked %d bytes from %v", entry.size, entry.location)
 	}
 }

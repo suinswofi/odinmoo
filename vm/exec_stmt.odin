@@ -213,15 +213,22 @@ exec_range_loop :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_Range_Loop) -> Stm
 		ctx.activation.locals[v.var_id] = values.int_val(i)
 
 		r := exec_stmts(ctx, v.body)
-		if r.signal == .Break && (r.loop_name == "" || r.loop_name == loop_name_of(ctx, v.var_id)) {
+		mine := r.loop_name == "" || r.loop_name == loop_name_of(ctx, v.var_id)
+		if r.signal == .Break && mine {
 			return normal_result()
 		}
-		if r.signal == .Continue && (r.loop_name == "" || r.loop_name == loop_name_of(ctx, v.var_id)) {
-			i += 1
-			continue
-		}
-		if r.signal != .Normal {
+		if r.signal != .Normal && !(r.signal == .Continue && mine) {
 			return r
+		}
+		// Terminate on the value rather than by incrementing past it. `to` can be max(i32),
+		// and i32 addition wraps, so the increment after the last iteration used to produce
+		// min(i32) -- still <= to -- and the loop restarted from the bottom of the range and
+		// never finished. `for i in [2147483645..2147483647]`, which the language says runs
+		// exactly three times, ran forever. Not the same thing as this port's documented lack
+		// of a tick budget: that makes an unbounded loop possible, this made a BOUNDED one
+		// non-terminating.
+		if i == to {
+			break
 		}
 		i += 1
 	}

@@ -8,6 +8,7 @@ package vm
 // arithmetic op below requires both operands to already be the same type.
 
 import "../values"
+import "core:sync"
 import "core:math"
 import "core:strings"
 
@@ -76,6 +77,17 @@ do_divide :: proc(a, b: values.Var) -> Op_Result {
 		if b.data.num == 0 {
 			return err_result(.E_DIV)
 		}
+		if a.data.num == min(i32) && b.data.num == -1 {
+			// The one division that is neither zero-divisor nor representable: |INT_MIN| has
+			// no positive counterpart, so INT_MIN / -1 overflows. On x86 that is not a wrong
+			// answer, it is a hardware trap -- the same SIGFPE as dividing by zero -- and it
+			// takes the whole server down, from any MOO expression, with no error to catch.
+			// (The C original divides two ints here and traps identically; there is no
+			// upstream behavior to preserve, only a crash to not reproduce.) Wrapping matches
+			// what this port already does elsewhere at the same boundary: -(-2147483648) and
+			// abs(-2147483648) both yield -2147483648.
+			return ok_result(values.int_val(min(i32)))
+		}
 		return ok_result(values.int_val(a.data.num / b.data.num))
 	}
 	if a.type == .Float {
@@ -98,6 +110,11 @@ do_modulus :: proc(a, b: values.Var) -> Op_Result {
 	if a.type == .Int {
 		if b.data.num == 0 {
 			return err_result(.E_DIV)
+		}
+		if a.data.num == min(i32) && b.data.num == -1 {
+			// Same overflow as in do_divide, same trap on the same instruction -- the
+			// remainder just happens to be the exactly-representable half of the answer.
+			return ok_result(values.int_val(0))
 		}
 		return ok_result(values.int_val(a.data.num % b.data.num))
 	}
@@ -306,7 +323,7 @@ index_set :: proc(base, index, value: values.Var) -> Op_Result {
 		return ok_result(values.str_val(string(buf)))
 	}
 	result := base
-	if base.data.list.rc != 1 {
+	if sync.atomic_load(&base.data.list.rc) != 1 { // atomic: see values.odin's refcount note
 		result = values.var_dup(base)
 		values.free_var(base)
 	}
