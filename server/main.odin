@@ -41,24 +41,28 @@ g_checkpoint_requested: bool
 @(private = "file")
 g_shutdown_requested: bool
 
-// Which file db_disk_size() should measure, and the flag that selects between them. This
-// ports db_file.c's db_disk_size(), which stats input_db_name while dump_generation is 0 and
-// dump_db_name once it isn't: before any checkpoint, the database's most recent full on-disk
-// representation IS the file we loaded.
+// The size db_disk_size() reports: the byte count of the database's most recent full on-disk
+// representation. This ports db_file.c's db_disk_size(), which stats input_db_name while
+// dump_generation is 0 and dump_db_name once it isn't -- before any checkpoint, the most recent
+// full representation IS the file we loaded.
 //
-// The paths are written once, in main(), before anything that could read them exists; the
-// flag is set by the checkpoint writer on a background thread, hence the atomics. It is
-// deliberately set only after a write SUCCEEDS, which differs slightly from the original's
-// dump_generation (bumped when the dump starts). The original can hand out the name of a file
-// its forked child has not finished writing, and stat() then reports a partial size or fails;
-// waiting for success means this always names a file that is actually there, and reports the
-// loaded database in the meantime rather than an error.
+// Kept as a cached COUNT rather than a path to stat on demand, for two reasons. db_disk_size()
+// is dispatched from a MOO task, which holds big_lock: a filesystem syscall there stalls every
+// other task in the server, on a slow or networked filesystem indefinitely. And the obvious
+// implementation (os.stat into context.temp_allocator) leaked, because the threads that run MOO
+// tasks -- forked tasks and connection drain workers -- only reclaim that arena when the thread
+// EXITS, and a forked housekeeping daemon never exits. The server already knows every number it
+// needs: the initial file is stat'd once at startup before any thread exists, and a checkpoint's
+// size is just the length of the buffer it wrote.
+//
+// Updated only after a write SUCCEEDS, which differs slightly from the original's
+// dump_generation (bumped when the dump starts). The original can name a file its forked child
+// has not finished writing, and stat() then reports a partial size or fails; waiting for success
+// means this always reports a file that is really there, and reports the loaded database in the
+// meantime rather than an error. Read and written atomically -- the writer is a background
+// thread, the reader is any MOO task's thread.
 @(private = "file")
-g_initial_db_path: string
-@(private = "file")
-g_checkpoint_db_path: string
-@(private = "file")
-g_checkpoint_written: bool
+g_db_disk_size: i64
 
 @(private = "file")
 on_sigusr2 :: proc "c" (sig: posix.Signal) {
@@ -87,30 +91,22 @@ hook_request_checkpoint :: proc(user_data: rawptr) {
 	sync.atomic_store(&g_checkpoint_requested, true)
 }
 
-// note_checkpoint_written is called by checkpoint.odin once a checkpoint file has actually
-// landed on disk, so db_disk_size() starts measuring it instead of the database we loaded.
-note_checkpoint_written :: proc() {
-	sync.atomic_store(&g_checkpoint_written, true)
+// note_db_written records the size of a database representation that has just landed on disk.
+// Called by checkpoint.odin's writer thread on success, and by main() for the file it loaded.
+note_db_written :: proc(size: i64) {
+	sync.atomic_store(&g_db_disk_size, size)
 }
 
-// hook_db_disk_size backs objdb.Server_Hooks.db_disk_size -- see the globals above for which
-// file it measures and why. A failed stat (the file deleted underneath us, a checkpoint path
-// that was never writable) is reported as "no such representation", which the built-in turns
-// into E_QUOTA exactly as the original does.
+// hook_db_disk_size backs objdb.Server_Hooks.db_disk_size -- see g_db_disk_size above for what
+// it measures and why it is a cached count. Zero means nothing has successfully landed on disk
+// (the initial stat failed), which the built-in turns into E_QUOTA exactly as the original does.
 @(private = "file")
 hook_db_disk_size :: proc(user_data: rawptr) -> (size: i64, ok: bool) {
-	path := g_initial_db_path
-	if sync.atomic_load(&g_checkpoint_written) {
-		path = g_checkpoint_db_path
-	}
-	if len(path) == 0 {
+	n := sync.atomic_load(&g_db_disk_size)
+	if n <= 0 {
 		return 0, false
 	}
-	fi, err := os.stat(path, context.temp_allocator)
-	if err != nil {
-		return 0, false
-	}
-	return fi.size, true
+	return n, true
 }
 
 main :: proc() {
@@ -126,9 +122,6 @@ main :: proc() {
 	}
 	initial_db_path := args[0]
 	checkpoint_db_path := args[1]
-	// Recorded before anything that could ask for them is running -- see the globals above.
-	g_initial_db_path = initial_db_path
-	g_checkpoint_db_path = checkpoint_db_path
 	port := DEFAULT_PORT
 	if len(args) >= 3 {
 		if p, ok := strconv.parse_int(args[2], 10); ok {
@@ -144,6 +137,12 @@ main :: proc() {
 	}
 	defer dbfile.database_destroy(&db)
 	fmt.printfln("LOADING: done -- %d objects, %d users", len(db.objects), len(db.users))
+
+	// The database's on-disk representation is the file we just loaded, until a checkpoint
+	// replaces it. Stat'd once, here, before any other thread exists -- see g_db_disk_size.
+	if fi, serr := os.stat(initial_db_path, context.temp_allocator); serr == nil {
+		note_db_written(fi.size)
+	}
 
 	sched := tasks.scheduler_init()
 	defer tasks.scheduler_destroy(&sched)
@@ -201,9 +200,6 @@ main :: proc() {
 	sync.mutex_lock(&sched.big_lock)
 	ok := dbfile.save_database(&db, checkpoint_db_path)
 	sync.mutex_unlock(&sched.big_lock)
-	if ok {
-		note_checkpoint_written()
-	}
 	fmt.printfln("DUMPING: %s", ok ? "done" : "FAILED")
 	fmt.println("DONE")
 }

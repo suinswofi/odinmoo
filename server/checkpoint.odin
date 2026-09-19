@@ -82,9 +82,11 @@ checkpoint_writer_proc :: proc(data: rawptr) {
 		fmt.eprintfln("CHECKPOINT: writing %s FAILED: %v", job.path, werr)
 	} else {
 		fmt.printfln("CHECKPOINT: finished writing %s", job.path)
-		// Only now does the checkpoint become the database's on-disk representation, which
-		// is what db_disk_size() reports on (main.odin's g_checkpoint_written).
-		note_checkpoint_written()
+		// Only now does the checkpoint become the database's on-disk representation, which is
+		// what db_disk_size() reports on (main.odin's g_db_disk_size). The byte count is just
+		// the buffer we wrote -- no stat needed, and none wanted: db_disk_size() is called from
+		// MOO tasks holding big_lock.
+		note_db_written(i64(len(job.data)))
 	}
 }
 
