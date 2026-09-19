@@ -115,12 +115,24 @@ Two structural points that are easy to violate by accident:
 
   Where there is no *legitimate* depth to cut off, the answer is an explicit heap stack
   rather than another tuned constant — the descendant-tree walks
-  (`objdb.property_defined_at_or_below`, `prop_resync`'s `snapshot_subtree` and
+  (`objdb.property_defined_at_or_below`, `prop_resync`'s `collect_layouts` and
   `resync_subtree_propvals`) are iterative for exactly that reason: object-tree depth is
   bounded only by the object count, and `create()` in a loop builds it. The same question
   applies to recursion reached through *dispatch* rather than through a parser:
   `call_function("call_function", …)` re-entered `bf_call_function` once per leading name,
   charging no tick and passing no `MAX_VERB_DEPTH` check, so it unwraps its chain in a loop.
+
+  **Moving a walk off the native stack removes the crash, not the cost.** Depth that is no
+  longer stack frames is still depth, and if each node re-derives from the root what the walk
+  already has in hand, the input that used to segfault now wedges the server instead — which
+  is the worse failure, because nothing reports it. `prop_resync` did exactly that: every
+  node's property layout was recomputed by walking that node's ancestor chain to the root,
+  making `add_property`/`delete_property`/`chparent`/`recycle` O(subtree depth²) — 6.8s at
+  depth 16000 and **121s at 64000**, inside a built-in, with `big_lock` held and one tick
+  charged. `collect_layouts` carries the parent's layout down the walk instead
+  (`layout(child) == child.propdefs ++ layout(parent)`), which is linear in the subtree's
+  total propdefs. Whenever one of these walks changes, ask what each node recomputes that its
+  parent already computed.
 - **Tasks are real OS threads, not a cooperative single-threaded loop with snapshotted activation
   stacks.** A single `Scheduler.big_lock` mutex guarantees only one task actively touches the object
   DB at a time, preserving the original's effective single-writer semantics. Anything touching the

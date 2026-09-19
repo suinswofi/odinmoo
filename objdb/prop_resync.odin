@@ -49,11 +49,7 @@ Prop_Layout_Snapshot :: struct {
 // before the propdef/parent-link mutation whose effects resync_subtree_propvals will later
 // reconcile.
 prop_layout_snapshot :: proc(db: ^dbfile.Database, oid: values.Objid) -> Prop_Layout_Snapshot {
-	snap := Prop_Layout_Snapshot {
-		layouts = make(map[values.Objid][dynamic]Prop_Key),
-	}
-	snapshot_subtree(db, oid, &snap)
-	return snap
+	return Prop_Layout_Snapshot{layouts = collect_layouts(db, oid)}
 }
 
 prop_layout_snapshot_destroy :: proc(snap: ^Prop_Layout_Snapshot) {
@@ -63,31 +59,90 @@ prop_layout_snapshot_destroy :: proc(snap: ^Prop_Layout_Snapshot) {
 	delete(snap.layouts)
 }
 
-// Iterative for the same reason object_crud.odin's property_defined_at_or_below is: the
-// descendant tree's depth is bounded only by the object count, and this port runs recursion on
-// the native stack, where that is a segfault rather than a growable array. Visit order does
-// not matter here -- each object's layout is recorded independently.
+// layout_extend builds one object's layout from its parent's already-computed one. The
+// order prop_layout produces is self-first, root-last, so this is exactly
+// `own propdefs ++ parent's layout` -- see collect_layouts for why that identity is the
+// whole point.
 @(private = "file")
-snapshot_subtree :: proc(db: ^dbfile.Database, oid: values.Objid, snap: ^Prop_Layout_Snapshot) {
-	stack: [dynamic]values.Objid
+layout_extend :: proc(oid: values.Objid, propdefs: []dbfile.Propdef, parent_layout: []Prop_Key) -> [dynamic]Prop_Key {
+	layout := make([dynamic]Prop_Key, 0, len(propdefs) + len(parent_layout))
+	for pd in propdefs {
+		append(&layout, Prop_Key{definer = oid, name = pd.name})
+	}
+	append(&layout, ..parent_layout)
+	return layout
+}
+
+// collect_layouts computes the property layout of `oid` and every descendant, in one pass.
+//
+// Iterative, for the same reason object_crud.odin's property_defined_at_or_below is: the
+// descendant tree's depth is bounded only by the object count, and this port runs recursion
+// on the native stack, where that is a segfault rather than a growable array.
+//
+// And INCREMENTAL, which is the other half. The obvious spelling calls prop_layout(db, id)
+// per node, and prop_layout walks that node's ancestor chain all the way to the root -- so
+// over a subtree that is a chain d objects deep it does O(d^2) work, essentially all of it
+// redundant. Measured on add_property before this changed: 31ms at depth 1000, 428ms at
+// 4000, 6.8s at 16000, 121s at 64000. Every one of those seconds is spent inside a built-in
+// holding big_lock, where nothing can preempt it: a tick is charged BETWEEN statements
+// (vm/budget.odin), so neither the tick count nor the wall-clock deadline is reachable while
+// one built-in runs, and kill_task() only reaches SUSPENDED tasks. A deep tree is ordinary
+// MOO -- create() in a loop -- so that was the "a built-in must do work bounded by its
+// inputs" rule in CLAUDE.md broken, straight through the budget.
+//
+// The walk is already top-down, so the parent's layout is in hand by the time a child is
+// reached, and layout(child) == child.propdefs ++ layout(parent). Carrying it down makes the
+// whole pass O(total propdefs in the subtree) instead. Only the subtree ROOT still walks to
+// the root the long way: its ancestors lie outside the subtree, so there is nothing cached
+// to build on.
+//
+// (The worst case is still quadratic when EVERY object in the chain defines its own propdef,
+// because then each node's layout is itself O(d) entries long -- but that is O(d^2) of
+// genuine output rather than redundant walking, and it is bounded by the same thing the
+// propvals arrays themselves are.)
+@(private = "file")
+collect_layouts :: proc(db: ^dbfile.Database, oid: values.Objid) -> map[values.Objid][dynamic]Prop_Key {
+	Frame :: struct {
+		id:         values.Objid,
+		parent:     values.Objid,
+		has_parent: bool,
+	}
+	layouts := make(map[values.Objid][dynamic]Prop_Key)
+	stack: [dynamic]Frame
 	defer delete(stack)
-	append(&stack, oid)
+	append(&stack, Frame{id = oid})
 	for len(stack) > 0 {
-		id := pop(&stack)
-		obj, ok := db.objects[id]
+		f := pop(&stack)
+		obj, ok := db.objects[f.id]
 		if !ok {
 			continue
 		}
-		snap.layouts[id] = prop_layout(db, id)
+		// Build on the cached parent layout only when this really is that parent's child.
+		// The walk follows child/sibling links, and dbfile/validate.odin proves those
+		// terminate but not that they agree with each child's own `parent` field -- so on a
+		// hand-edited .db they can disagree, and the full walk is what stays correct.
+		layout: [dynamic]Prop_Key
+		if cached, cok := layouts[obj.parent]; f.has_parent && obj.parent == f.parent && cok {
+			layout = layout_extend(f.id, obj.propdefs[:], cached[:])
+		} else {
+			layout = prop_layout(db, f.id)
+		}
+		// Same caveat, one step further: nothing proves an object appears in only ONE child
+		// list, and revisiting it would drop the layout recorded the first time on the floor.
+		if previous, seen := layouts[f.id]; seen {
+			delete(previous)
+		}
+		layouts[f.id] = layout
 		for c := obj.child; c != values.NOTHING; {
 			child, cok := db.objects[c]
 			if !cok {
 				break
 			}
-			append(&stack, c)
+			append(&stack, Frame{id = c, parent = f.id, has_parent = true})
 			c = child.sibling
 		}
 	}
+	return layouts
 }
 
 // prop_layout walks the ancestor chain in exactly the order find_property (property.odin)
@@ -118,23 +173,52 @@ prop_layout :: proc(db: ^dbfile.Database, oid: values.Objid) -> [dynamic]Prop_Ke
 // prop_layout_snapshot) before the change that prompted this call. `default_owner` is used for
 // any brand new (never-before-seen) slot an object picks up as a result of the change.
 //
-// Iterative over an explicit stack, like snapshot_subtree above and for the same reason. The
-// order it produces is still strictly PARENT-BEFORE-CHILD, which this walk (unlike the
-// snapshot's) actually depends on: resync_one reads the parent's propvals via
-// parent_propval_index to inherit permission bits, so an object must be rebuilt before any of
-// its descendants are. Pushing a node's children only after resyncing that node preserves
-// exactly that; sibling order among them is irrelevant.
+// Iterative over an explicit stack, like collect_layouts above and for the same reason. The
+// order it produces is strictly PARENT-BEFORE-CHILD, which this walk (unlike the snapshot's)
+// actually depends on: resync_one reads the parent's propvals via parent_propval_index to
+// inherit permission bits, so an object must be rebuilt before any of its descendants are.
+// Pushing a node's children only after resyncing that node preserves exactly that; sibling
+// order among them is irrelevant.
 resync_subtree_propvals :: proc(db: ^dbfile.Database, oid: values.Objid, default_owner: values.Objid, snap: ^Prop_Layout_Snapshot) {
+	// The layout every object in this subtree must END UP with, computed once, up front, in
+	// a single incremental pass. resync_one used to derive its own -- and its parent's --
+	// by walking to the root per node, which made this whole call quadratic in the subtree's
+	// depth (see collect_layouts). Precomputing is safe because resync_one rewrites propvals
+	// only: it never touches a propdef or a parent/child link, so no layout can go stale
+	// underneath this walk.
+	new_layouts := collect_layouts(db, oid)
+	defer {
+		for _, layout in new_layouts {
+			delete(layout)
+		}
+		delete(new_layouts)
+	}
+
 	stack: [dynamic]values.Objid
 	defer delete(stack)
 	append(&stack, oid)
 	for len(stack) > 0 {
 		id := pop(&stack)
-		resync_one(db, id, default_owner, snap)
 		obj, ok := db.objects[id]
 		if !ok {
 			continue
 		}
+		// Both lookups miss at most once per call, and the misses are filled into the same
+		// map so the fallback walk can never repeat: `id` is missing only if collect_layouts
+		// somehow failed to reach a node this identical walk does, and the PARENT is missing
+		// exactly for the subtree root, whose parent lies outside the subtree.
+		layout, have_layout := new_layouts[id]
+		if !have_layout {
+			layout = prop_layout(db, id)
+			new_layouts[id] = layout
+		}
+		parent_layout, have_parent := new_layouts[obj.parent]
+		if !have_parent && obj.parent != values.NOTHING {
+			parent_layout = prop_layout(db, obj.parent)
+			new_layouts[obj.parent] = parent_layout
+		}
+
+		resync_one(db, id, default_owner, snap, layout[:], parent_layout[:])
 		for c := obj.child; c != values.NOTHING; {
 			child, cok := db.objects[c]
 			if !cok {
@@ -147,7 +231,14 @@ resync_subtree_propvals :: proc(db: ^dbfile.Database, oid: values.Objid, default
 }
 
 @(private = "file")
-resync_one :: proc(db: ^dbfile.Database, oid: values.Objid, default_owner: values.Objid, snap: ^Prop_Layout_Snapshot) {
+resync_one :: proc(
+	db: ^dbfile.Database,
+	oid: values.Objid,
+	default_owner: values.Objid,
+	snap: ^Prop_Layout_Snapshot,
+	new_layout: []Prop_Key,
+	parent_layout: []Prop_Key,
+) {
 	obj, ok := db.objects[oid]
 	if !ok {
 		return
@@ -178,11 +269,9 @@ resync_one :: proc(db: ^dbfile.Database, oid: values.Objid, default_owner: value
 	// (JHCore's $quota_utils:charge_quota reads <new object>.object_size, defined "r" on an
 	// ancestor, and gets E_PERM -- aborting the whole create, and with it the connect path
 	// that creates an MCP session).
-	parent_slots := parent_propval_index(db, oid)
+	parent_slots := parent_propval_index(db, oid, parent_layout)
 	defer delete(parent_slots)
 
-	new_layout := prop_layout(db, oid)
-	defer delete(new_layout)
 	new_propvals := make([dynamic]dbfile.Propval, 0, len(new_layout))
 	for key in new_layout {
 		if pv, found := surviving[key]; found {
@@ -205,9 +294,11 @@ resync_one :: proc(db: ^dbfile.Database, oid: values.Objid, default_owner: value
 
 // parent_propval_index maps each property in `oid`'s parent's layout to that parent's
 // propval slot, so fresh_propval can find the Pval to inherit permissions from. Empty map
-// when there's no (valid) parent.
+// when there's no (valid) parent. `parent_layout` is the parent's CURRENT layout, handed in
+// by the caller rather than recomputed here -- resync_subtree_propvals already has it, and
+// walking to the root for it once per node is what made that call quadratic.
 @(private = "file")
-parent_propval_index :: proc(db: ^dbfile.Database, oid: values.Objid) -> map[Prop_Key]int {
+parent_propval_index :: proc(db: ^dbfile.Database, oid: values.Objid, parent_layout: []Prop_Key) -> map[Prop_Key]int {
 	index := make(map[Prop_Key]int)
 	obj, ok := db.objects[oid]
 	if !ok || obj.parent == values.NOTHING {
@@ -217,9 +308,7 @@ parent_propval_index :: proc(db: ^dbfile.Database, oid: values.Objid) -> map[Pro
 	if !pok {
 		return index
 	}
-	layout := prop_layout(db, obj.parent)
-	defer delete(layout)
-	for key, i in layout {
+	for key, i in parent_layout {
 		if i < len(parent.propvals) {
 			index[key] = i
 		}
