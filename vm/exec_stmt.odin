@@ -167,8 +167,13 @@ loop_name_of :: proc(ctx: ^Eval_Context, var_id: int) -> string {
 	return ctx.names.names[var_id]
 }
 
-// exec_list_loop ports STMT_LIST (`for x in (list_or_str) ... endfor`; MOO's `for` also
-// accepts a string here, iterating its characters).
+// exec_list_loop ports STMT_LIST (`for x in (list) ... endfor`).
+//
+// A LIST, and nothing else: "The expression is evaluated and should return a list; if it does
+// not, E_TYPE is raised" (Programmer's Manual, 4.1.2). This used to also accept a string and
+// iterate its characters, described in a comment here as MOO behaviour -- it is not, it is a
+// Stunt/ToastStunt extension, and accepting it silently turned code that should have raised
+// E_TYPE on an unexpected string into code that quietly looped over its bytes.
 @(private = "file")
 exec_list_loop :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_List_Loop) -> Stmt_Result {
 	list_r := eval_expr(ctx, v.list)
@@ -177,31 +182,17 @@ exec_list_loop :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_List_Loop) -> Stmt_
 	}
 	defer values.free_var(list_r.value)
 
-	n: int
-	#partial switch list_r.value.type {
-	case .List:
-		n = values.list_len(list_r.value)
-	case .Str:
-		n = len(list_r.value.data.str.s)
-	case:
-		return raised_stmt(.E_TYPE, "List or string required")
+	if list_r.value.type != .List {
+		return raised_stmt(.E_TYPE, "List required")
 	}
+	n := values.list_len(list_r.value)
 
 	for i in 1 ..= n {
 		if r, exhausted := charge_iteration(ctx); exhausted {
 			return r
 		}
-		item: values.Var
-		if list_r.value.type == .List {
-			item = values.var_ref(values.list_get(list_r.value, i))
-		} else {
-			// str_val takes OWNERSHIP and free_var will delete() the string -- handing it
-			// a borrowed slice into the loop subject corrupts the heap (freeing an interior
-			// pointer, or the subject's own buffer for i == 1). Must clone.
-			item = values.str_val(strings.clone(list_r.value.data.str.s[i - 1:i]))
-		}
 		values.free_var(ctx.activation.locals[v.var_id])
-		ctx.activation.locals[v.var_id] = item
+		ctx.activation.locals[v.var_id] = values.var_ref(values.list_get(list_r.value, i))
 
 		r := exec_stmts(ctx, v.body)
 		if r.signal == .Break && (r.loop_name == "" || r.loop_name == loop_name_of(ctx, v.var_id)) {

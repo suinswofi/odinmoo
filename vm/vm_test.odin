@@ -627,3 +627,20 @@ test_budget_leaves_ordinary_work_alone :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, r.signal == .Return)
 }
+
+// ---- Regression: `for x in (expr)` requires a LIST ----
+//
+// "The expression is evaluated and should return a list; if it does not, E_TYPE is raised"
+// (Programmer's Manual, 4.1.2). This used to also accept a string and iterate its bytes -- a
+// Stunt/ToastStunt extension that a comment here wrongly described as MOO behaviour. Accepting
+// it turned code that should have raised E_TYPE on an unexpected string into code that quietly
+// looped over its characters instead.
+@(test)
+test_for_list_loop_requires_a_list :: proc(t: ^testing.T) {
+	expect_raised(t, `for c in ("abc") endfor return 1;`, .E_TYPE)
+	expect_raised(t, `for c in (17) endfor return 1;`, .E_TYPE)
+	expect_raised(t, `for c in (#3) endfor return 1;`, .E_TYPE)
+	// A list still iterates, and an empty one is not an error.
+	expect_return_int(t, `n = 0; for x in ({4, 5, 6}) n = n + x; endfor return n;`, 15)
+	expect_return_int(t, `n = 7; for x in ({}) n = 0; endfor return n;`, 7)
+}
