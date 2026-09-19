@@ -148,7 +148,18 @@ save_database_bytes :: proc(db: ^Database) -> []byte {
 	fmt.sbprintfln(&w.b, "** LambdaMOO Database, Format Version %d **", db.version)
 
 	nprogs := 0
-	max_oid := values.Objid(-1)
+	// Seeded from db.max_oid -- the highest id ever ASSIGNED -- not just from the ids still
+	// live, and that distinction is the whole reason `#N recycled` records exist in the
+	// format. Recomputing the ceiling from db.objects alone silently dropped every hole above
+	// the last surviving object, so a checkpoint written after recycling the top object came
+	// back with a LOWER max_object() and create() handed that number straight out again.
+	// (Reproduced: recycle #97, max_object() is #97 in memory and #96 after save+reload, and
+	// the next create() returns #97.) The Programmer's Manual is explicit -- "no object number
+	// is ever reused, even if the object with that number is recycled" -- and the reason is
+	// that any `#97` still stored in a property would otherwise start naming an unrelated new
+	// object. The live scan below still runs, so a hand-built Database whose max_oid was never
+	// maintained is covered too.
+	max_oid := db.max_oid
 	for oid, obj in db.objects {
 		if oid > max_oid {
 			max_oid = oid

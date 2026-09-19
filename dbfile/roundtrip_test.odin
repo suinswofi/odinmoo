@@ -74,3 +74,41 @@ test_save_and_reload_lambdacore_db :: proc(t: ^testing.T) {
 		}
 	}
 }
+
+// ---- Regression: a checkpoint must preserve the recycled-object ceiling ----
+//
+// save_database_bytes recomputed the object ceiling by scanning the LIVE objects, so every
+// `#N recycled` hole above the last surviving object silently vanished from the file. The
+// visible effect was object-number REUSE: recycle the highest object, checkpoint, restart, and
+// create() hands that same number straight back out -- so any `#N` still stored in a property
+// starts naming an unrelated new object. The Programmer's Manual is explicit that this must
+// never happen ("no object number is ever reused, even if the object with that number is
+// recycled"). Reproduced against a real core before the fix: max_object() #97 in memory, #96
+// after save+reload, next create() returns #97.
+//
+// Bumping max_oid is exactly the state recycle() leaves behind -- ids used, objects gone --
+// without needing to tear down real objects to get there.
+@(test)
+test_save_preserves_recycled_object_ceiling :: proc(t: ^testing.T) {
+	db1, lerr1 := load_database("LambdaCore.db")
+	testing.expectf(t, lerr1.stage == "", "load failed: %v", lerr1)
+	defer database_destroy(&db1)
+
+	live := len(db1.objects)
+	db1.max_oid += 5 // five object numbers used and then recycled
+
+	data := save_database_bytes(&db1)
+	defer delete(data)
+	db2, lerr2 := load_database_bytes(data)
+	defer database_destroy(&db2)
+	testing.expectf(t, lerr2.stage == "", "reload failed: %v", lerr2)
+
+	testing.expectf(
+		t,
+		db2.max_oid == db1.max_oid,
+		"max_oid %d -> %d: trailing recycled holes were dropped, so create() will reuse ids",
+		db1.max_oid,
+		db2.max_oid,
+	)
+	testing.expectf(t, len(db2.objects) == live, "live object count changed: %d -> %d", live, len(db2.objects))
+}
