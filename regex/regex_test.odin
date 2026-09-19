@@ -2,6 +2,7 @@ package regex
 
 import "core:strings"
 import "core:testing"
+import "core:time"
 
 @(test)
 test_literal_match :: proc(t: ^testing.T) {
@@ -205,4 +206,43 @@ test_long_subject_with_groups_reports_correct_offsets :: proc(t: ^testing.T) {
 	testing.expect(t, res.start == 0 && res.end == 5_004)
 	testing.expect(t, res.groups[0] == [2]int{0, 5_000})
 	testing.expect(t, res.groups[1] == [2]int{5_000, 5_003})
+}
+
+// MAX_STEPS is a budget for one whole match() call, not for one start position. When
+// runner_reset zeroed it per attempt, the real ceiling was len(subject) x MAX_STEPS and a
+// catastrophically-backtracking pattern took 52 SECONDS on a 2000-byte subject -- one tick, with
+// big_lock held. A length-scaling timing test would be flaky, so this pins the property that
+// makes the timing impossible instead: work must not scale with the subject once the budget is
+// spent. Both subjects below exhaust it; if the counter is reset per attempt, the second takes
+// ~8x the first and the assertion on their ratio fails.
+@(test)
+test_step_budget_is_per_call_not_per_start_position :: proc(t: ^testing.T) {
+	pattern :: "%(a*%)*b"
+	elapsed :: proc(subject_len: int) -> time.Duration {
+		prog, ok := compile(pattern)
+		defer program_destroy(&prog)
+		if !ok {
+			return 0
+		}
+		subject := strings.repeat("a", subject_len)
+		defer delete(subject)
+		start := time.tick_now()
+		res := match_pattern(&prog, subject, false, true)
+		_ = res
+		return time.tick_since(start)
+	}
+	// Deliberately small. Both lengths exhaust the budget, so with the fix both cost the same
+	// (~one MAX_STEPS run); without it the longer one pays that cost once per start position.
+	// Kept small so a regression FAILS in seconds rather than hanging the suite.
+	short := elapsed(25)
+	long := elapsed(200)
+	// 8x the subject must not mean ~8x the work. Generous factor so this can't flake on a
+	// loaded machine while still failing loudly on a per-attempt reset.
+	testing.expectf(
+		t,
+		long < short * 4 + 50 * time.Millisecond,
+		"work scaled with subject length: 25 bytes took %v, 200 bytes took %v -- MAX_STEPS is being reset per start position rather than per call",
+		short,
+		long,
+	)
 }

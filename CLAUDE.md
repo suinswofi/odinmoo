@@ -129,6 +129,23 @@ Two structural points that are easy to violate by accident:
   renewed when it comes back from `suspend()`/`read()`. `ticks_left()`/`seconds_left()` report
   against it truthfully, which is what makes core code's `$command_utils:suspend_if_needed()`
   work; they used to return constants.
+
+  **What the budget does NOT bound is a single statement**, and this was overstated in
+  `vm/budget.odin` until an audit caught it. A charge happens only *between* statements, so
+  neither the tick count nor the `MAX_SECONDS` deadline is reachable while one built-in runs. The
+  regex engine used to reset its step budget once per start position, which made a single
+  `match()` cost `len(subject) × MAX_STEPS` — 52 seconds on a 2000-byte subject, one tick, with
+  `big_lock` held — i.e. exactly the server-wedging the budget exists to prevent, straight
+  through it. **A built-in must do work bounded by its inputs** (which are themselves bounded by
+  `MAX_STR_LEN`/`MAX_LIST_LEN`); one that loops on its own recognizance needs its own internal
+  ceiling, like `regex.MAX_STEPS`, and that ceiling must be per-call.
+
+  Two further consequences, both deliberate: a budget abort does **not** run `try ... finally`
+  handlers (so core invariants restored that way are not restored — running them is impossible,
+  the task is already out of budget), and `budget_renew` resets exhaustion rather than topping it
+  up, so a task that calls `suspend()` can never be killed by the budget. Also note that truthful
+  `ticks_left()` means LambdaCore's `suspend_if_needed` now actually fires, and it backs off by
+  measured lag — up to a 10-second pause per yield, where before it never fired at all.
 - **Values are bounded in size and nesting depth** (`values.MAX_VALUE_DEPTH`, `MAX_LIST_LEN`,
   `MAX_STR_LEN`), enforced where values are *built* — the list literal in `eval_args_as_list`,
   `index_set`/`range_set`, and `listappend`/`listinsert`/`listset`/`setadd`. Depth is cached on

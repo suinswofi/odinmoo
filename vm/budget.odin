@@ -27,17 +27,39 @@ package vm
 // and its callers), and a budget generous enough to be invisible to correct code is the
 // right direction to err in.
 //
-// MAX_SECONDS is the real backstop, and the reason a tick count alone is not enough: a
-// single statement can legitimately be slow (a large listappend, a regex over a long string),
-// so a task that is charged few ticks can still hold the lock for a long time. The deadline
-// is checked every CLOCK_CHECK_TICKS statements rather than on every one, because time.now()
-// is a syscall-ish read and the tick counter is not.
+// MAX_SECONDS is the second half of the budget, and its limits must be stated honestly because
+// an earlier version of this comment overstated them. It is checked every CLOCK_CHECK_TICKS
+// charges -- and a charge only happens BETWEEN statements, so the deadline is unreachable while
+// a single built-in runs. It therefore bounds a task that executes many slow statements; it does
+// NOT bound one statement that is slow by itself.
+//
+// That distinction was not academic. The regex engine used to reset its step budget once per
+// start position, so a single match() cost len(subject) x MAX_STEPS -- 52 seconds for a
+// 2000-byte subject, charged one tick, with big_lock held throughout, which is precisely the
+// server-wedging this file exists to prevent. The fix was in regex.odin (the budget is now
+// per-call), not here. The invariant to preserve when adding a built-in: it must do work
+// bounded by its inputs, and its inputs are bounded by values.MAX_STR_LEN / MAX_LIST_LEN. A
+// built-in that can loop on its own recognizance needs its own internal ceiling.
 //
 // An exhausted budget aborts the task UNCATCHABLY (Error_Info.uncatchable, honored by
 // exec_try_except/exec_try_finally). That is not fastidiousness about matching the original,
 // which aborts the whole task rather than raising anything: a catchable abort would be
 // useless here, since `while (1) try x = 1; except (ANY) endtry endwhile` would swallow it
 // and keep the lock exactly as before.
+//
+// Two consequences of that, both deliberate and neither free:
+//
+//   - `try ... finally` handlers do NOT run on a budget abort (exec_try_finally). Core code
+//     uses finally to restore set_task_perms, locks and "in use" flags, and those are left
+//     unrestored. Running the handler is not an option -- the task is already out of budget, so
+//     every statement in it re-aborts and a loop in it would spin -- and the original doesn't
+//     face the question at all, because it kills an out-of-ticks task where it stands with no
+//     unwind. Skipping is the closest available behaviour, not a costless one.
+//   - budget_renew resets exhaustion completely rather than topping the allowance up, so a task
+//     that calls suspend() can never be terminated by the budget: `while (1) suspend(0);
+//     endwhile` runs forever. That matches the original, where a resumed task is requeued as a
+//     new background task with a full budget of its own, and it is safe here for the reason the
+//     budget exists at all -- a suspended task is not holding big_lock.
 
 import "../values"
 import "core:strings"

@@ -397,9 +397,17 @@ runner_destroy :: proc(r: ^Runner) {
 }
 
 // runner_reset clears the per-attempt state before trying a new start position.
+//
+// It deliberately does NOT reset `steps`. MAX_STEPS is a budget for one whole match() call, not
+// for one start position: match_pattern tries every start position in the subject, so zeroing
+// the counter here made the real ceiling len(subject) x MAX_STEPS. That is not a tighter-than-
+// necessary limit, it is no limit at all -- a 2000-byte subject against `%(a*%)*b` took 52
+// SECONDS, and an 8000-byte one had not finished after two minutes. The task budget cannot
+// catch it either: budget_charge (vm/budget.odin) only runs between statements, so the whole
+// call is one tick with big_lock held the entire time. Carrying the count across attempts puts
+// the worst case back at MAX_STEPS total, which is milliseconds.
 @(private = "file")
 runner_reset :: proc(r: ^Runner) {
-	r.steps = 0
 	for i in 0 ..< len(r.loop_entry) {
 		r.loop_entry[i] = -1
 	}
@@ -410,8 +418,10 @@ runner_reset :: proc(r: ^Runner) {
 	}
 }
 
+// MAX_STEPS is the backtracking budget for one entire match()/rmatch()/substitute() call --
+// see runner_reset for why "one call" rather than "one start position" is the load-bearing part.
 @(private = "file")
-MAX_STEPS :: 2_000_000 // backtracking budget: bounds pathological patterns instead of hanging
+MAX_STEPS :: 2_000_000
 
 // MAX_BACKTRACK bounds how many pending alternatives run() will hold at once. Like MAX_STEPS
 // it's a give-up-and-report-no-match valve for pathological inputs, bounding memory rather than
