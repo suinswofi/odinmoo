@@ -94,6 +94,13 @@ Connection :: struct {
 	out_lock:    sync.Mutex,
 	out_cond:    sync.Cond, // signaled on new output and on out_closing
 	out_buf:     [dynamic]byte,
+	// Bytes the writer thread has taken out of out_buf but not yet handed to the socket. The
+	// writer swaps the buffer out and then sends with NO lock held (see output_writer_proc), so
+	// out_buf alone is 0 for the whole duration of a blocking send -- which is exactly the
+	// stalled-client case buffered_output_length() exists to observe. Without this, that
+	// built-in reported "nothing queued" precisely when the backlog was largest, and JHCore's
+	// #210:close_safe drain loop closed the connection on its first poll. Guarded by out_lock.
+	out_in_flight: int,
 	out_closing: bool, // writer flushes what it has and exits; enqueues become no-ops
 	out_done:    sync.Wait_Group, // signaled when the writer thread has exited
 }
@@ -113,7 +120,11 @@ MAX_QUEUED_OUTPUT :: 65536
 //
 //  - the partial line being accumulated in connection_read_loop: bytes with no '\n' in
 //    them are just appended, so a client that never sends a newline could grow one
-//    connection's buffer until the process ran out of memory.
+//    connection's buffer until the process ran out of memory. The count is of RAW bytes
+//    received, which includes the '\r' of a "\r\n" terminator even though trim_right strips
+//    it -- so a CRLF client's longest accepted line is one byte shorter than an LF client's.
+//    That is deliberate: counting anything other than the bytes actually buffered would mean
+//    a client could send unbounded '\r's without ever being charged for them.
 //  - a connection's pending_lines queue (input_queue.odin): lines arrive on the recv
 //    thread and are dispatched by a drain worker, so a client sending faster than its
 //    commands execute -- or one that simply sets "hold-input" and then types -- grows the
@@ -165,11 +176,17 @@ output_writer_proc :: proc(data: rawptr) {
 		}
 		conn.out_buf, local = local, conn.out_buf
 		closing := conn.out_closing
+		// Taken out of out_buf but not yet sent -- keep it visible to
+		// buffered_output_length() while the send below runs unlocked.
+		conn.out_in_flight = len(local)
 		sync.mutex_unlock(&conn.out_lock)
 
 		if len(local) > 0 {
 			_, serr := net.send_tcp(conn.socket, local[:])
 			clear(&local)
+			sync.mutex_lock(&conn.out_lock)
+			conn.out_in_flight = 0
+			sync.mutex_unlock(&conn.out_lock)
 			if serr != nil {
 				// Socket dead (or shutdown() from teardown unblocked us). Stop accepting
 				// output and exit; the recv loop notices the death independently.

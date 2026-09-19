@@ -114,6 +114,18 @@ deliver :: proc(conn: ^Connection, line: string, at_front: bool, from_other_thre
 	}
 	hold := values.is_true(conn.options["hold-input"])
 	if hold || from_other_thread {
+		if len(line) > MAX_QUEUED_INPUT {
+			// One line bigger than the whole queue's budget. The socket path cannot produce this
+			// -- connection_read_loop caps a line as it is read, and says so with a distinct
+			// notice -- so force_input() is the only way here; it clones an
+			// arbitrary MOO string, and queueing it would leave pending_bytes permanently over
+			// the cap -- every subsequent line the player typed would then flush the queue and
+			// blame them for it. Drop it instead, so pending_bytes <= MAX_QUEUED_INPUT always.
+			delete(line)
+			sync.mutex_unlock(&conn.io_lock)
+			send_line(conn, ">> Forced input line too long: discarded <<")
+			return
+		}
 		if conn.pending_bytes + len(line) > MAX_QUEUED_INPUT {
 			// The queue has outrun whatever is meant to be draining it: a client typing
 			// faster than its commands run, one that set "hold-input" and then kept typing,

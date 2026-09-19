@@ -730,3 +730,106 @@ thread_safe_allocator :: proc(mu: ^mem.Mutex_Allocator) -> mem.Allocator {
 	mem.mutex_allocator_init(mu, context.allocator)
 	return mem.mutex_allocator(mu)
 }
+
+// MAX_QUEUED_INPUT and the `overlong` state machine in connection_read_loop had no test at all,
+// and they are the one piece of new state an UNAUTHENTICATED peer can drive: a client that
+// never sends a newline used to grow a connection's buffer until the process ran out of memory.
+// This drives it over the socket, the way a real client would.
+@(test)
+test_overlong_input_line_is_discarded_and_connection_survives :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
+	db := build_login_db()
+	defer dbfile.database_destroy(&db)
+
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := objdb.object_world_init(&db, &sched)
+	defer objdb.object_world_destroy(&ow)
+	world := objdb.make_world(&ow)
+
+	s: Server
+	wire_connection_hooks(&ow, &s)
+	err := server_start(&s, 0, &sched, &world, net.IP4_Loopback)
+	testing.expectf(t, err == nil, "server_start: %v", err)
+	defer server_stop(&s)
+
+	endpoint, eerr := net.bound_endpoint(s.listener)
+	testing.expectf(t, eerr == nil, "bound_endpoint: %v", eerr)
+	sock, derr := net.dial_tcp_from_endpoint(endpoint)
+	testing.expectf(t, derr == nil, "dial: %v", derr)
+	defer net.close(sock)
+	client := client_init(sock)
+	defer client_destroy(&client)
+
+	banner := recv_line(t, &client)
+	defer delete(banner)
+	log_in(t, &client)
+
+	// Well past the cap, with no newline anywhere in it -- the shape that was unbounded.
+	blob := strings.repeat("A", MAX_QUEUED_INPUT + 4096)
+	defer delete(blob)
+	net.send_tcp(client.sock, transmute([]byte)blob)
+	send_cmd(&client, "") // the newline that terminates the over-long line
+
+	notice := recv_line(t, &client)
+	defer delete(notice)
+	// Specifically the READ-LOOP notice. The queue-side cap in input_queue.odin has its own,
+	// deliberately different, wording -- asserting on a substring common to both would let this
+	// test pass with the read-loop limit removed entirely, which is exactly what it did before
+	// the two were given distinct text.
+	testing.expectf(t, strings.contains(notice, "Line too long"), "expected the read-loop over-long notice, got %q", notice)
+
+	// The connection must resynchronize on the next line rather than being poisoned or dropped.
+	send_cmd(&client, ".eval 6 * 7")
+	after := recv_line(t, &client)
+	defer delete(after)
+	testing.expectf(t, after == "42", "connection unusable after an over-long line: got %q", after)
+}
+
+// A line at exactly the cap is accepted -- the limit must not be off by one in the strict
+// direction, or a legitimate long command would be refused.
+@(test)
+test_input_line_at_the_limit_is_accepted :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
+	db := build_login_db()
+	defer dbfile.database_destroy(&db)
+
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := objdb.object_world_init(&db, &sched)
+	defer objdb.object_world_destroy(&ow)
+	world := objdb.make_world(&ow)
+
+	s: Server
+	wire_connection_hooks(&ow, &s)
+	err := server_start(&s, 0, &sched, &world, net.IP4_Loopback)
+	testing.expectf(t, err == nil, "server_start: %v", err)
+	defer server_stop(&s)
+
+	endpoint, _ := net.bound_endpoint(s.listener)
+	sock, derr := net.dial_tcp_from_endpoint(endpoint)
+	testing.expectf(t, derr == nil, "dial: %v", derr)
+	defer net.close(sock)
+	client := client_init(sock)
+	defer client_destroy(&client)
+	banner := recv_line(t, &client)
+	defer delete(banner)
+	log_in(t, &client)
+
+	// `.eval "AAA..."` padded so the whole line is exactly MAX_QUEUED_INPUT bytes, LF-terminated.
+	prefix :: `.eval "`
+	pad := strings.repeat("A", MAX_QUEUED_INPUT - len(prefix) - 1)
+	defer delete(pad)
+	line := strings.concatenate({prefix, pad, `"`})
+	defer delete(line)
+	testing.expect(t, len(line) == MAX_QUEUED_INPUT)
+	net.send_tcp(client.sock, transmute([]byte)line)
+	net.send_tcp(client.sock, transmute([]byte)string("\n"))
+
+	echoed := recv_line(t, &client)
+	defer delete(echoed)
+	testing.expectf(t, !strings.contains(echoed, "too long"), "a line at exactly the cap was rejected: %q", echoed)
+	testing.expectf(t, len(echoed) >= MAX_QUEUED_INPUT - len(prefix) - 1, "unexpected reply of length %d: %q", len(echoed), echoed)
+}

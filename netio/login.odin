@@ -292,7 +292,10 @@ hook_buffered_output_length :: proc(user_data: rawptr, player: values.Objid) -> 
 	}
 	sync.mutex_lock(&conn.out_lock)
 	defer sync.mutex_unlock(&conn.out_lock)
-	return len(conn.out_buf), true
+	// out_in_flight covers the window where the writer has swapped the buffer out and is
+	// blocked in send_tcp -- without it this reports 0 for a stalled client, which is the one
+	// case the built-in is for. See Connection.out_in_flight.
+	return len(conn.out_buf) + conn.out_in_flight, true
 }
 
 // hook_max_queued_output answers buffered_output_length()'s no-argument form: the ceiling any
