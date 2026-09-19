@@ -19,25 +19,37 @@ import "core:strings"
 // named `name` (case-insensitively) directly on itself. Used by add_property (a new propdef
 // can't shadow one a descendant already defines) and chparent (reparenting can't introduce a
 // name collision between the new ancestor chain and the moved subtree).
+//
+// Walks the descendant tree ITERATIVELY, over an explicit heap stack, rather than with the
+// recursion this reads as most naturally. The tree's depth is bounded only by the object
+// count, and building a deep one is ordinary MOO -- `create()` in a loop, each object
+// parented on the last -- so recursing here put an attacker-chosen depth on the native stack,
+// which in this port is a segfault that takes the server down rather than the growable array
+// the original would have used. Unlike compiler.MAX_PARSE_DEPTH and friends there is no
+// legitimate depth to cut off here, so moving the growth onto the heap is the right answer
+// rather than another tuned ceiling.
 property_defined_at_or_below :: proc(db: ^dbfile.Database, name: string, oid: values.Objid) -> bool {
-	obj, ok := db.objects[oid]
-	if !ok {
-		return false
-	}
-	for pd in obj.propdefs {
-		if strings.equal_fold(pd.name, name) {
-			return true
+	stack: [dynamic]values.Objid
+	defer delete(stack)
+	append(&stack, oid)
+	for len(stack) > 0 {
+		obj, ok := db.objects[pop(&stack)]
+		if !ok {
+			continue
 		}
-	}
-	for c := obj.child; c != values.NOTHING; {
-		child, cok := db.objects[c]
-		if !cok {
-			break
+		for pd in obj.propdefs {
+			if values.strings_equal_fold(pd.name, name) {
+				return true
+			}
 		}
-		if property_defined_at_or_below(db, name, c) {
-			return true
+		for c := obj.child; c != values.NOTHING; {
+			child, cok := db.objects[c]
+			if !cok {
+				break
+			}
+			append(&stack, c)
+			c = child.sibling
 		}
-		c = child.sibling
 	}
 	return false
 }

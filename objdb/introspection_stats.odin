@@ -172,15 +172,32 @@ bf_function_info :: proc(args: values.Var) -> vm.Call_Result {
 // the scheduler's) that an ordinary Expr_Call already goes through, via ctx.world.call_builtin.
 bf_call_function :: proc(args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	n := values.list_len(args)
-	if n < 1 {
-		values.free_var(args)
-		return err_result_local(.E_ARGS, "Incorrect number of arguments")
+	// call_function("call_function", ..., "real_name", @real_args) is legal, and means exactly
+	// call_function("real_name", @real_args). Dispatching that straight back through
+	// call_builtin re-entered THIS function on the native stack once per leading name --
+	// charging no tick, incrementing no activation depth, and so passing no MAX_VERB_DEPTH
+	// check. A list of "call_function" strings is buildable up to values.MAX_LIST_LEN by
+	// doubling, which made that an unbounded native recursion with nothing in the server able
+	// to stop it. Unwrapping the chain in a loop is exactly equivalent and costs one frame.
+	first := 1
+	for {
+		if n - first + 1 < 1 {
+			values.free_var(args)
+			return err_result_local(.E_ARGS, "Incorrect number of arguments")
+		}
+		leading := values.list_get(args, first)
+		if leading.type != .Str {
+			values.free_var(args)
+			return err_result_local(.E_TYPE, "Type mismatch")
+		}
+		// Exact comparison, not case-folded: built-in dispatch is an exact map lookup, so this
+		// is precisely the set of names that would have recursed.
+		if leading.data.str.s != "call_function" {
+			break
+		}
+		first += 1
 	}
-	name_v := values.list_get(args, 1)
-	if name_v.type != .Str {
-		values.free_var(args)
-		return err_result_local(.E_TYPE, "Type mismatch")
-	}
+	name_v := values.list_get(args, first)
 	fname := strings.clone(name_v.data.str.s)
 	defer delete(fname)
 	if !compiler.is_known_builtin(fname) {
@@ -189,9 +206,9 @@ bf_call_function :: proc(args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Res
 		return vm.Call_Result{raised = true, code = .E_INVARG, msg = strings.clone("Unknown built-in function"), rvalue = name_ref}
 	}
 
-	rest_items := make([]values.Var, n - 1)
-	for i in 2 ..= n {
-		rest_items[i - 2] = values.var_ref(values.list_get(args, i))
+	rest_items := make([]values.Var, n - first)
+	for i in first + 1 ..= n {
+		rest_items[i - first - 1] = values.var_ref(values.list_get(args, i))
 	}
 	rest := values.list_val(rest_items)
 	values.free_var(args)

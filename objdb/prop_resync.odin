@@ -63,21 +63,30 @@ prop_layout_snapshot_destroy :: proc(snap: ^Prop_Layout_Snapshot) {
 	delete(snap.layouts)
 }
 
+// Iterative for the same reason object_crud.odin's property_defined_at_or_below is: the
+// descendant tree's depth is bounded only by the object count, and this port runs recursion on
+// the native stack, where that is a segfault rather than a growable array. Visit order does
+// not matter here -- each object's layout is recorded independently.
 @(private = "file")
 snapshot_subtree :: proc(db: ^dbfile.Database, oid: values.Objid, snap: ^Prop_Layout_Snapshot) {
-	obj, ok := db.objects[oid]
-	if !ok {
-		return
-	}
-	snap.layouts[oid] = prop_layout(db, oid)
-	for c := obj.child; c != values.NOTHING; {
-		child, cok := db.objects[c]
-		if !cok {
-			break
+	stack: [dynamic]values.Objid
+	defer delete(stack)
+	append(&stack, oid)
+	for len(stack) > 0 {
+		id := pop(&stack)
+		obj, ok := db.objects[id]
+		if !ok {
+			continue
 		}
-		next := child.sibling
-		snapshot_subtree(db, c, snap)
-		c = next
+		snap.layouts[id] = prop_layout(db, id)
+		for c := obj.child; c != values.NOTHING; {
+			child, cok := db.objects[c]
+			if !cok {
+				break
+			}
+			append(&stack, c)
+			c = child.sibling
+		}
 	}
 }
 
@@ -108,20 +117,32 @@ prop_layout :: proc(db: ^dbfile.Database, oid: values.Objid) -> [dynamic]Prop_Ke
 // then does the same for every descendant. `snap` must have been captured (see
 // prop_layout_snapshot) before the change that prompted this call. `default_owner` is used for
 // any brand new (never-before-seen) slot an object picks up as a result of the change.
+//
+// Iterative over an explicit stack, like snapshot_subtree above and for the same reason. The
+// order it produces is still strictly PARENT-BEFORE-CHILD, which this walk (unlike the
+// snapshot's) actually depends on: resync_one reads the parent's propvals via
+// parent_propval_index to inherit permission bits, so an object must be rebuilt before any of
+// its descendants are. Pushing a node's children only after resyncing that node preserves
+// exactly that; sibling order among them is irrelevant.
 resync_subtree_propvals :: proc(db: ^dbfile.Database, oid: values.Objid, default_owner: values.Objid, snap: ^Prop_Layout_Snapshot) {
-	resync_one(db, oid, default_owner, snap)
-	obj, ok := db.objects[oid]
-	if !ok {
-		return
-	}
-	for c := obj.child; c != values.NOTHING; {
-		child, cok := db.objects[c]
-		if !cok {
-			break
+	stack: [dynamic]values.Objid
+	defer delete(stack)
+	append(&stack, oid)
+	for len(stack) > 0 {
+		id := pop(&stack)
+		resync_one(db, id, default_owner, snap)
+		obj, ok := db.objects[id]
+		if !ok {
+			continue
 		}
-		next := child.sibling
-		resync_subtree_propvals(db, c, default_owner, snap)
-		c = next
+		for c := obj.child; c != values.NOTHING; {
+			child, cok := db.objects[c]
+			if !cok {
+				break
+			}
+			append(&stack, c)
+			c = child.sibling
+		}
 	}
 }
 

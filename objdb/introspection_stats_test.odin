@@ -141,3 +141,50 @@ test_call_function_dispatches_and_rejects_unknown :: proc(t: ^testing.T) {
 	delete(br.msg)
 	values.free_var(br.rvalue)
 }
+
+// ---- Regression: call_function() must not recurse on the native stack ----
+//
+// call_function("call_function", ..., "real_name", @args) is legal and means exactly
+// call_function("real_name", @args). Dispatching that back through call_builtin re-entered
+// bf_call_function once per leading name -- charging no tick, incrementing no activation
+// depth, and so passing no MAX_VERB_DEPTH check. The name list is an ordinary MOO value,
+// buildable up to values.MAX_LIST_LEN by doubling, so that was an unbounded native recursion
+// (and O(n^2) argument copying on the way down) with nothing in the server able to stop it.
+// Unwrapping the chain iteratively is exactly equivalent; this is the guard on that.
+@(test)
+test_call_function_chain_is_iterative :: proc(t: ^testing.T) {
+	db := build_crud_world()
+	defer crud_world_destroy(&db)
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := object_world_init(&db, &sched)
+	defer object_world_destroy(&ow)
+	world := make_world(&ow)
+	act := crud_root_activation(1)
+	ctx := vm.Eval_Context{activation = &act, world = &world}
+
+	CHAIN :: 20_000
+	items := make([]values.Var, CHAIN + 1)
+	for i in 0 ..< CHAIN {
+		items[i] = values.str_val(strings.clone("call_function"))
+	}
+	items[CHAIN] = values.str_val(strings.clone("max_object"))
+
+	r := bf_call_function(values.list_val(items), &ctx)
+	testing.expect(t, !r.raised)
+	if r.raised {
+		delete(r.msg)
+		values.free_var(r.rvalue)
+		return
+	}
+	testing.expectf(t, r.value.type == .Obj && r.value.data.obj == 3, "got %v", r.value)
+	values.free_var(r.value)
+
+	// A chain with nothing on the end of it is an argument-count error, not a crash.
+	only := make([]values.Var, 1)
+	only[0] = values.str_val(strings.clone("call_function"))
+	r2 := bf_call_function(values.list_val(only), &ctx)
+	testing.expect(t, r2.raised && r2.code == .E_ARGS)
+	delete(r2.msg)
+	values.free_var(r2.rvalue)
+}
