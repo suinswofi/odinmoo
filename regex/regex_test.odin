@@ -246,3 +246,78 @@ test_step_budget_is_per_call_not_per_start_position :: proc(t: ^testing.T) {
 		long,
 	)
 }
+
+// ---- Regression: pattern compilation must not recurse without a ceiling ----
+//
+// compile_alt recurses once per `%|` branch, so an alternation's branch count was a native
+// stack depth chosen by whoever supplied the pattern -- and a pattern is an ordinary MOO string
+// reaching here from any match()/rmatch()/substitute() call. Measured before MAX_ALT_DEPTH, on
+// a worker thread (which is where MOO tasks compile patterns): 20000 branches fine, 40000
+// segfault, taking the whole server with them.
+@(test)
+test_alternation_depth_is_bounded :: proc(t: ^testing.T) {
+	// Comfortably inside MAX_ALT_DEPTH: must still compile.
+	ok_pat := strings.repeat("a%|", 900)
+	defer delete(ok_pat)
+	p1, ok1 := compile(ok_pat)
+	testing.expect(t, ok1)
+	if ok1 {
+		program_destroy(&p1)
+	}
+
+	// Far past it: must be REJECTED as an invalid pattern (E_INVARG at the built-in), not
+	// crash. This call is the regression -- it used to be a segfault, not a false return.
+	big := strings.repeat("a%|", 50_000)
+	defer delete(big)
+	p2, ok2 := compile(big)
+	testing.expect(t, !ok2)
+	if ok2 {
+		program_destroy(&p2)
+	}
+}
+
+// ---- Regression: the per-call step budget must actually bound a whole match() ----
+//
+// runner_reset used to clear an O(len(program)) array once per start position, and `steps`
+// never counted that work -- so one match() cost O(len(subject) x len(pattern)) with nothing
+// bounding it. Measured before the stamp-based reset: a 20KB pattern against a 200KB subject
+// took 5.6 seconds inside a single built-in, charged one tick, holding big_lock throughout;
+// the sizes below took ~1.1s. Afterwards this is milliseconds. The threshold is loose on
+// purpose -- this asks "does it still scale", not "how fast is it".
+@(test)
+test_large_pattern_scan_stays_bounded :: proc(t: ^testing.T) {
+	pat := strings.repeat("a", 20_000)
+	defer delete(pat)
+	subject := strings.repeat("b", 20_000)
+	defer delete(subject)
+	prog, ok := compile(pat)
+	testing.expect(t, ok)
+	defer program_destroy(&prog)
+
+	start := time.tick_now()
+	res := match_pattern(&prog, subject, false, true)
+	elapsed := time.duration_seconds(time.tick_since(start))
+	testing.expect(t, !res.found)
+	testing.expectf(t, elapsed < 0.5, "scan took %.3fs -- the per-attempt reset is O(program) again", elapsed)
+}
+
+// The zero-width-loop guard is now keyed by (attempt, position) rather than cleared between
+// attempts, so check a stale stamp from an earlier start position can neither hang the next
+// attempt nor make it miss a real match.
+@(test)
+test_zero_width_loop_guard_spans_attempts :: proc(t: ^testing.T) {
+	prog, ok := compile("%(a*%)*b")
+	testing.expect(t, ok)
+	defer program_destroy(&prog)
+
+	miss := match_pattern(&prog, "aaaa", false, true)
+	testing.expect(t, !miss.found)
+
+	hit := match_pattern(&prog, "aaab", false, true)
+	testing.expectf(t, hit.found && hit.end == 4, "got %v", hit)
+
+	// A match that can only be found at a LATER start position is the case a stale stamp
+	// would break.
+	late := match_pattern(&prog, "xxxaaab", false, true)
+	testing.expectf(t, late.found && late.start == 3 && late.end == 7, "got %v", late)
+}
