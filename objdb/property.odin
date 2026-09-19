@@ -53,7 +53,7 @@ builtin_prop_names := [Builtin_Prop]string {
 
 find_builtin_prop :: proc(name: string) -> Builtin_Prop {
 	for bp in Builtin_Prop {
-		if bp != .None && strings.equal_fold(builtin_prop_names[bp], name) {
+		if bp != .None && values.strings_equal_fold(builtin_prop_names[bp], name) {
 			return bp
 		}
 	}
@@ -103,6 +103,8 @@ list_contents :: proc(db: ^dbfile.Database, oid: values.Objid) -> values.Var {
 		}
 		c = child.next
 	}
+	// Exact-length allocation: the receiver frees this with delete(). See vm/eval_expr.odin.
+	shrink(&items)
 	return values.list_val(items[:])
 }
 
@@ -131,8 +133,18 @@ find_property :: proc(db: ^dbfile.Database, oid: values.Objid, name: string) -> 
 			break
 		}
 		for pd in obj.propdefs {
-			if strings.equal_fold(pd.name, name) {
+			if values.strings_equal_fold(pd.name, name) {
 				start_obj := db.objects[oid]
+				if n >= len(start_obj.propvals) {
+					// Unreachable for any database this server will load -- dbfile's
+					// check_propval_layout makes "one value slot per inherited propdef" a
+					// precondition. Kept as a belt-and-braces read guard for the same reason
+					// property_value below has one: the alternative to reporting "no such
+					// property" is an out-of-range panic that takes the server down, and this
+					// index comes from walking a chain of objects rather than from anything
+					// this function can see.
+					return Prop_Handle{}
+				}
 				pv := start_obj.propvals[n]
 				return Prop_Handle{definer = cur, value_owner = pv.owner, value_perms = pv.perms, value_index = n, found = true}
 			}

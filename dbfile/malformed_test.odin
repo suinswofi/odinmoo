@@ -18,6 +18,9 @@ Core_Opts :: struct {
 	list_len:  string, // element count of #0.stuff, a LIST propval
 	nusers:    string,
 	wiz_parent: string,
+	wiz_next:   string, // #3's `next` link (its place in #2's contents chain)
+	wiz_sibling: string, // #3's `sibling` link (its place in #1's child chain)
+	extra_propdef: bool, // give #0 a second propdef with no matching propval slot
 }
 
 @(private = "file")
@@ -37,7 +40,11 @@ build_core :: proc(o: Core_Opts) -> string {
 	w(&b, "#0");w(&b, "System Object");w(&b, "")
 	w(&b, "16");w(&b, "3");w(&b, "-1");w(&b, "-1");w(&b, "-1");w(&b, "1");w(&b, "-1");w(&b, "2")
 	w(&b, "1");w(&b, "do_login_command");w(&b, "3");w(&b, "173");w(&b, "-1")
-	w(&b, "1");w(&b, "stuff")
+	if o.extra_propdef {
+		w(&b, "2");w(&b, "stuff");w(&b, "extra")
+	} else {
+		w(&b, "1");w(&b, "stuff")
+	}
 	w(&b, "1");w(&b, "4") // propval: type tag 4 == LIST
 	w(&b, o.list_len == "" ? "0" : o.list_len)
 	w(&b, "3");w(&b, "0")
@@ -48,9 +55,11 @@ build_core :: proc(o: Core_Opts) -> string {
 	w(&b, "0");w(&b, "3");w(&b, "-1");w(&b, "3");w(&b, "-1");w(&b, "1");w(&b, "-1");w(&b, "3")
 	w(&b, "0");w(&b, "0");w(&b, "0")
 	w(&b, "#3");w(&b, "Wizard");w(&b, "")
-	w(&b, "7");w(&b, "3");w(&b, "2");w(&b, "-1");w(&b, "-1")
+	w(&b, "7");w(&b, "3");w(&b, "2");w(&b, "-1")
+	w(&b, o.wiz_next == "" ? "-1" : o.wiz_next)
 	w(&b, o.wiz_parent == "" ? "1" : o.wiz_parent)
-	w(&b, "-1");w(&b, "-1")
+	w(&b, "-1")
+	w(&b, o.wiz_sibling == "" ? "-1" : o.wiz_sibling)
 	w(&b, "0");w(&b, "0");w(&b, "0")
 	w(&b, "#0:0");w(&b, "return #3;");w(&b, ".")
 	w(&b, "0 clocks");w(&b, "0 queued tasks");w(&b, "0 suspended tasks")
@@ -139,4 +148,35 @@ test_every_truncation_is_handled :: proc(t: ^testing.T) {
 	// Sanity check that the loop is actually testing something rather than accepting
 	// everything: a truncated database is overwhelmingly a rejected one.
 	testing.expectf(t, rejected > len(raw) - 8, "expected nearly every truncation to be rejected, got %d of %d", rejected, len(raw) + 1)
+}
+
+// validate_hierarchies checked cycles on the parent and location chains only, but objdb walks
+// two more the same way and just as unguardedly: contents->next (db_change_location,
+// list_contents, match_contents) and child->sibling (bf_children, property_defined_at_or_below,
+// db_change_parent_links, prop_resync's subtree walks). A loop in either loaded cleanly and
+// then hung -- or grew a list until the process died -- the first time anyone looked in that
+// room or asked for its children.
+@(test)
+test_contents_and_child_chain_cycles_are_rejected :: proc(t: ^testing.T) {
+	// #2's contents chain is #3 -> #3 -> ...
+	contents_loop := build_core({wiz_next = "3"})
+	defer delete(contents_loop)
+	expect_rejected(t, contents_loop, "contents/next cycle")
+
+	// #1's child chain is #0 -> #2 -> #3 -> #0 -> ...
+	child_loop := build_core({wiz_sibling = "0"})
+	defer delete(child_loop)
+	expect_rejected(t, child_loop, "child/sibling cycle")
+}
+
+// Every object must carry exactly one propval slot per property defined anywhere above it:
+// find_property accumulates a running index across the ancestor chain's propdef lists and then
+// indexes the starting object's propvals with it, with no bounds check, because a well-formed
+// database guarantees they agree. Nothing made that a precondition, so a file where they
+// disagree turned an ordinary `obj.prop` read into an out-of-range panic far from the damage.
+@(test)
+test_propval_layout_mismatch_is_rejected :: proc(t: ^testing.T) {
+	src := build_core({extra_propdef = true}) // #0: 2 propdefs, 1 propval
+	defer delete(src)
+	expect_rejected(t, src, "propdef/propval count mismatch")
 }
