@@ -45,6 +45,8 @@ bf_queued_tasks :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Contex
 		}
 		append(&items, queued_task_entry(s))
 	}
+	// Exact-length allocation: the receiver frees this with delete(). See vm/eval_expr.odin.
+	shrink(&items)
 	return ok_result(values.list_val(items[:]))
 }
 

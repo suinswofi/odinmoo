@@ -106,6 +106,16 @@ read_forked_task :: proc(r: ^Reader, version: int, db: ^Database) -> (ft: Forked
 
 	src, serr := read_program_text(r)
 	if serr != .None {
+		// The record is never appended to db.forked_tasks on an error path, so nothing will
+		// ever free the runtime environment read just above -- release it here. Same reasoning
+		// as abort_rt_env's, one step further along: a malformed trailer must not cost memory.
+		delete(ft.var_names)
+		for v in ft.var_values {
+			values.free_var(v)
+		}
+		delete(ft.var_values)
+		ft.var_names = nil
+		ft.var_values = nil
 		return ft, serr
 	}
 	ft.program_source = src

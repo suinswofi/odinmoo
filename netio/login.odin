@@ -52,6 +52,8 @@ split_command_words :: proc(s: string) -> []string {
 			i += 1
 		}
 	}
+	// Exact-length allocation: the receiver frees this with delete(). See vm/eval_expr.odin.
+	shrink(&words)
 	return words[:]
 }
 
@@ -216,6 +218,8 @@ hook_connected_players :: proc(user_data: rawptr, include_all: bool) -> []values
 			append(&ids, player)
 		}
 	}
+	// Exact-length allocation: the receiver frees this with delete(). See vm/eval_expr.odin.
+	shrink(&ids)
 	return ids[:]
 }
 

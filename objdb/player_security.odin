@@ -89,6 +89,8 @@ bf_players :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 			append(&items, values.obj_val(oid))
 		}
 	}
+	// Exact-length allocation: the receiver frees this with delete(). See vm/eval_expr.odin.
+	shrink(&items)
 	return ok_result(values.list_val(items[:]))
 }
 
