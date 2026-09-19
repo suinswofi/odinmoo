@@ -287,12 +287,22 @@ test_malformed_programs_parse_without_memory_errors :: proc(t: ^testing.T) {
 	}
 }
 
+// nest_src builds `prefix + open*n + middle + close*n + suffix` in one buffer. It replaces a
+// repeat_str() helper whose results were fed straight into strings.concatenate() and never
+// freed -- roughly 250KB of tracked leaks per run of this package, which is exactly the noise
+// that hides a real one.
 @(private = "file")
-repeat_str :: proc(unit: string, n: int) -> string {
+nest_src :: proc(prefix, open: string, n: int, middle, close, suffix: string) -> string {
 	b := strings.builder_make()
+	strings.write_string(&b, prefix)
 	for _ in 0 ..< n {
-		strings.write_string(&b, unit)
+		strings.write_string(&b, open)
 	}
+	strings.write_string(&b, middle)
+	for _ in 0 ..< n {
+		strings.write_string(&b, close)
+	}
+	strings.write_string(&b, suffix)
 	return strings.to_string(b)
 }
 
@@ -306,10 +316,10 @@ test_deep_nesting_is_rejected_not_fatal :: proc(t: ^testing.T) {
 		label: string,
 		src:   string,
 	} {
-		{"parens", strings.concatenate({"return ", repeat_str("(", 50000), "1", repeat_str(")", 50000), ";"})},
-		{"unary", strings.concatenate({"return ", repeat_str("!", 50000), "1;"})},
-		{"list literals", strings.concatenate({"return ", repeat_str("{", 50000), "1", repeat_str("}", 50000), ";"})},
-		{"statement blocks", strings.concatenate({repeat_str("if (1)\n", 50000), "x = 1;", repeat_str("\nendif", 50000)})},
+		{"parens", nest_src("return ", "(", 50000, "1", ")", ";")},
+		{"unary", nest_src("return ", "!", 50000, "1;", "", "")},
+		{"list literals", nest_src("return ", "{", 50000, "1", "}", ";")},
+		{"statement blocks", nest_src("", "if (1)\n", 50000, "x = 1;", "\nendif", "")},
 	}
 	for c in cases {
 		defer delete(c.src)
@@ -326,7 +336,7 @@ test_deep_nesting_is_rejected_not_fatal :: proc(t: ^testing.T) {
 // both bundled cores, but this pins the intent.
 @(test)
 test_moderate_nesting_still_parses :: proc(t: ^testing.T) {
-	src := strings.concatenate({"return ", repeat_str("(", 100), "1", repeat_str(")", 100), ";"})
+	src := nest_src("return ", "(", 100, "1", ")", ";")
 	defer delete(src)
 	r := parse_ok(t, src)
 	result_destroy(&r)

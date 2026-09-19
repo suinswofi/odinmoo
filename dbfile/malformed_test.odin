@@ -21,6 +21,9 @@ Core_Opts :: struct {
 	wiz_next:   string, // #3's `next` link (its place in #2's contents chain)
 	wiz_sibling: string, // #3's `sibling` link (its place in #1's child chain)
 	extra_propdef: bool, // give #0 a second propdef with no matching propval slot
+	// End the file with a QUEUED-TASK record that is truncated just before its program
+	// text -- everything up to and including the runtime environment reads fine.
+	truncated_queued_task: bool,
 }
 
 @(private = "file")
@@ -62,7 +65,18 @@ build_core :: proc(o: Core_Opts) -> string {
 	w(&b, o.wiz_sibling == "" ? "-1" : o.wiz_sibling)
 	w(&b, "0");w(&b, "0");w(&b, "0")
 	w(&b, "#0:0");w(&b, "return #3;");w(&b, ".")
-	w(&b, "0 clocks");w(&b, "0 queued tasks");w(&b, "0 suspended tasks")
+	if o.truncated_queued_task {
+		w(&b, "0 clocks");w(&b, "1 queued tasks")
+		w(&b, "0 1 0 1") // dummy, first_lineno, start_time, task_id
+		w(&b, "0");w(&b, "-111") // the ignored sentinel Var (TYPE_INT -111)
+		w(&b, "3 -2 -3 3 -5 3 -1 -8 1") // this, ..., player, ..., progr, vloc, ..., debug
+		w(&b, "");w(&b, "");w(&b, "");w(&b, "") // argstr, dobjstr, iobjstr, prepstr
+		w(&b, "do_login_command");w(&b, "do_login_command")
+		w(&b, "1 variables");w(&b, "foo");w(&b, "2");w(&b, "hello")
+		// ... and then nothing: no program text, no "suspended tasks" line.
+	} else {
+		w(&b, "0 clocks");w(&b, "0 queued tasks");w(&b, "0 suspended tasks")
+	}
 	return strings.to_string(b)
 }
 
@@ -179,4 +193,16 @@ test_propval_layout_mismatch_is_rejected :: proc(t: ^testing.T) {
 	src := build_core({extra_propdef = true}) // #0: 2 propdefs, 1 propval
 	defer delete(src)
 	expect_rejected(t, src, "propdef/propval count mismatch")
+}
+
+// A queued-task record that ends before its program text. read_forked_task has already read
+// (and taken ownership of) the record's runtime environment by then, and the record is never
+// appended to db.forked_tasks on an error path -- so nothing else will ever free it. This is
+// the tracking allocator's half of the file doing the work: the rejection is easy, not
+// leaking the half-read record on the way out is the part that regressed.
+@(test)
+test_truncated_queued_task_is_rejected_without_leaking :: proc(t: ^testing.T) {
+	src := build_core({truncated_queued_task = true})
+	defer delete(src)
+	expect_rejected(t, src, "truncated queued task")
 }

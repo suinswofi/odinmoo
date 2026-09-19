@@ -636,6 +636,10 @@ convert_arglist_to_scatter :: proc(p: ^Parser, items: []Arg) -> []Scatter_Item {
 		append(&result, Scatter_Item{kind = kind, var_id = id.var_id})
 		free(id)
 	}
+	// Exact-length allocation: ast_destroy frees this with delete(). See vm/eval_expr.odin.
+	// `result` is sized for every arg up front, but an arg that isn't a simple variable is
+	// reported and skipped, so on that error path len < cap.
+	shrink(&result)
 	return result[:]
 }
 
