@@ -429,3 +429,79 @@ thread_safe_allocator :: proc(mu: ^mem.Mutex_Allocator) -> mem.Allocator {
 	mem.mutex_allocator_init(mu, context.allocator)
 	return mem.mutex_allocator(mu)
 }
+
+// ---- Regression: a Fork_Job must OWN the activation strings it carries ----
+//
+// Fork_Job copied ctx.activation.verb_name (and, once the command context was carried too,
+// argstr and friends) as a BORROWED string. Every owner of that string is gone before a
+// delayed fork runs: the caller's evaluated verb-name Var is freed when the calling expression
+// finishes, a Parsed_Command.verb when dispatch_command returns, a literal inside an eval()'d
+// AST when bf_eval returns. The forked task then handed the dangling pointer to register_task,
+// where queued_tasks()/task_stack() clone from it and pass() re-searches by it.
+//
+// This was not theoretical: against a real server under ASan, `;#obj:verb()` on a verb
+// containing `fork (2) suspend(60); endfork` followed by `;queued_tasks()` reported
+// heap-use-after-free, reading the verb name out of the freed eval AST.
+//
+// What is asserted here is the OWNERSHIP INVARIANT -- that the forked task's string is a
+// different allocation from the caller's -- not the use-after-free itself. That distinction
+// matters: the obvious version of this test (free the caller's string, scribble over the
+// memory, then read the fork's copy) was written first and PASSED against the unfixed code,
+// because nothing guarantees the allocator hands that block back. Comparing the pointers is
+// deterministic, and it fails the moment anyone reintroduces the borrow. Catching the
+// dereference itself needs ASan, which is how the bug was found in the first place.
+@(test)
+test_fork_owns_the_activation_strings_it_carries :: proc(t: ^testing.T) {
+	sync.mutex_lock(&serial_tests)
+	defer sync.mutex_unlock(&serial_tests)
+
+	s := scheduler_init()
+	defer scheduler_destroy(&s)
+	world := make_test_world(&s)
+
+	VERB :: "forkyverbname"
+	verb_name := strings.clone(VERB) // stands in for the caller-owned string a real call borrows
+	defer delete(verb_name)
+
+	r := compiler.parse_program(`fork (0) suspend(2); endfork return 1;`, compiler.DBV_Float)
+	defer {
+		compiler.free_stmts(r.body)
+		compiler.name_table_destroy(&r.names)
+		for e in r.errors do delete(e)
+		delete(r.errors)
+	}
+	act := vm.activation_make(len(r.names.names))
+	act.task_id = new_task_id(&s)
+	act.verb_name = verb_name // borrowed by the Activation, exactly as a real verb call does
+	defer vm.activation_destroy(&act)
+
+	result := vm.run(r.body, &r.names, &world, &act)
+	if result.signal == .Return {
+		values.free_var(result.value)
+	}
+
+	got_name := ""
+	got_data: [^]byte
+	for _ in 0 ..< 200 {
+		snaps := snapshot_tasks(&s)
+		if len(snaps) == 1 {
+			got_name = snaps[0].verb_name
+			got_data = raw_data(snaps[0].verb_name)
+			delete(snaps)
+			break
+		}
+		delete(snaps)
+		time.sleep(5 * time.Millisecond)
+	}
+
+	testing.expect(t, got_name != "")
+	testing.expectf(t, got_name == VERB, "forked task reported verb_name %q, want %q", got_name, VERB)
+	testing.expect(
+		t,
+		got_data != raw_data(verb_name),
+		"the forked task is pointing at the CALLER'S verb-name string, not a clone of it -- " +
+		"that pointer is dangling as soon as the calling verb returns",
+	)
+
+	scheduler_shutdown(&s) // kill the parked task and wait for the fork thread to exit
+}

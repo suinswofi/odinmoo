@@ -9,6 +9,7 @@ package tasks
 import "../compiler"
 import "../values"
 import "../vm"
+import "core:strings"
 import "core:sync"
 import "core:time"
 
@@ -43,9 +44,43 @@ Fork_Job :: struct {
 	caller:     values.Objid,
 	programmer: values.Objid,
 	verb_loc:   values.Objid,
-	verb_name:  string,
 	debug:      bool,
 	task_id:    int,
+
+	// Every string below is an OWNED clone, and that is the whole point of them being here.
+	// The Activation they are copied from BORROWS all of them, from owners that are gone long
+	// before this job runs: verb_name points at the caller's evaluated verb-name Var (freed
+	// when the calling expression finishes), at a Parsed_Command.verb (freed when
+	// dispatch_command returns), or at a string literal inside an eval()'d AST (freed when
+	// bf_eval returns) -- while a fork may not start for another delay_secs seconds, and then
+	// hands the pointer straight to register_task, which queued_tasks()/task_stack() clone
+	// from and pass() re-searches by. Borrowing it was a genuine use-after-free, reachable
+	// from an ordinary `;#obj:verb()` where the verb forks: ASan caught the read in objdb's
+	// queued_task_entry, against memory freed by the eval AST's teardown.
+	//
+	// The command-context strings have exactly the same owners and exactly the same problem;
+	// they are carried at all because the original's enqueue_forked_task() copies the whole
+	// activation, so a forked task's callees see the dobj/argstr context the forking verb had
+	// (this port used to leave them empty, and dobj/iobj defaulted to Objid(0) -- i.e. #0, the
+	// System Object, not #-1).
+	verb_name:  string,
+	dobjstr:    string,
+	iobjstr:    string,
+	prepstr:    string,
+	argstr:     string,
+	dobj:       values.Objid,
+	iobj:       values.Objid,
+}
+
+// fork_job_release_strings frees the owned clones above. Shared by the thread proc's normal
+// exit and by do_fork's "couldn't start the thread" unwind, so the two can't drift.
+@(private = "file")
+fork_job_release_strings :: proc(job: ^Fork_Job) {
+	delete(job.verb_name)
+	delete(job.dobjstr)
+	delete(job.iobjstr)
+	delete(job.prepstr)
+	delete(job.argstr)
 }
 
 @(private = "file")
@@ -95,9 +130,16 @@ do_fork :: proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^
 		caller     = ctx.activation.this, // the forking verb becomes the forked task's caller
 		programmer = ctx.activation.programmer,
 		verb_loc   = ctx.activation.verb_loc,
-		verb_name  = ctx.activation.verb_name,
 		debug      = ctx.activation.debug,
 		task_id    = task_id,
+		// Cloned, never borrowed -- see Fork_Job's comment on why this is load-bearing.
+		verb_name  = strings.clone(ctx.activation.verb_name),
+		dobjstr    = strings.clone(ctx.activation.dobjstr),
+		iobjstr    = strings.clone(ctx.activation.iobjstr),
+		prepstr    = strings.clone(ctx.activation.prepstr),
+		argstr     = strings.clone(ctx.activation.argstr),
+		dobj       = ctx.activation.dobj,
+		iobj       = ctx.activation.iobj,
 	}
 
 	sync.wait_group_add(&s.active_forks, 1)
@@ -120,6 +162,7 @@ do_fork :: proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^
 		// scheduler_destroy would otherwise wait on forever.
 		compiler.free_stmts(job_ptr.body)
 		compiler.name_table_destroy(&job_ptr.names)
+		fork_job_release_strings(job_ptr)
 		for v in job_ptr.locals {
 			values.free_var(v)
 		}
@@ -142,6 +185,8 @@ fork_thread_proc :: proc(data: rawptr) {
 	defer free(job)
 	defer compiler.free_stmts(job.body)
 	defer compiler.name_table_destroy(&job.names)
+	// Registered after free(job), so LIFO runs it BEFORE the struct holding the pointers goes.
+	defer fork_job_release_strings(job)
 	// This thread exists only to run one forked task, so reclaim its scratch arena on the way
 	// out -- context.temp_allocator is per-thread and only ever reclaimed explicitly, so
 	// without this every forked task would leave its scratch memory behind for good.
@@ -164,6 +209,16 @@ fork_thread_proc :: proc(data: rawptr) {
 		verb_name  = job.verb_name,
 		debug      = job.debug,
 		task_id    = job.task_id,
+		// The forking verb's command context, carried across so a verb CALLED by the forked
+		// body sees what the original's ENV_COPY would have given it (objdb's call_verb_from
+		// copies these from the caller's activation). Without them dobj/iobj defaulted to
+		// Objid(0) -- #0, not #-1 -- and every *str was empty.
+		dobj       = job.dobj,
+		iobj       = job.iobj,
+		dobjstr    = job.dobjstr,
+		iobjstr    = job.iobjstr,
+		prepstr    = job.prepstr,
+		argstr     = job.argstr,
 	}
 	defer vm.activation_destroy(&act)
 
