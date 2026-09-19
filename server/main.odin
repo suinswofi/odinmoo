@@ -300,6 +300,17 @@ eval_and_print :: proc(db: ^dbfile.Database, world: ^vm.World, line: string, tas
 		lit_args := make([]values.Var, 1)
 		lit_args[0] = values.var_ref(result.value)
 		lit_result, _ := builtins.call("toliteral", values.list_val(lit_args))
+		// toliteral() can raise (values.MAX_STR_LEN), and a raised Call_Result's `value` is
+		// the zero Var, whose data.str is nil -- see netio/connection.odin's eval_expr for
+		// the same check and the crash it prevents. Emergency mode is the LAST place that
+		// should die on a value it was asked to inspect.
+		if lit_result.raised {
+			print_colored("%r**%n ")
+			fmt.printfln("cannot print value: %s (%s)", compiler.error_name(lit_result.code), lit_result.msg)
+			delete(lit_result.msg)
+			values.free_var(lit_result.rvalue)
+			return
+		}
 		defer values.free_var(lit_result.value)
 		print_colored("%h%g=>%n ")
 		fmt.println(lit_result.value.data.str.s)

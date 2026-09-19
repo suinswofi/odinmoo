@@ -48,7 +48,43 @@ handle_programming_line :: proc(conn: ^Connection, line: string) {
 		finish_programming(conn)
 		return
 	}
+	// The accumulated body is bounded, like every other per-connection buffer in netio
+	// (MAX_QUEUED_INPUT and MAX_QUEUED_OUTPUT in connection.odin). This one had no ceiling at
+	// all: a client that types `.program obj:verb` and then never sends a lone "." grows this
+	// array for as long as it keeps sending lines. MAX_PROGRAM_TEXT is values.MAX_STR_LEN
+	// because set_verb_code joins these lines into a single MOO string, so anything past it
+	// could not be installed anyway.
+	//
+	// Over the limit the session is ABANDONED rather than truncated: quietly installing the
+	// first 16MB of a verb body someone is still typing is the one outcome worse than making
+	// them start again.
+	if conn.program_bytes + len(line) + 1 > MAX_PROGRAM_TEXT {
+		send_line(conn, ">> Verb text too long: .program abandoned, nothing installed <<")
+		program_session_reset(conn)
+		return
+	}
+	conn.program_bytes += len(line) + 1 // +1 for the newline set_verb_code will join on
 	append(&conn.program_lines, strings.clone(line))
+}
+
+// MAX_PROGRAM_TEXT caps the source a single `.program` session may accumulate -- see
+// handle_programming_line.
+MAX_PROGRAM_TEXT :: values.MAX_STR_LEN
+
+// program_session_reset ends a `.program` session and releases its buffer, leaving the
+// connection in ordinary command mode. Shared by the over-limit abandon above and by
+// finish_programming's exit path, so the two can't disagree about what "not programming" means.
+@(private = "file")
+program_session_reset :: proc(conn: ^Connection) {
+	conn.programming = false
+	delete(conn.program_verb_name)
+	conn.program_verb_name = ""
+	for l in conn.program_lines {
+		delete(l)
+	}
+	delete(conn.program_lines)
+	conn.program_lines = nil
+	conn.program_bytes = 0
 }
 
 // start_programming ports find_verb_for_programming() + start_programming(): resolve
@@ -102,6 +138,7 @@ start_programming :: proc(conn: ^Connection, ow: ^objdb.Object_World, verbref: s
 	conn.program_obj = h.definer
 	conn.program_verb_name = strings.clone(verb_part)
 	conn.program_lines = make([dynamic]string)
+	conn.program_bytes = 0
 
 	send_line(conn, confirmation_owned)
 	delete(confirmation_owned)
@@ -173,16 +210,7 @@ echo_existing_source :: proc(conn: ^Connection, ow: ^objdb.Object_World, h: objd
 @(private = "file")
 finish_programming :: proc(conn: ^Connection) {
 	ow := (^objdb.Object_World)(conn.server.world.user_data)
-	defer {
-		conn.programming = false
-		delete(conn.program_verb_name)
-		conn.program_verb_name = ""
-		for l in conn.program_lines {
-			delete(l)
-		}
-		delete(conn.program_lines)
-		conn.program_lines = nil
-	}
+	defer program_session_reset(conn)
 
 	act := vm.Activation{this = values.NOTHING, player = conn.player, programmer = conn.player, task_id = tasks.new_task_id(conn.server.scheduler), depth = -1}
 	ctx := vm.Eval_Context{activation = &act, world = conn.server.world}

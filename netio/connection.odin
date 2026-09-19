@@ -76,6 +76,9 @@ Connection :: struct {
 	program_obj:        values.Objid, // the verb's DEFINER (h.definer from find_defined_verb), not necessarily the object named in ".program obj:verb"
 	program_verb_name:  string, // owned; the verb name as typed, re-resolved against program_obj when programming ends
 	program_lines:      [dynamic]string, // owned strings; raw body lines accumulated so far
+	program_bytes:      int, // running byte total of program_lines (+1 per line for the joining
+	// newline), so the MAX_PROGRAM_TEXT check in program_editor.odin stays O(1). This was the
+	// one per-connection buffer with no ceiling at all, while input and output both have one.
 
 	// PREFIX/OUTPUTPREFIX and SUFFIX/OUTPUTSUFFIX intrinsic commands (see command.odin's
 	// handle_intrinsic_command): text sent immediately before/after every ordinary command's
@@ -502,6 +505,21 @@ eval_expr :: proc(conn: ^Connection, trimmed: string) {
 		lit_args := make([]values.Var, 1)
 		lit_args[0] = values.var_ref(result.value)
 		lit_result, _ := builtins.call("toliteral", values.list_val(lit_args))
+		// toliteral() CAN raise -- it grew a values.MAX_STR_LEN ceiling, and a raised
+		// Call_Result's `value` is the zero Var (type .Int), whose data.str is nil. Reading
+		// .data.str.s unconditionally dereferenced that nil and killed the whole server from
+		// one `.eval` of an over-long value; a 16MB string is enough, since toliteral adds
+		// two quote characters to something already at the cap.
+		if lit_result.raised {
+			msg := strings.concatenate(
+				{"%r** Cannot print value: %n", compiler.error_name(lit_result.code), " (", lit_result.msg, ")"},
+			)
+			defer delete(msg)
+			send_line(conn, msg)
+			delete(lit_result.msg)
+			values.free_var(lit_result.rvalue)
+			return
+		}
 		defer values.free_var(lit_result.value)
 		send_line(conn, lit_result.value.data.str.s)
 	case .Raised:

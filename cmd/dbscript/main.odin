@@ -307,6 +307,14 @@ eval_stmts :: proc(env: ^Env, src: string, print_result: bool) -> bool {
 		lit_args := make([]values.Var, 1)
 		lit_args[0] = values.var_ref(result)
 		lit, _ := builtins.call("toliteral", values.list_val(lit_args))
+		// toliteral() can raise (values.MAX_STR_LEN), leaving `value` as the zero Var whose
+		// data.str is nil -- see netio/connection.odin's eval_expr for the same check.
+		if lit.raised {
+			fmt.printfln("  %s:%d => <unprintable: %s>", env.file, env.line, compiler.error_name(lit.code))
+			delete(lit.msg)
+			values.free_var(lit.rvalue)
+			return true
+		}
 		defer values.free_var(lit.value)
 		fmt.printfln("  %s:%d => %s", env.file, env.line, lit.value.data.str.s)
 	}
