@@ -152,7 +152,7 @@ bf_set_property_info :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_C
 		obj := w.db.objects[oid]
 		found_idx := -1
 		for pd, i in obj.propdefs {
-			if strings.equal_fold(pd.name, name_v.data.str.s) {
+			if values.strings_equal_fold(pd.name, name_v.data.str.s) {
 				found_idx = i
 				break
 			}
@@ -160,7 +160,7 @@ bf_set_property_info :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_C
 		if found_idx < 0 {
 			return err_result_local(.E_INVARG, "Property not defined here")
 		}
-		if !strings.equal_fold(name_v.data.str.s, new_name) {
+		if !values.strings_equal_fold(name_v.data.str.s, new_name) {
 			collide := find_property(w.db, oid, new_name)
 			if collide.found || property_defined_at_or_below(w.db, new_name, oid) {
 				return err_result_local(.E_INVARG, "Duplicate property name")
@@ -274,7 +274,7 @@ bf_delete_property :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Con
 	obj := w.db.objects[oid]
 	found_idx := -1
 	for pd, i in obj.propdefs {
-		if strings.equal_fold(pd.name, name_v.data.str.s) {
+		if values.strings_equal_fold(pd.name, name_v.data.str.s) {
 			found_idx = i
 			break
 		}
@@ -319,7 +319,12 @@ bf_clear_property :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Cont
 		return err_result_local(.E_PROPNF, "Property not found")
 	}
 	progr := ctx.activation.programmer
-	if h.builtin != .None || (progr != h.value_owner && !is_wizard(w.db, progr)) {
+	// WRITE permission on the property, not owner-or-wizard. The Programmer's Manual is
+	// explicit -- "If the programmer does not have read (write) permission on the property in
+	// question, then is_clear_property() (clear_property()) raises E_PERM" -- and
+	// prop_allows(.Write) is what every other property mutation in this file already uses, so
+	// the old test made a `w` (world-writable) property clearable only by its owner.
+	if h.builtin != .None || !prop_allows(w.db, h.value_perms, h.value_owner, progr, .Write) {
 		return err_result_local(.E_PERM, "Permission denied")
 	}
 	if h.definer == oid {

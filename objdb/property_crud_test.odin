@@ -57,7 +57,7 @@ test_add_delete_clear_property_roundtrip :: proc(t: ^testing.T) {
 	iargs := make([]values.Var, 2)
 	iargs[0] = values.obj_val(child)
 	iargs[1] = values.str_val(strings.clone("score"))
-	iresult := bf_is_clear_property(&ow, values.list_val(iargs))
+	iresult := bf_is_clear_property(&ow, values.list_val(iargs), &ctx)
 	testing.expect(t, !iresult.raised && iresult.value.data.num == 1)
 
 	// properties(#2) should list its own propdefs: "greeting" (from build_crud_world's
@@ -291,4 +291,93 @@ test_delete_inherited_property_realigns_descendants :: proc(t: ^testing.T) {
 
 	expect_prop_int(t, &db, child, "pb", 999)
 	expect_prop_int(t, &db, 2, "pb", 202)
+}
+
+// ---- Regression: is_clear_property() needs READ, clear_property() needs WRITE ----
+//
+// "If the programmer does not have read (write) permission on the property in question, then
+// is_clear_property() (clear_property()) raises E_PERM" -- Programmer's Manual. is_clear_property
+// had no permission check at all, so whether a property was overridden or inherited was
+// readable on any object by anyone. clear_property tested owner-or-wizard instead of the `w`
+// bit, which is stricter than the spec in the other direction: a world-writable property could
+// only be cleared by its owner.
+@(test)
+test_clear_property_permission_rules :: proc(t: ^testing.T) {
+	db := build_crud_world()
+	defer crud_world_destroy(&db)
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := object_world_init(&db, &sched)
+	defer object_world_destroy(&ow)
+	world := make_world(&ow)
+
+	wiz := crud_root_activation(1) // #1: wizard, owns "greeting" on #2
+	wiz_ctx := vm.Eval_Context{activation = &wiz, world = &world}
+	nobody := crud_root_activation(0) // #0: not a wizard, owns nothing
+	nobody_ctx := vm.Eval_Context{activation = &nobody, world = &world}
+
+	// A child of #2 inherits "greeting" as a CLEAR slot.
+	cargs := make([]values.Var, 1)
+	cargs[0] = values.obj_val(2)
+	cres := bf_create(&ow, values.list_val(cargs), &wiz_ctx)
+	testing.expect(t, !cres.raised)
+	child := cres.value.data.obj
+	values.free_var(cres.value)
+
+	is_clear :: proc(ow: ^Object_World, oid: values.Objid, ctx: ^vm.Eval_Context) -> vm.Call_Result {
+		a := make([]values.Var, 2)
+		a[0] = values.obj_val(oid)
+		a[1] = values.str_val(strings.clone("greeting"))
+		return bf_is_clear_property(ow, values.list_val(a), ctx)
+	}
+	clear_it :: proc(ow: ^Object_World, oid: values.Objid, ctx: ^vm.Eval_Context) -> vm.Call_Result {
+		a := make([]values.Var, 2)
+		a[0] = values.obj_val(oid)
+		a[1] = values.str_val(strings.clone("greeting"))
+		return bf_clear_property(ow, values.list_val(a), ctx)
+	}
+	discard :: proc(r: vm.Call_Result) {
+		if r.raised {
+			delete(r.msg)
+			values.free_var(r.rvalue)
+		} else {
+			values.free_var(r.value)
+		}
+	}
+
+	// "greeting" has perms 0: the owner/a wizard may read it, nobody else may.
+	r := is_clear(&ow, child, &wiz_ctx)
+	testing.expect(t, !r.raised && r.value.data.num == 1)
+	discard(r)
+	r = is_clear(&ow, child, &nobody_ctx)
+	testing.expectf(t, r.raised && r.code == .E_PERM, "is_clear_property without `r`: got %v", r.code)
+	discard(r)
+
+	// Give the child's slot a real value and the `w` bit, owned by #1. Clearing it is then
+	// something #0 may do -- write permission, not ownership, is the rule.
+	h := find_property(&db, child, "greeting")
+	testing.expect(t, h.found)
+	cobj := db.objects[child]
+	values.free_var(cobj.propvals[h.value_index].value)
+	cobj.propvals[h.value_index].value = values.str_val(strings.clone("mine"))
+	cobj.propvals[h.value_index].owner = 1
+	cobj.propvals[h.value_index].perms = 1 << uint(Prop_Flag.Write)
+
+	r = clear_it(&ow, child, &nobody_ctx)
+	testing.expectf(t, !r.raised, "clear_property on a `w` property: got %v %s", r.code, r.raised ? r.msg : "")
+	discard(r)
+	testing.expect(t, db.objects[child].propvals[h.value_index].value.type == .Clear)
+
+	// ...and without the `w` bit it is still E_PERM for a non-owner.
+	values.free_var(cobj.propvals[h.value_index].value)
+	cobj.propvals[h.value_index].value = values.str_val(strings.clone("mine"))
+	cobj.propvals[h.value_index].perms = 0
+	r = clear_it(&ow, child, &nobody_ctx)
+	testing.expectf(t, r.raised && r.code == .E_PERM, "clear_property without `w`: got %v", r.code)
+	discard(r)
+
+	// The definer itself has no ancestor value to fall back to: E_INVARG, not E_PERM.
+	r = clear_it(&ow, 2, &wiz_ctx)
+	testing.expectf(t, r.raised && r.code == .E_INVARG, "clear_property on the definer: got %v", r.code)
+	discard(r)
 }

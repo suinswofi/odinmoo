@@ -50,7 +50,7 @@ object_builtin :: proc(w: ^Object_World, name: string, args: values.Var, ctx: ^v
 	case "verb_info":
 		return bf_verb_info(w, args, ctx), true
 	case "is_clear_property":
-		return bf_is_clear_property(w, args), true
+		return bf_is_clear_property(w, args, ctx), true
 	case "pass":
 		return bf_pass(w, args, ctx), true
 	case "set_task_perms":
@@ -243,6 +243,8 @@ bf_children :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 		}
 		c = child.sibling
 	}
+	// Exact-length allocation: the receiver frees this with delete(). See vm/eval_expr.odin.
+	shrink(&items)
 	return ok_result(values.list_val(items[:]))
 }
 
@@ -328,6 +330,8 @@ bf_callers :: proc(args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 		append(&items, values.list_val(frame))
 		append_builtin_frame(&items, a, include_lines)
 	}
+	// Exact-length allocation: the receiver frees this with delete(). See vm/eval_expr.odin.
+	shrink(&items)
 	return ok_result(values.list_val(items[:]))
 }
 
@@ -686,7 +690,7 @@ bf_verb_info :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) 
 // checked directly at h.value_index, not resolved through property_value()'s
 // walk-toward-root (which is precisely the distinction this builtin exists to expose). Not
 // file-private: property_crud_test.odin uses it directly too.
-bf_is_clear_property :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
+bf_is_clear_property :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	defer values.free_var(args)
 	if values.list_len(args) != 2 {
 		return err_result_local(.E_ARGS, "Incorrect number of arguments")
@@ -701,6 +705,13 @@ bf_is_clear_property :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Resu
 	h := find_property(w.db, obj_v.data.obj, name_v.data.str.s)
 	if !h.found || h.builtin != .None {
 		return err_result_local(.E_PROPNF, "Property not found")
+	}
+	// "If the programmer does not have read (write) permission on the property in question,
+	// then is_clear_property() (clear_property()) raises E_PERM" -- Programmer's Manual,
+	// is_clear_property. This check was simply absent, so whether a property was overridden or
+	// inherited was readable on any object by anyone, regardless of its `r` bit.
+	if !prop_allows(w.db, h.value_perms, h.value_owner, ctx.activation.programmer, .Read) {
+		return err_result_local(.E_PERM, "Permission denied")
 	}
 	obj := w.db.objects[obj_v.data.obj]
 	is_clear := obj.propvals[h.value_index].value.type == .Clear
