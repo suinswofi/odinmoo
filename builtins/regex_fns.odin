@@ -94,6 +94,19 @@ bf_substitute :: proc(args: values.Var) -> vm.Call_Result {
 	t := template_v.data.str.s
 	i := 0
 	for i < len(t) {
+		// The same values.MAX_STR_LEN ceiling tostr/strsub/toliteral carry, and substitute
+		// needs it more than any of them: those are DOUBLING constructions, this one is a
+		// PRODUCT. Each `%N` in the template expands to a whole span of the subject, so the
+		// output is (number of directives) x (span length) with nothing relating it to either
+		// input's size. Measured before this check: a 20KB template of "%0" against a 200KB
+		// subject produced a 2GB string in 25 seconds -- one tick, big_lock held throughout,
+		// and a resulting MOO string 128x past the cap. At the input ceilings it is ~10^14
+		// bytes. Checked before each template character rather than per byte copied, so the
+		// transient overshoot is one span, itself already bounded by MAX_STR_LEN; the check
+		// after the loop is what bounds the RESULT.
+		if strings.builder_len(b) > values.MAX_STR_LEN {
+			return raise_err(.E_QUOTA, "Value too large")
+		}
 		c := t[i]
 		if c != '%' {
 			strings.write_byte(&b, c)
@@ -133,6 +146,9 @@ bf_substitute :: proc(args: values.Var) -> vm.Call_Result {
 			strings.write_byte(&b, subject[start])
 			start += 1
 		}
+	}
+	if strings.builder_len(b) > values.MAX_STR_LEN {
+		return raise_err(.E_QUOTA, "Value too large")
 	}
 	return vm.call_ok(values.str_val(strings.clone(strings.to_string(b))))
 }

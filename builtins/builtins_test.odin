@@ -258,3 +258,78 @@ expect_raised :: proc(t: ^testing.T, r: vm.Call_Result, want: values.Error, labe
 	delete(r.msg)
 	values.free_var(r.rvalue)
 }
+
+// ---- Regression: substitute() must respect values.MAX_STR_LEN ----
+//
+// tostr/strsub/toliteral all grew a length cap; substitute did not, and it is the one that
+// needed it most. Its output is (number of %N directives in the template) x (length of the
+// span each names), a PRODUCT of its two inputs rather than a doubling of one -- so it was
+// unbounded by anything: measured before the fix, a 20KB template of "%0" against a 200KB
+// subject produced a 2GB string in 25 seconds, inside a single built-in call, charged one tick,
+// holding the scheduler's big lock throughout.
+//
+// This test uses a small subject so it stays fast, and a template long enough that the product
+// crosses the cap.
+@(test)
+test_substitute_is_capped :: proc(t: ^testing.T) {
+	SPAN :: 4096
+	subject := strings.repeat("x", SPAN)
+	// A match()-shaped subs list: {start, end, {9 group pairs}, subject}.
+	groups := make([]values.Var, 9)
+	for i in 0 ..< 9 {
+		pair := make([]values.Var, 2)
+		pair[0] = values.int_val(0)
+		pair[1] = values.int_val(-1)
+		groups[i] = values.list_val(pair)
+	}
+	subs := make([]values.Var, 4)
+	subs[0] = values.int_val(1)
+	subs[1] = values.int_val(SPAN)
+	subs[2] = values.list_val(groups)
+	subs[3] = values.str_val(subject)
+
+	// (MAX_STR_LEN / SPAN) + 64 directives is comfortably past the cap.
+	ndirectives := values.MAX_STR_LEN / SPAN + 64
+	args := make([]values.Var, 2)
+	args[0] = values.str_val(strings.repeat("%0", ndirectives))
+	args[1] = values.list_val(subs)
+	r := call_builtin(t, "substitute", args)
+	expect_raised(t, r, .E_QUOTA, "substitute past MAX_STR_LEN")
+}
+
+// ...and must keep working normally, including the whole-match and group forms.
+@(test)
+test_substitute_still_works_normally :: proc(t: ^testing.T) {
+	groups := make([]values.Var, 9)
+	for i in 0 ..< 9 {
+		pair := make([]values.Var, 2)
+		pair[0] = values.int_val(0)
+		pair[1] = values.int_val(-1)
+		groups[i] = values.list_val(pair)
+	}
+	// Group 1 covers "ell" of "hello" (1-based, closed).
+	g1 := make([]values.Var, 2)
+	g1[0] = values.int_val(2)
+	g1[1] = values.int_val(4)
+	values.free_var(groups[0])
+	groups[0] = values.list_val(g1)
+
+	subs := make([]values.Var, 4)
+	subs[0] = values.int_val(1)
+	subs[1] = values.int_val(5)
+	subs[2] = values.list_val(groups)
+	subs[3] = values.str_val(strings.clone("hello"))
+
+	args := make([]values.Var, 2)
+	args[0] = values.str_val(strings.clone("[%1] in %0, 100%% sure"))
+	args[1] = values.list_val(subs)
+	r := call_builtin(t, "substitute", args)
+	testing.expect(t, !r.raised)
+	testing.expectf(
+		t,
+		r.value.type == .Str && r.value.data.str.s == "[ell] in hello, 100% sure",
+		"got %v",
+		r.value,
+	)
+	values.free_var(r.value)
+}
