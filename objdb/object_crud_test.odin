@@ -262,3 +262,54 @@ test_renumber_reuses_lowest_hole :: proc(t: ^testing.T) {
 	testing.expect(t, !valid(&db, 3))
 	testing.expect(t, valid(&db, 2))
 }
+
+// recycle() must never leave the database referring to an object it has destroyed. The
+// content-eviction loop used to `break` when move() raised -- an :exitfunc refusing, a
+// contained object the recycler doesn't control, or a task running out of budget mid-verb --
+// and then fell through to destroy_object anyway. The un-evicted items kept `location == oid`
+// for an id no longer in db.objects, which is exactly the dangling link dbfile/validate.odin
+// rejects at load: the next checkpoint wrote a database the server would refuse to start on.
+@(test)
+test_recycle_leaves_no_dangling_location_when_eviction_fails :: proc(t: ^testing.T) {
+	db := build_crud_world()
+	defer crud_world_destroy(&db)
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := object_world_init(&db, &sched)
+	defer object_world_destroy(&ow)
+	world := make_world(&ow)
+
+	// #4 is the container, owned by #3 (a plain, non-wizard object). #5 sits inside it but is
+	// owned by #1, whom #3 does NOT control -- so the eviction move() is refused with E_PERM,
+	// which is the real-world shape of a "stuck" content item. #3 still controls #4 itself, so
+	// the recycle is permitted to start.
+	container := crud_mkobj(&db, 4, values.NOTHING, 3, "container")
+	stuck := crud_mkobj(&db, 5, values.NOTHING, 1, "stuck")
+	stuck.location = 4
+	container.contents = 5
+	db.max_oid = 5
+
+	act := crud_root_activation(3)
+	ctx := vm.Eval_Context{activation = &act, world = &world}
+	rargs := make([]values.Var, 1)
+	rargs[0] = values.obj_val(4)
+	rresult := bf_recycle(&ow, values.list_val(rargs), &ctx)
+	if rresult.raised {
+		delete(rresult.msg)
+		values.free_var(rresult.rvalue)
+	} else {
+		values.free_var(rresult.value)
+	}
+
+	// Whatever happened, the invariant must hold: no live object may point at a dead one.
+	for oid, obj in db.objects {
+		if obj.location != values.NOTHING {
+			_, present := db.objects[obj.location]
+			testing.expectf(t, present, "#%d.location = #%d, which is not a live object", oid, obj.location)
+		}
+		if obj.contents != values.NOTHING {
+			_, present := db.objects[obj.contents]
+			testing.expectf(t, present, "#%d.contents = #%d, which is not a live object", oid, obj.contents)
+		}
+	}
+}

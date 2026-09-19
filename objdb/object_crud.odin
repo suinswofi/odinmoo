@@ -238,7 +238,19 @@ bf_recycle :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) ->
 		if mresult.raised {
 			delete(mresult.msg)
 			values.free_var(mresult.rvalue)
-			break // avoid looping forever if a stuck item refuses to move
+			// The polite eviction failed -- an :exitfunc/:accept refused, the recycler doesn't
+			// control the item, or the task ran out of budget mid-verb. Force it out at the DB
+			// level instead of giving up.
+			//
+			// Giving up is what this used to do, and it was a database-integrity bug, not just
+			// an incomplete recycle: the loop `break`, then fell through to destroy_object
+			// below, which removed `oid` from db.objects while items still held
+			// `location == oid`. That dangling link is exactly what dbfile/validate.odin
+			// rejects at load, so the next checkpoint wrote a database the server would then
+			// refuse to start on. Forcing the location change guarantees the object really is
+			// the barren orphan destroy_object requires, and guarantees this loop terminates.
+			db_change_location(w, c, values.NOTHING)
+			continue
 		}
 		values.free_var(mresult.value)
 	}
@@ -253,6 +265,10 @@ bf_recycle :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) ->
 			if mresult.raised {
 				delete(mresult.msg)
 				values.free_var(mresult.rvalue)
+				// Same as the contents loop above: if the object itself can't be moved out
+				// politely, unlink it anyway, or it stays in its old location's contents chain
+				// pointing at an object destroy_object is about to remove.
+				db_change_location(w, oid, values.NOTHING)
 			} else {
 				values.free_var(mresult.value)
 			}
@@ -296,10 +312,19 @@ bf_recycle :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) ->
 // from the DB map, ports db_destroy_object() (called only once the object is already a
 // barren orphan -- no location, no contents, no parent, no children, matching that
 // function's own precondition panic).
+//
+// The precondition is CHECKED here rather than trusted. It used to be documented and not
+// enforced, and a caller that broke it (bf_recycle, when an item refused to be evicted) left
+// other objects pointing at an id no longer in db.objects -- a dangling link that
+// dbfile/validate.odin rejects at load, i.e. a checkpoint the server cannot read back.
+// Refusing to destroy is the recoverable failure; writing an unloadable database is not.
 @(private = "file")
 destroy_object :: proc(db: ^dbfile.Database, oid: values.Objid) {
 	obj, ok := db.objects[oid]
 	if !ok {
+		return
+	}
+	if obj.contents != values.NOTHING || obj.location != values.NOTHING || obj.child != values.NOTHING || obj.parent != values.NOTHING {
 		return
 	}
 	for pv in obj.propvals {

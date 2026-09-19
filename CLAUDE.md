@@ -226,6 +226,13 @@ Two structural points that are easy to violate by accident:
   still reports against JHCore; LambdaCore calls none of them.
   Databases at format version 5+ (e.g. HellCore) are rejected cleanly at load — stock LambdaMOO's
   `DB_Version` stops at 4, and so does this.
+- **Never remove an object from `db.objects` while anything still points at it.**
+  `destroy_object` (`objdb/object_crud.odin`) enforces its own "barren orphan" precondition
+  rather than trusting callers, because `bf_recycle` broke it: when a contained object refused to
+  be evicted, recycle gave up on the eviction and destroyed the container anyway, leaving items
+  whose `location` named a dead id. That is the dangling link `dbfile/validate.odin` rejects at
+  load, so the next checkpoint wrote a database the server would refuse to start on. Eviction now
+  falls back to a DB-level `db_change_location` when the polite `move()` fails.
 - **A database with a broken object graph is rejected at load** (`dbfile/validate.odin`): every
   parent/child/sibling/location/contents/next link must name a live object or `NOTHING`, and no
   parent or location chain may loop. This is a precondition, not a nicety — every graph walk in
