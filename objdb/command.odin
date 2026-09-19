@@ -89,6 +89,8 @@ parse_words :: proc(s: string) -> []string {
 			i += 1
 		}
 	}
+	// Exact-length allocation: the receiver frees this with delete(). See vm/eval_expr.odin.
+	shrink(&words)
 	return words[:]
 }
 
@@ -152,7 +154,7 @@ find_prep :: proc(words: []string) -> (prep: int, first: int, last: int, found: 
 			}
 			matched := true
 			for k in 0 ..< n {
-				if !strings.equal_fold(words[i + k], entry.words[k]) {
+				if !values.strings_equal_fold(words[i + k], entry.words[k]) {
 					matched = false
 					break
 				}
@@ -279,10 +281,10 @@ match_object :: proc(db: ^dbfile.Database, player: values.Objid, name: string) -
 	if !valid(db, player) {
 		return FAILED_MATCH
 	}
-	if strings.equal_fold(name, "me") {
+	if values.strings_equal_fold(name, "me") {
 		return player
 	}
-	if strings.equal_fold(name, "here") {
+	if values.strings_equal_fold(name, "here") {
 		return db.objects[player].location
 	}
 	return match_contents(db, player, name)
@@ -299,7 +301,7 @@ Match_State :: struct {
 
 @(private = "file")
 check_name_match :: proc(name: string, d: ^Match_State, oid: values.Objid) {
-	if len(name) < d.lname || !strings.equal_fold(name[:d.lname], d.name) {
+	if len(name) < d.lname || !values.strings_equal_fold(name[:d.lname], d.name) {
 		return
 	}
 	if len(name) == d.lname {

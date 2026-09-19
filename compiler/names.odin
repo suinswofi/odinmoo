@@ -12,6 +12,7 @@ package compiler
 // (SLOT_NUM..SLOT_IOBJSTR, then SLOT_INT/SLOT_FLOAT), since that order is baked into every
 // compiled verb's variable-name table on disk.
 
+import "../values"
 import "core:strings"
 
 Name_Table :: struct {
@@ -57,7 +58,7 @@ name_table_destroy :: proc(t: ^Name_Table) {
 // its own clone of name) on miss.
 find_or_add :: proc(t: ^Name_Table, name: string) -> int {
 	for n, i in t.names {
-		if strings.equal_fold(n, name) {
+		if values.strings_equal_fold(n, name) {
 			return i
 		}
 	}
@@ -68,7 +69,7 @@ find_or_add :: proc(t: ^Name_Table, name: string) -> int {
 // find ports find_name(): case-insensitive lookup, -1 on miss (does not add).
 find :: proc(t: ^Name_Table, name: string) -> int {
 	for n, i in t.names {
-		if strings.equal_fold(n, name) {
+		if values.strings_equal_fold(n, name) {
 			return i
 		}
 	}

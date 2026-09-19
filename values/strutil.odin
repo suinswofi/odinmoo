@@ -20,8 +20,28 @@ clone_string :: proc(s: string) -> string {
 	return strings.clone(s)
 }
 
+// strings_equal_fold is the ASCII-only case-insensitive comparison the header above promises.
+// It used to delegate to core:strings.equal_fold, which quietly broke both halves of that
+// promise: that routine decodes RUNES and applies Unicode simple folding, so "K" (U+212A,
+// KELVIN SIGN) compared equal to "k" -- and, far worse, every byte that is not valid UTF-8
+// decodes to U+FFFD, so any two distinct invalid bytes compared EQUAL. Measured before this
+// change: "\xc3" == "\xc4" was true, and so was "\xff\xfe" == "\xfe\xff".
+//
+// MOO strings are byte strings, and the original compares them with utils.c's mystrcasecmp,
+// which folds ASCII A-Z and nothing else. This is not a theoretical difference: this proc
+// backs the `==`/`!=` operators, `in`, and case-insensitive is_member, so two genuinely
+// different strings tested equal, and it backs object-name and alias matching in
+// objdb/command.odin, where the strings come straight from player input.
 strings_equal_fold :: proc(a, b: string) -> bool {
-	return strings.equal_fold(a, b)
+	if len(a) != len(b) {
+		return false
+	}
+	for i in 0 ..< len(a) {
+		if ascii_lower(a[i]) != ascii_lower(b[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 ascii_lower :: proc(b: byte) -> byte {

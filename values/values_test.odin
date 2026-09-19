@@ -352,3 +352,46 @@ test_too_deep_finds_depth_buried_in_a_wide_list :: proc(t: ^testing.T) {
 	free_var(wide)
 	free_var(deep)
 }
+
+// ---- Regression: case-insensitive comparison must fold ASCII ONLY ----
+//
+// strings_equal_fold used to delegate to core:strings.equal_fold, which decodes runes and
+// applies Unicode simple folding. Two consequences, both wrong for a byte-string language:
+// U+212A (KELVIN SIGN) folded to "k", and -- far worse -- every byte that is not valid UTF-8
+// decodes to U+FFFD, so ANY two distinct invalid bytes compared equal. This proc backs the
+// `==`/`!=` operators, `in`, case-insensitive is_member, and (via objdb) object-name and alias
+// matching on strings that come straight from player input.
+@(test)
+test_equality_folds_ascii_only :: proc(t: ^testing.T) {
+	eq :: proc(a, b: string) -> bool {
+		va, vb := str_val(clone_string(a)), str_val(clone_string(b))
+		defer free_var(va)
+		defer free_var(vb)
+		return equality(va, vb, false)
+	}
+
+	// ASCII folding is the behaviour we DO want, and must keep working.
+	testing.expect(t, eq("Hello", "hELLO"))
+	testing.expect(t, eq("", ""))
+	testing.expect(t, !eq("abc", "abd"))
+	testing.expect(t, !eq("abc", "abcd"))
+
+	// Distinct invalid UTF-8 bytes are distinct strings. Both of these were `true`.
+	testing.expect(t, !eq("\xc3", "\xc4"))
+	testing.expect(t, !eq("\xff\xfe", "\xfe\xff"))
+	testing.expect(t, !eq("caf\xe9", "caf\xe8"))
+
+	// A high byte still equals itself, and folding must not reach past ASCII A-Z.
+	testing.expect(t, eq("caf\xe9", "CAF\xe9"))
+	testing.expect(t, !eq("\xe2\x84\xaa", "k")) // U+212A KELVIN SIGN vs plain "k"
+}
+
+// ascii_compare_fold and the index helpers were always byte-oriented; this pins that down
+// alongside the above so the whole family keeps one semantics.
+@(test)
+test_ascii_helpers_are_byte_oriented :: proc(t: ^testing.T) {
+	testing.expect(t, ascii_compare_fold("ABC", "abc") == 0)
+	testing.expect(t, ascii_compare_fold("\xc3", "\xc4") < 0)
+	testing.expect(t, ascii_index_fold("caf\xe9x", "\xe9") == 3)
+	testing.expect(t, ascii_index_fold("caf\xe9x", "\xe8") == -1)
+}

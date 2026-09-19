@@ -98,11 +98,11 @@ validate_verb_args_arg :: proc(args: values.Var) -> (dobj, prep, iobj: int, err:
 @(private = "file")
 match_arg_spec :: proc(s: string) -> (spec: int, ok: bool) {
 	switch {
-	case strings.equal_fold(s, "none"):
+	case values.strings_equal_fold(s, "none"):
 		return 0, true
-	case strings.equal_fold(s, "any"):
+	case values.strings_equal_fold(s, "any"):
 		return 1, true
-	case strings.equal_fold(s, "this"):
+	case values.strings_equal_fold(s, "this"):
 		return 2, true
 	}
 	return 0, false
@@ -110,10 +110,10 @@ match_arg_spec :: proc(s: string) -> (spec: int, ok: bool) {
 
 @(private = "file")
 match_prep_spec :: proc(s: string) -> (spec: int, ok: bool) {
-	if strings.equal_fold(s, "none") {
+	if values.strings_equal_fold(s, "none") {
 		return PREP_NONE, true
 	}
-	if strings.equal_fold(s, "any") {
+	if values.strings_equal_fold(s, "any") {
 		return PREP_ANY, true
 	}
 	words := split_prep_words(s)
@@ -138,6 +138,8 @@ split_prep_words :: proc(s: string) -> []string {
 			append(&words, w)
 		}
 	}
+	// Exact-length allocation: the receiver frees this with delete(). See vm/eval_expr.odin.
+	shrink(&words)
 	return words[:]
 }
 

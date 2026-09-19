@@ -27,7 +27,7 @@ import "core:sync"
 @(private = "file")
 handle_intrinsic_command :: proc(conn: ^Connection, ow: ^objdb.Object_World, pc: ^objdb.Parsed_Command) -> bool {
 	switch {
-	case strings.equal_fold(pc.verb, ".program"):
+	case values.strings_equal_fold(pc.verb, ".program"):
 		sync.mutex_lock(&conn.server.scheduler.big_lock)
 		is_programmer := objdb.is_programmer(ow.db, conn.player)
 		sync.mutex_unlock(&conn.server.scheduler.big_lock)
@@ -40,10 +40,10 @@ handle_intrinsic_command :: proc(conn: ^Connection, ow: ^objdb.Object_World, pc:
 			start_programming(conn, ow, pc.args[0])
 		}
 		return true
-	case strings.equal_fold(pc.verb, "PREFIX"), strings.equal_fold(pc.verb, "OUTPUTPREFIX"):
+	case values.strings_equal_fold(pc.verb, "PREFIX"), values.strings_equal_fold(pc.verb, "OUTPUTPREFIX"):
 		set_output_delimiter(conn, &conn.output_prefix, pc.argstr)
 		return true
-	case strings.equal_fold(pc.verb, "SUFFIX"), strings.equal_fold(pc.verb, "OUTPUTSUFFIX"):
+	case values.strings_equal_fold(pc.verb, "SUFFIX"), values.strings_equal_fold(pc.verb, "OUTPUTSUFFIX"):
 		set_output_delimiter(conn, &conn.output_suffix, pc.argstr)
 		return true
 	}

@@ -940,6 +940,8 @@ parse_brace :: proc(p: ^Parser) -> Expr {
 			free(id)
 		}
 		delete(items)
+		// Exact-length allocation: ast_destroy frees this with delete(). See vm/eval_expr.odin.
+		shrink(&scat_items)
 		vet_scatter(p, scat_items[:])
 		expect(p, .Assign)
 		rhs := parse_expr(p, ASSIGN_BP)
@@ -1005,6 +1007,8 @@ parse_ne_arglist :: proc(p: ^Parser) -> []Arg {
 		advance(p)
 		append(&items, parse_one_arg(p))
 	}
+	// Exact-length allocation: ast_destroy frees this with delete(). See vm/eval_expr.odin.
+	shrink(&items)
 	return items[:]
 }
 
@@ -1062,7 +1066,7 @@ check_loop_name :: proc(p: ^Parser, name: string, is_break: bool) {
 		if e.is_barrier {
 			break
 		}
-		if e.name != "" && strings.equal_fold(e.name, name) {
+		if e.name != "" && values.strings_equal_fold(e.name, name) {
 			return
 		}
 	}
