@@ -259,7 +259,9 @@ bf_connection_options :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_
 	if !found {
 		return err_result_local(.E_INVARG, "Invalid argument")
 	}
-	return ok_result(list)
+	// Wraps each stored option value TWICE ({name, value} inside the pair list), so it is the
+	// other built-in that can hand back something deeper than it was given.
+	return ok_result_checked(list)
 }
 
 // bf_output_delimiters ports tasks.c's bf_output_delimiters(): (player) -> {prefix, suffix}
@@ -454,7 +456,9 @@ bf_eval :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 		items := make([]values.Var, 2)
 		items[0] = values.int_val(1)
 		items[1] = result.value
-		return ok_result(values.list_val(items))
+		// Checked: this wrap is how eval() deepened a value without ever passing an argument
+		// list -- see ok_result_checked for the crash it reached.
+		return ok_result_checked(values.list_val(items))
 	case .Raised:
 		// Like a verb call, eval()'d code runs in its own activation, so a raise inside it
 		// unwinds through eval()'s caller rather than becoming that caller's inline value.

@@ -147,19 +147,30 @@ Two structural points that are easy to violate by accident:
   `ticks_left()` means LambdaCore's `suspend_if_needed` now actually fires, and it backs off by
   measured lag — up to a 10-second pause per yield, where before it never fired at all.
 - **Values are bounded in size and nesting depth** (`values.MAX_VALUE_DEPTH`, `MAX_LIST_LEN`,
-  `MAX_STR_LEN`), enforced where values are *built* — the list literal in `eval_args_as_list`,
-  `index_set`/`range_set`, and `listappend`/`listinsert`/`listset`/`setadd`. Depth is cached on
-  `Moo_List` so the check is O(1); the two in-place mutators (`list_set` and `do_insert`'s
-  append fast path) must keep it up to date. This is memory safety, not a quota: nearly
-  everything that touches a value walks it recursively on the native stack (`free_var`,
-  `equality`, `toliteral`, **the database writer**), so a deep enough value crashes the server
-  on *checkpoint*. `dbfile`'s reader enforces the same depth ceiling, since a hand-written
-  `.db` isn't built through the VM.
+  `MAX_STR_LEN`). This is memory safety, not a quota: nearly everything that touches a value
+  walks it recursively on the native stack (`free_var`, `equality`, `toliteral`, **the database
+  writer**), so a deep enough value crashes the server on *checkpoint* — the database then
+  cannot be written at all.
 
-  Length is bounded the same way and at every point that concatenates, which is *not just the
-  `+` operator*: `tostr`, `strsub` and `toliteral` are all doubling constructions -- `s =
-  tostr(s, s)` in a loop reached 64MB, four times `MAX_STR_LEN`, while `do_string_concat`'s
-  guard sat there doing nothing because none of them go through it -- so each needs its own cap.
+  Enforcement is at every point that can make a value *deeper* or *longer* than its inputs, and
+  the coverage has been wrong twice, so the rule is worth stating as a rule. **Depth** grows only
+  where a value is nested inside another: the list literal in `eval_args_as_list`,
+  `index_set`/`range_set`, `listappend`/`listinsert`/`listset`/`setadd`, and any built-in that
+  *wraps* a caller-supplied value — those must return through `objdb`'s `ok_result_checked`
+  (`eval()` and `connection_options()` do; `eval()` was the hole, because its only argument is a
+  string, so a value smuggled in and out through a property never passed an argument list and
+  grew without limit). **Length** grows wherever strings or lists are concatenated, which is *not
+  just the `+` operator*: `tostr`, `strsub` and `toliteral` are all doubling constructions and
+  each needs its own cap.
+
+  `value_depth` is a cached upper BOUND, not the exact depth — the in-place mutators (`list_set`,
+  `do_insert`'s append fast path) raise it and can't lower it, because recomputing per `l[i] = v`
+  would be quadratic. So **use `too_deep`, never `value_depth`, to decide anything**: it walks the
+  value for real when the cheap bound trips, which is what stops a stale bound from permanently
+  rejecting a value that is actually shallow. `MAX_USABLE_VALUE_DEPTH` is the deepest a value can
+  be and still be passable as an argument (the argument list costs a level); `dbfile`'s reader
+  holds loaded values to that, so a database this server accepts can't contain a value MOO code
+  is unable to touch.
 - **Each connection gets its own thread with a blocking socket**, instead of one `select()`/`poll()`
   multiplexing loop. There is no event loop to add a descriptor to. Outbound writes never happen
   inline: `send_line` appends to a bounded per-connection buffer drained by a dedicated writer

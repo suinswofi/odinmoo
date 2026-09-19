@@ -197,7 +197,19 @@ MAX_VALUE_DEPTH :: 256
 MAX_LIST_LEN :: 1 << 20
 MAX_STR_LEN :: 1 << 24
 
-// value_depth reports how deeply v nests. Scalars are 0, so `{1, 2}` is 1 and `{{1}}` is 2.
+// MAX_USABLE_VALUE_DEPTH is the deepest a value may be and still be passable to a verb or
+// built-in: the argument list carrying it is itself a value and costs one level, so it must fit
+// under MAX_VALUE_DEPTH too. Values loaded from a database are held to this rather than to
+// MAX_VALUE_DEPTH, so that a database this server accepts can never contain a value that MOO
+// code is then unable to touch.
+MAX_USABLE_VALUE_DEPTH :: MAX_VALUE_DEPTH - 1
+
+// value_depth reports v's cached nesting depth. Scalars are 0, so `{1, 2}` is 1 and `{{1}}` is 2.
+//
+// This is an upper BOUND, not necessarily the exact depth: the two in-place mutators
+// (list.odin's list_set and do_insert fast path) raise it without being able to lower it, since
+// recomputing on every `l[i] = v` would make a loop over a list quadratic. Use too_deep, not
+// this, to decide whether a value is over the limit.
 value_depth :: proc(v: Var) -> int {
 	if v.type == .List {
 		return v.data.list.depth
@@ -205,12 +217,40 @@ value_depth :: proc(v: Var) -> int {
 	return 0
 }
 
+// exceeds_depth answers "does v nest more than `budget` levels" by walking it, stopping as soon
+// as it knows. Its own recursion is bounded by `budget`, so it cannot overflow the stack even on
+// a value whose cached bound is wrong.
+@(private = "file")
+exceeds_depth :: proc(v: Var, budget: int) -> bool {
+	if v.type != .List {
+		return false
+	}
+	if budget <= 0 {
+		return true
+	}
+	for item in v.data.list.items {
+		if exceeds_depth(item, budget - 1) {
+			return true
+		}
+	}
+	return false
+}
+
 // too_deep is the guard every value-building operation applies to its RESULT. Checking
 // afterwards rather than before is deliberate: the result's depth is already cached by
-// list_val, so the test is a field read, and the operations that need it (list literals,
+// list_val, so the common case is a field read, and the operations that need it (list literals,
 // listappend, l[i] = v, ...) all consume their inputs on the way to producing it anyway.
+//
+// The cached bound is only a FILTER. Being an over-estimate, it can claim a value is too deep
+// when it is not -- `l = {x}` with a deep x, then `l[1] = 0`, leaves `l` as the one-element list
+// `{0}` still carrying x's depth, and that made `length(l)` raise E_QUOTA forever. So when the
+// cheap test trips, the real depth is walked before anything is rejected. That slow path runs
+// only on the way to raising an error, and only ever walks MAX_VALUE_DEPTH levels.
 too_deep :: proc(v: Var) -> bool {
-	return value_depth(v) > MAX_VALUE_DEPTH
+	if value_depth(v) <= MAX_VALUE_DEPTH {
+		return false
+	}
+	return exceeds_depth(v, MAX_VALUE_DEPTH)
 }
 
 empty_list :: proc() -> Var {

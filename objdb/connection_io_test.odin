@@ -643,3 +643,75 @@ test_db_disk_size_reports_the_hook_and_quotas_without_one :: proc(t: ^testing.T)
 	testing.expectf(t, r2.value.type == .Int && r2.value.data.num == 4242, "want 4242, got %v", r2.value)
 	values.free_var(r2.value)
 }
+
+// ---- eval()'s result wrap (ok_result_checked) ----
+//
+// eval() returns {1, value}, which deepens the value by one level. That is the ONE nesting site
+// whose input never passed through an argument list -- its only argument is a string -- so a
+// deep value fetched from a property and handed back out grew without limit:
+//
+//     x = eval("return #0.deep;"); #0.deep = x;
+//
+// in a loop, across tasks, reproduced the segfault values.MAX_VALUE_DEPTH exists to prevent, in
+// free_var and in the database writer (so the checkpoint died and the database became
+// unwritable). The property here is built directly rather than by MOO code, which is both how
+// the loop accumulated one and how a legacy database could already contain one.
+@(test)
+test_eval_result_wrap_is_depth_checked :: proc(t: ^testing.T) {
+	db := build_crud_world()
+	defer crud_world_destroy(&db)
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+
+	deep := values.list_val(make([]values.Var, 0))
+	for _ in 0 ..< values.MAX_VALUE_DEPTH - 1 {
+		items := make([]values.Var, 1)
+		items[0] = deep
+		deep = values.list_val(items)
+	}
+	testing.expect(t, values.value_depth(deep) == values.MAX_VALUE_DEPTH, "expected a value at exactly the limit")
+	crud_add_propdef(&db, db.objects[1], "deep", deep, 1)
+
+	ow := object_world_init(&db, &sched)
+	defer object_world_destroy(&ow)
+	world := make_world(&ow)
+	act := crud_root_activation(1) // #1 is a wizard, and so a programmer: eval() is permitted
+	ctx := vm.Eval_Context{activation = &act, world = &world}
+
+	args := make([]values.Var, 1)
+	args[0] = values.str_val(strings.clone("return #1.deep;"))
+	r := bf_eval(&ow, values.list_val(args), &ctx)
+	if !testing.expectf(t, r.raised, "wrapping a limit-depth value must raise, got %v", r.value) {
+		values.free_var(r.value)
+		return
+	}
+	testing.expectf(t, r.code == .E_QUOTA, "want E_QUOTA, got %v", r.code)
+	delete(r.msg)
+	values.free_var(r.rvalue)
+}
+
+// The check must not disturb an ordinary eval().
+@(test)
+test_eval_still_returns_shallow_values :: proc(t: ^testing.T) {
+	db := build_crud_world()
+	defer crud_world_destroy(&db)
+	sched := tasks.scheduler_init()
+	defer tasks.scheduler_destroy(&sched)
+	ow := object_world_init(&db, &sched)
+	defer object_world_destroy(&ow)
+	world := make_world(&ow)
+	act := crud_root_activation(1)
+	ctx := vm.Eval_Context{activation = &act, world = &world}
+
+	args := make([]values.Var, 1)
+	args[0] = values.str_val(strings.clone("return {1, {2, {3}}};"))
+	r := bf_eval(&ow, values.list_val(args), &ctx)
+	testing.expectf(t, !r.raised, "ordinary eval should succeed, got %v", r.code)
+	if r.raised {
+		delete(r.msg)
+		values.free_var(r.rvalue)
+		return
+	}
+	testing.expect(t, r.value.type == .List && values.list_len(r.value) == 2)
+	values.free_var(r.value)
+}

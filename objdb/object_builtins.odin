@@ -163,6 +163,28 @@ ok_result :: proc(v: values.Var) -> vm.Call_Result {
 	return vm.call_ok(v)
 }
 
+// ok_result_checked is ok_result for a built-in that WRAPS a caller-supplied value in a new
+// list, which is the one shape that can deepen a value. Every other route into a built-in is
+// already bounded, because an argument list is itself depth-checked as it is built
+// (vm/eval_expr.odin's eval_args_as_list) -- so a built-in can never RECEIVE a value past the
+// limit, and therefore never return one deeper than the limit plus one.
+//
+// eval() was the exception and it was a genuine hole: its only argument is a STRING, so a deep
+// value smuggled in and out through a property never passed an argument list at all. `x =
+// eval("return #0.deep;"); #0.deep = x;` in a loop grew the value by one level per iteration,
+// unbounded across tasks, and reproduced exactly the segfault values.MAX_VALUE_DEPTH exists to
+// prevent -- in free_var, and in the database writer, which means the CHECKPOINT dies and the
+// database can no longer be written at all.
+//
+// Use this rather than another one-off check wherever a built-in nests a value it was handed.
+ok_result_checked :: proc(v: values.Var) -> vm.Call_Result {
+	if values.too_deep(v) {
+		values.free_var(v)
+		return err_result_local(.E_QUOTA, "Value too large")
+	}
+	return vm.call_ok(v)
+}
+
 err_result_local :: proc(code: values.Error, msg: string) -> vm.Call_Result {
 	return vm.Call_Result{raised = true, code = code, msg = strings.clone(msg), rvalue = values.int_val(0)}
 }

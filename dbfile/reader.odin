@@ -139,7 +139,9 @@ expect_line :: proc(r: ^Reader, expected: string) -> Read_Error {
 // TYPE_ANY quirk, ported verbatim from db_io.c's dbio_read_var).
 //
 // `depth` bounds the one place this function recurses -- a list element -- against
-// values.MAX_VALUE_DEPTH, and is the load-time half of that limit. The VM enforces it on
+// values.MAX_USABLE_VALUE_DEPTH (not MAX_VALUE_DEPTH: a value the VM cannot pass as an argument
+// has no business being in a database this server accepts), and is the load-time half of that
+// limit. The VM enforces it on
 // values MOO code builds, so no database this server writes can exceed it; a file from
 // anywhere else can, and a million-deep list would overflow the stack here rather than
 // being reported as the malformed input it is. Rejecting it is the same policy validate.odin
@@ -183,7 +185,7 @@ read_var :: proc(r: ^Reader, version: int, intern: ^values.Intern_Table, depth: 
 		f, ferr := read_float(r)
 		return values.float_val(f), ferr
 	case .List:
-		if depth >= values.MAX_VALUE_DEPTH {
+		if depth >= values.MAX_USABLE_VALUE_DEPTH {
 			return values.none_val(), .Bad_Format
 		}
 		n, nerr := read_num(r)

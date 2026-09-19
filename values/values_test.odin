@@ -314,3 +314,41 @@ test_too_deep_triggers_at_the_limit :: proc(t: ^testing.T) {
 	testing.expect(t, too_deep(one_more), "one level past the limit must be rejected")
 	free_var(one_more)
 }
+
+// The cached depth is a monotonic upper bound -- list_set and do_insert raise it and can never
+// lower it, because recomputing on every `l[i] = v` would make a loop over a list quadratic. So
+// too_deep must not trust it when it trips: `l = {x}` with a deep x, then `l[1] = 0`, leaves `l`
+// as the one-element list {0} still carrying x's depth. That made length(l), toliteral(l) and
+// passing l to anything at all raise E_QUOTA forever, on a value that is literally {0}.
+@(test)
+test_too_deep_does_not_trust_a_stale_cached_depth :: proc(t: ^testing.T) {
+	deep := mklist()
+	for _ in 0 ..< MAX_VALUE_DEPTH - 1 {
+		deep = mklist(deep)
+	}
+	l := mklist(var_ref(deep))
+	testing.expect(t, value_depth(l) > MAX_VALUE_DEPTH, "expected the wrapper to be over the limit")
+	testing.expect(t, too_deep(l), "a genuinely over-deep value must still be rejected")
+
+	// Replace the one deep element with a scalar. The list is now {0}.
+	l = list_set(l, int_val(0), 1)
+	testing.expect(t, value_depth(l) > MAX_VALUE_DEPTH, "the cached bound is expected to stay stale")
+	testing.expect(t, !too_deep(l), "a shallow value must not be rejected because of a stale bound")
+
+	free_var(l)
+	free_var(deep)
+}
+
+// The authoritative walk must still reject what the bound catches, including a value that is
+// only over the limit deep inside a wide list.
+@(test)
+test_too_deep_finds_depth_buried_in_a_wide_list :: proc(t: ^testing.T) {
+	deep := mklist()
+	for _ in 0 ..< MAX_VALUE_DEPTH {
+		deep = mklist(deep)
+	}
+	wide := mklist(int_val(1), int_val(2), var_ref(deep), int_val(3))
+	testing.expect(t, too_deep(wide))
+	free_var(wide)
+	free_var(deep)
+}
