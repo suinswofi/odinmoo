@@ -104,12 +104,23 @@ Two structural points that are easy to violate by accident:
   point possible.
 - **Anything recursive runs on the native stack, so every such recursion needs an explicit
   ceiling** — this port turns what is a growable heap array (or a bison value stack) upstream into
-  a segfault that takes the whole server down. There are four, and they are a family, not
+  a segfault that takes the whole server down. There are five, and they are a family, not
   unrelated constants: `compiler.MAX_PARSE_DEPTH` (nested expressions and statement blocks —
   `.program`, `eval()`, `set_verb_code()` and a `.db`'s verb text all reach the parser),
-  `objdb.MAX_VERB_DEPTH` (nested verb calls), `values.MAX_VALUE_DEPTH` (nested values), and
-  `dbfile`'s reader applying the last of those at load. Adding a new recursive walk over
+  `objdb.MAX_VERB_DEPTH` (nested verb calls), `values.MAX_VALUE_DEPTH` (nested values),
+  `regex.MAX_ALT_DEPTH` (a pattern's `%|` branch count — `compile_alt` recurses once per
+  branch, so `"a%|" * 100000` from any `match()` call used to segfault outright), and
+  `dbfile`'s reader applying MAX_VALUE_DEPTH at load. Adding a new recursive walk over
   attacker-shaped input means asking which of these bounds it.
+
+  Where there is no *legitimate* depth to cut off, the answer is an explicit heap stack
+  rather than another tuned constant — the descendant-tree walks
+  (`objdb.property_defined_at_or_below`, `prop_resync`'s `snapshot_subtree` and
+  `resync_subtree_propvals`) are iterative for exactly that reason: object-tree depth is
+  bounded only by the object count, and `create()` in a loop builds it. The same question
+  applies to recursion reached through *dispatch* rather than through a parser:
+  `call_function("call_function", …)` re-entered `bf_call_function` once per leading name,
+  charging no tick and passing no `MAX_VERB_DEPTH` check, so it unwraps its chain in a loop.
 - **Tasks are real OS threads, not a cooperative single-threaded loop with snapshotted activation
   stacks.** A single `Scheduler.big_lock` mutex guarantees only one task actively touches the object
   DB at a time, preserving the original's effective single-writer semantics. Anything touching the
@@ -139,6 +150,17 @@ Two structural points that are easy to violate by accident:
   through it. **A built-in must do work bounded by its inputs** (which are themselves bounded by
   `MAX_STR_LEN`/`MAX_LIST_LEN`); one that loops on its own recognizance needs its own internal
   ceiling, like `regex.MAX_STEPS`, and that ceiling must be per-call.
+
+  Two corollaries, both learned the hard way after that fix. **The ceiling has to cover the
+  set-up, not just the loop**: `regex`'s per-attempt `runner_reset` cleared an
+  O(len(program)) array once per start position, work `steps` never counted, so a `match()`
+  still cost O(len(subject) × len(pattern)) — 5.6s for a 20KB pattern on a 200KB subject.
+  (It now invalidates by bumping a stamp counter instead.) And **"bounded by its inputs" is
+  not the same as "small"**: `substitute()`'s output is (number of `%N` directives) ×
+  (length of the span each names), a product of two capped inputs that still reached 2GB in
+  25 seconds from a 20KB template and a 200KB subject. A built-in whose output is a product
+  rather than a sum of its inputs needs an explicit `MAX_STR_LEN` check, not just an
+  argument that its inputs are finite.
 
   Two further consequences, both deliberate: a budget abort does **not** run `try ... finally`
   handlers (so core invariants restored that way are not restored — running them is impossible,
@@ -180,6 +202,11 @@ Two structural points that are easy to violate by accident:
   both the partial line being accumulated in `connection_read_loop` and a connection's
   `pending_lines` queue, since both grow on an unauthenticated connection's say-so. Over-limit
   policy matches the output side — drop what is queued, tell the client, keep the connection.
+  The third per-connection buffer is the `.program` editor's (`MAX_PROGRAM_TEXT`, which is
+  `values.MAX_STR_LEN` because `set_verb_code` joins those lines into one MOO string); it had no
+  ceiling at all until an audit caught it, and its over-limit policy differs deliberately —
+  the session is abandoned rather than truncated, because quietly installing the first 16MB of a
+  verb body someone is still typing is worse than making them start again.
 - **A `^Connection` may only be dereferenced by another thread while holding `players_lock`**, and
   never after releasing it — that lock is the only thing standing between the pointer and the
   connection's own thread freeing it. The other half of the rule lives in `connection_teardown`:
@@ -234,12 +261,37 @@ Two structural points that are easy to violate by accident:
   load, so the next checkpoint wrote a database the server would refuse to start on. Eviction now
   falls back to a DB-level `db_change_location` when the polite `move()` fails.
 - **A database with a broken object graph is rejected at load** (`dbfile/validate.odin`): every
-  parent/child/sibling/location/contents/next link must name a live object or `NOTHING`, and no
-  parent or location chain may loop. This is a precondition, not a nicety — every graph walk in
+  parent/child/sibling/location/contents/next link must name a live object or `NOTHING`, and
+  none of the four chains `objdb` walks may loop — `parent`, `location`, `contents`→`next`, and
+  `child`→`sibling`. This is a precondition, not a nicety — every graph walk in
   `objdb` indexes `db.objects` with an id taken straight from another object's link field, so a
   dangling link is a nil dereference and a cycle is an infinite loop, both surfacing far from
-  the damage. `cmd/jhverify` reports on the same invariants; this enforces them. All bundled
-  cores pass unchanged.
+  the damage. (Only `parent` and `location` were cycle-checked at first, which left `#1.contents
+  = #2; #2.next = #2` loading cleanly and then spinning the first time anyone looked in that
+  room.) Loading also requires each object's `propvals` to be exactly as long as its accumulated
+  property layout, since `find_property` indexes it with a count derived from the parent chain
+  and no bounds check. `cmd/jhverify` reports on the same invariants; this enforces them. All
+  bundled cores pass unchanged.
+- **A checkpoint must preserve the recycled-object ceiling, not just the live objects.**
+  `dbfile/write.odin` seeds its object count from `db.max_oid` — the highest id ever *assigned* —
+  and emits a `#N recycled` record for every hole below it. Recomputing that ceiling from the
+  live objects instead drops every hole above the last survivor, and the consequence is object
+  number REUSE: recycle the top object, checkpoint, restart, and `create()` hands the same number
+  straight back out, so any `#N` still stored in a property starts naming an unrelated new
+  object. The Programmer's Manual is explicit that this never happens.
+- **Case-insensitive string comparison folds ASCII and nothing else** (`values.strings_equal_fold`,
+  and every caller goes through it — nothing calls `core:strings.equal_fold` directly). MOO
+  strings are byte strings and the original compares them with `utils.c`'s `mystrcasecmp`.
+  `core:strings.equal_fold` decodes runes and applies Unicode simple folding, which quietly made
+  `"\xc3" == "\xc4"` true — every byte that is not valid UTF-8 decodes to U+FFFD, so any two
+  distinct invalid bytes compared equal. That backs `==`/`in`/`is_member` and object-name and
+  alias matching, i.e. strings that come straight from player input.
+- **A `Call_Result` that can raise must have its `raised` flag checked before `.value` is read.**
+  A raised result's `value` is the zero `Var` (type `.Int`), so `value.data.str.s` dereferences
+  nil and takes the process down. This bit three separate `builtins.call("toliteral", …)` call
+  sites at once — `.eval`, emergency mode and `cmd/dbscript` — the moment `toliteral` gained a
+  `MAX_STR_LEN` ceiling it had never had before. Giving a shared function a new failure mode
+  means auditing its callers; `grep` found all three in seconds.
 
 ## Working in this codebase
 
