@@ -272,6 +272,14 @@ bf_strsub :: proc(args: values.Var) -> vm.Call_Result {
 	b := strings.builder_make()
 	i := 0
 	for i < len(haystack) {
+		// Same doubling guard as tostr/toliteral: `s = strsub(s, "a", "aa")` grew a string past
+		// values.MAX_STR_LEN unchecked (measured: 64MB after 26 iterations, and unbounded after
+		// that). Checked inside the loop so it stops at the limit instead of after the whole
+		// replacement has been materialised.
+		if strings.builder_len(b) > values.MAX_STR_LEN {
+			strings.builder_destroy(&b)
+			return raise_err(.E_QUOTA, "Value too large")
+		}
 		rest := haystack[i:]
 		matched := strings.has_prefix(rest, needle) if case_matters else values.ascii_has_prefix_fold(rest, needle)
 		if matched {

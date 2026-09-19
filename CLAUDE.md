@@ -155,6 +155,11 @@ Two structural points that are easy to violate by accident:
   `equality`, `toliteral`, **the database writer**), so a deep enough value crashes the server
   on *checkpoint*. `dbfile`'s reader enforces the same depth ceiling, since a hand-written
   `.db` isn't built through the VM.
+
+  Length is bounded the same way and at every point that concatenates, which is *not just the
+  `+` operator*: `tostr`, `strsub` and `toliteral` are all doubling constructions -- `s =
+  tostr(s, s)` in a loop reached 64MB, four times `MAX_STR_LEN`, while `do_string_concat`'s
+  guard sat there doing nothing because none of them go through it -- so each needs its own cap.
 - **Each connection gets its own thread with a blocking socket**, instead of one `select()`/`poll()`
   multiplexing loop. There is no event loop to add a descriptor to. Outbound writes never happen
   inline: `send_line` appends to a bounded per-connection buffer drained by a dedicated writer

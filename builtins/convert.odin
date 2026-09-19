@@ -22,11 +22,20 @@ bf_typeof :: proc(args: values.Var) -> vm.Call_Result {
 // concatenated with no separator: INT decimal, OBJ "#N", STR raw (no quotes), ERR its
 // English message (not the E_FOO token -- that's toliteral's job), FLOAT "%g", LIST the
 // literal marker text "{list}" (not recursively expanded).
+// The values.MAX_STR_LEN guard here is not belt-and-braces. `do_string_concat` bounds the `+`
+// operator (vm/value_ops.odin), but tostr() concatenates too, so `s = tostr(s, s)` was an
+// unguarded doubling construction: 26 iterations produced a 64MB string, four times the cap,
+// and it keeps going from there. Checked per argument rather than up front so the bound is
+// exact; the transient overshoot is one argument, itself already capped.
 bf_tostr :: proc(args: values.Var) -> vm.Call_Result {
 	defer values.free_var(args)
 	b := strings.builder_make()
 	for i in 1 ..= nargs(args) {
 		v := nth(args, i)
+		if strings.builder_len(b) > values.MAX_STR_LEN {
+			strings.builder_destroy(&b)
+			return raise_err(.E_QUOTA, "Value too large")
+		}
 		#partial switch v.type {
 		case .Int:
 			fmt.sbprintf(&b, "%d", v.data.num)
@@ -42,6 +51,10 @@ bf_tostr :: proc(args: values.Var) -> vm.Call_Result {
 			strings.write_string(&b, "{list}")
 		}
 	}
+	if strings.builder_len(b) > values.MAX_STR_LEN {
+		strings.builder_destroy(&b)
+		return raise_err(.E_QUOTA, "Value too large")
+	}
 	return vm.call_ok(values.str_val(strings.to_string(b)))
 }
 
@@ -54,6 +67,14 @@ bf_toliteral :: proc(args: values.Var) -> vm.Call_Result {
 	}
 	b := strings.builder_make()
 	write_literal(&b, nth(args, 1))
+	// `s = toliteral(s)` roughly doubles a string of quote characters each call, so this is a
+	// doubling construction too and needs the same cap as tostr/strsub. Checked after building
+	// rather than before: the output size is only knowable by producing it (write_literal
+	// recurses over lists), and it is bounded by about twice an input that already exists.
+	if strings.builder_len(b) > values.MAX_STR_LEN {
+		strings.builder_destroy(&b)
+		return raise_err(.E_QUOTA, "Value too large")
+	}
 	return vm.call_ok(values.str_val(strings.to_string(b)))
 }
 

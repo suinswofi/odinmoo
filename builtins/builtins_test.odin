@@ -1,6 +1,8 @@
 package builtins
 
 import "../values"
+import "../vm"
+import "core:strings"
 import "core:testing"
 
 @(private = "file")
@@ -182,4 +184,77 @@ test_unknown_builtin_not_found :: proc(t: ^testing.T) {
 	_, found := call("this_does_not_exist", args)
 	testing.expect(t, !found)
 	values.free_var(args)
+}
+
+// tostr(), strsub() and toliteral() all concatenate, so each is a doubling construction:
+// `s = tostr(s, s)` in a loop reached 64MB -- four times values.MAX_STR_LEN -- while the `+`
+// operator's guard in vm/value_ops.odin sat there doing nothing, because none of these go
+// through it. Each must refuse to build past the cap.
+@(test)
+test_string_builders_respect_max_str_len :: proc(t: ^testing.T) {
+	big := strings.repeat("x", values.MAX_STR_LEN)
+	defer delete(big)
+
+	// tostr: two near-limit arguments would concatenate to twice the limit.
+	a1 := make([]values.Var, 2)
+	a1[0] = values.str_val(strings.clone(big))
+	a1[1] = values.str_val(strings.clone(big))
+	r1 := call_builtin(t, "tostr", a1)
+	expect_raised(t, r1, .E_QUOTA, "tostr")
+
+	// strsub: every "x" becomes "xx", doubling a near-limit subject.
+	a2 := make([]values.Var, 3)
+	a2[0] = values.str_val(strings.clone(big))
+	a2[1] = values.str_val(strings.clone("x"))
+	a2[2] = values.str_val(strings.clone("xx"))
+	r2 := call_builtin(t, "strsub", a2)
+	expect_raised(t, r2, .E_QUOTA, "strsub")
+
+	// toliteral: quoting a near-limit string of quote characters roughly doubles it.
+	quotes := strings.repeat("\"", values.MAX_STR_LEN)
+	defer delete(quotes)
+	a3 := make([]values.Var, 1)
+	a3[0] = values.str_val(strings.clone(quotes))
+	r3 := call_builtin(t, "toliteral", a3)
+	expect_raised(t, r3, .E_QUOTA, "toliteral")
+}
+
+// The guards must not disturb ordinary use.
+@(test)
+test_string_builders_still_work_normally :: proc(t: ^testing.T) {
+	a1 := make([]values.Var, 3)
+	a1[0] = values.str_val(strings.clone("ab"))
+	a1[1] = values.int_val(1)
+	a1[2] = values.obj_val(2)
+	r1 := call_builtin(t, "tostr", a1)
+	testing.expect(t, !r1.raised)
+	testing.expectf(t, r1.value.type == .Str && r1.value.data.str.s == "ab1#2", "got %v", r1.value)
+	values.free_var(r1.value)
+
+	a2 := make([]values.Var, 3)
+	a2[0] = values.str_val(strings.clone("banana"))
+	a2[1] = values.str_val(strings.clone("an"))
+	a2[2] = values.str_val(strings.clone("AN"))
+	r2 := call_builtin(t, "strsub", a2)
+	testing.expect(t, !r2.raised)
+	testing.expectf(t, r2.value.type == .Str && r2.value.data.str.s == "bANANa", "got %v", r2.value)
+	values.free_var(r2.value)
+}
+
+@(private = "file")
+call_builtin :: proc(t: ^testing.T, name: string, args: []values.Var) -> vm.Call_Result {
+	r, found := call(name, values.list_val(args))
+	testing.expectf(t, found, "%s should be a known built-in", name)
+	return r
+}
+
+@(private = "file")
+expect_raised :: proc(t: ^testing.T, r: vm.Call_Result, want: values.Error, label: string) {
+	if !testing.expectf(t, r.raised, "%s: expected a raise, got %v", label, r.value) {
+		values.free_var(r.value)
+		return
+	}
+	testing.expectf(t, r.code == want, "%s: want %v, got %v", label, want, r.code)
+	delete(r.msg)
+	values.free_var(r.rvalue)
 }
