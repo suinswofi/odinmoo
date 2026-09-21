@@ -4,6 +4,7 @@ import "../values"
 import "../vm"
 import "core:strings"
 import "core:testing"
+import "core:time"
 
 @(private = "file")
 mklist :: proc(items: ..values.Var) -> values.Var {
@@ -332,4 +333,102 @@ test_substitute_still_works_normally :: proc(t: ^testing.T) {
 		r.value,
 	)
 	values.free_var(r.value)
+}
+
+// ---- Cost and output bounds ----
+//
+// strsub asked "does the needle start here" at every position, which is O(len(subject) *
+// len(what)) -- both capped only by values.MAX_STR_LEN, so the same product-of-two-capped-
+// inputs wedge index() had, reached the same way. Measured before the fix on 400KB of "a"
+// with a 200KB needle that never matches: 29s case-folding, 0.95s case-sensitive, each for a
+// single tick with big_lock held. Both paths are pinned here: the case-sensitive one went
+// through core:strings.has_prefix and was quadratic too, just with a faster constant.
+@(test)
+test_strsub_is_not_quadratic :: proc(t: ^testing.T) {
+	n, m := 400_000, 200_000
+	subject := strings.repeat("a", n)
+	prefix := strings.repeat("a", m - 1)
+	what := strings.concatenate({prefix, "b"})
+	defer delete(subject)
+	defer delete(prefix)
+	defer delete(what)
+
+	for case_matters in ([]bool{false, true}) {
+		args := mklist(
+			values.str_val(values.clone_string(subject)),
+			values.str_val(values.clone_string(what)),
+			values.str_val(values.clone_string("Z")),
+			values.int_val(1 if case_matters else 0),
+		)
+		started := time.now()
+		r, found := call("strsub", args)
+		elapsed := time.since(started)
+		testing.expect(t, found)
+		testing.expect(t, !r.raised)
+		// No occurrence, so the subject comes back unchanged.
+		testing.expect(t, r.value.type == .Str && len(r.value.data.str.s) == n)
+		testing.expectf(
+			t,
+			elapsed < 2 * time.Second,
+			"strsub (case_matters=%v) over %d bytes with a %d-byte needle took %v -- the per-position scan is back",
+			case_matters, n, m, elapsed,
+		)
+		values.free_var(r.value)
+	}
+}
+
+// strsub's ordinary semantics, which the rewrite from a per-byte loop to a search-and-copy
+// loop has to preserve exactly: leftmost-first, non-overlapping, case-folding by default.
+@(test)
+test_strsub_semantics_unchanged :: proc(t: ^testing.T) {
+	check :: proc(t: ^testing.T, subject, what, with, want: string) {
+		args := mklist(
+			values.str_val(values.clone_string(subject)),
+			values.str_val(values.clone_string(what)),
+			values.str_val(values.clone_string(with)),
+		)
+		r, _ := call("strsub", args)
+		testing.expect(t, !r.raised)
+		testing.expectf(
+			t,
+			r.value.type == .Str && r.value.data.str.s == want,
+			"strsub(%q, %q, %q) = %q, want %q",
+			subject, what, with, r.value.data.str.s, want,
+		)
+		values.free_var(r.value)
+	}
+	check(t, "hello world hello", "hello", "bye", "bye world bye")
+	check(t, "aaa", "aa", "b", "ba")            // non-overlapping, leftmost-first
+	check(t, "abc", "z", "q", "abc")            // no occurrence
+	check(t, "aXbXc", "x", "--", "a--b--c")     // folding is the default
+	check(t, "xx", "x", "", "")                 // empty replacement
+	check(t, "abc", "abc", "z", "z")            // needle is the whole subject
+	check(t, "aaaaaa", "aa", "aa", "aaaaaa")    // replacement equal to the needle terminates
+}
+
+// ansify() expands every markup code into a longer escape sequence -- about 2.5x at worst --
+// so with an input already allowed to be values.MAX_STR_LEN the output ran past it: 8MB of
+// "%r" returned 20MB against a 16MB cap. tostr/toliteral/strsub/substitute all carry this
+// check; ansify was the one string-builder here that did not.
+@(test)
+test_ansify_is_capped :: proc(t: ^testing.T) {
+	// 8M of "%r" -> ~20MB of escapes, comfortably over the cap.
+	big := strings.repeat("%r", values.MAX_STR_LEN / 2)
+	defer delete(big)
+	r, found := call("ansify", mklist(values.str_val(values.clone_string(big))))
+	testing.expect(t, found)
+	testing.expectf(t, r.raised, "ansify of %d bytes of markup was not capped", len(big))
+	if r.raised {
+		testing.expect(t, r.code == .E_QUOTA)
+		delete(r.msg)
+		values.free_var(r.rvalue)
+	} else {
+		values.free_var(r.value)
+	}
+
+	// ...and an ordinary string still translates.
+	r2, _ := call("ansify", mklist(values.str_val(values.clone_string("%rred%n"))))
+	testing.expect(t, !r2.raised)
+	testing.expect(t, r2.value.type == .Str && r2.value.data.str.s == "\x1b[31mred\x1b[0m")
+	values.free_var(r2.value)
 }

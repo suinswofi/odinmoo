@@ -174,6 +174,23 @@ Two structural points that are easy to violate by accident:
   rather than a sum of its inputs needs an explicit `MAX_STR_LEN` check, not just an
   argument that its inputs are finite.
 
+  The same product can hide in the *cost* rather than the output, and that is how `index()`,
+  `rindex()` and `strsub()` were all wedging the server. Each tried the needle at every start
+  position — O(len(subject) × len(pattern)), both capped only by `MAX_STR_LEN` — so with a
+  subject of `"a"` repeated and a needle of `"a"…"b"`, which defeats the first-byte skip, a
+  single call cost 1.8s at 100KB/50KB, 29s at 400KB/200KB, 179s at 1MB/500KB, and about twelve
+  HOURS at `MAX_STR_LEN`, for two ticks with `big_lock` held. Case-folding is MOO's *default*
+  for all three, so this was the ordinary path, not a corner. The fix there was not a ceiling
+  like `regex.MAX_STEPS` but a better algorithm — substring search has a genuinely linear one,
+  so long needles now go through Knuth-Morris-Pratt (`values/strutil.odin`) and the worst case
+  is 89ms, with every call that worked before still working. **Prefer removing the cost to
+  capping it whenever a linear algorithm exists**; a ceiling is what you reach for when the
+  work is inherently exponential, as backtracking regex is. Note also that the obvious linear
+  choice, Rabin-Karp (what `core:strings.index` uses), is only *expected* linear: its rolling
+  hash is linear in the bytes over a 32-bit modulus, so a caller who picks both strings — which
+  is exactly the caller being defended against — can solve for collisions at every window and
+  put the quadratic straight back.
+
   Two further consequences, both deliberate: a budget abort does **not** run `try ... finally`
   handlers (so core invariants restored that way are not restored — running them is impossible,
   the task is already out of budget), and `budget_renew` resets exhaustion rather than topping it
@@ -194,17 +211,26 @@ Two structural points that are easy to violate by accident:
   (`eval()` and `connection_options()` do; `eval()` was the hole, because its only argument is a
   string, so a value smuggled in and out through a property never passed an argument list and
   grew without limit). **Length** grows wherever strings or lists are concatenated, which is *not
-  just the `+` operator*: `tostr`, `strsub` and `toliteral` are all doubling constructions and
-  each needs its own cap.
+  just the `+` operator*: `tostr`, `strsub`, `toliteral` and `ansify` are all growing
+  constructions and each needs its own cap. `ansify` was the one missed — it is not a doubling
+  construction but a constant-factor one (every markup code it consumes is shorter than the
+  escape sequence it emits, ~2.5x at worst), which is enough on its own to clear `MAX_STR_LEN`
+  when the input is already allowed to reach it: 8MB of `"%r"` returned 20MB.
 
   `value_depth` is a cached upper BOUND, not the exact depth — the in-place mutators (`list_set`,
   `do_insert`'s append fast path) raise it and can't lower it, because recomputing per `l[i] = v`
-  would be quadratic. So **use `too_deep`, never `value_depth`, to decide anything**: it walks the
-  value for real when the cheap bound trips, which is what stops a stale bound from permanently
-  rejecting a value that is actually shallow. `MAX_USABLE_VALUE_DEPTH` is the deepest a value can
-  be and still be passable as an argument (the argument list costs a level); `dbfile`'s reader
-  holds loaded values to that, so a database this server accepts can't contain a value MOO code
-  is unable to touch.
+  would be quadratic. So **use `too_deep` (or `nests_too_deep`), never `value_depth`, to decide
+  anything**: they walk the value for real when the cheap bound trips, which is what stops a
+  stale bound from permanently rejecting a value that is actually shallow. The two differ only
+  in which value they are asked about — `too_deep` checks a result already built, and
+  `nests_too_deep` asks the same question one level ahead, for the five operations that must
+  decide *before* nesting (`l[i] = v`, `listappend`/`listinsert`/`listset`/`setadd`). Those five
+  were the hole: they were left deciding straight off the cached bound when the list-literal
+  path was fixed, so `v = {deep}; v[1] = 0` — which leaves `v` as the shallow list `{0}` — made
+  all five raise `E_QUOTA` on it forever, while `{v}` and `length(v)` on that same value kept
+  working. `MAX_USABLE_VALUE_DEPTH` is the deepest a value can be and still be passable as an
+  argument (the argument list costs a level); `dbfile`'s reader holds loaded values to that, so
+  a database this server accepts can't contain a value MOO code is unable to touch.
 - **Each connection gets its own thread with a blocking socket**, instead of one `select()`/`poll()`
   multiplexing loop. There is no event loop to add a descriptor to. Outbound writes never happen
   inline: `send_line` appends to a bounded per-connection buffer drained by a dedicated writer

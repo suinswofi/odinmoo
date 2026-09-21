@@ -326,9 +326,11 @@ index_set :: proc(base, index, value: values.Var) -> Op_Result {
 		values.free_var(value)
 		return ok_result(values.str_val(string(buf)))
 	}
-	if values.value_depth(value) + 1 > values.MAX_VALUE_DEPTH {
+	if values.nests_too_deep(value) {
 		// `l[i] = v` nests v one level inside l, so it can grow depth exactly like a list
-		// literal can -- see values.MAX_VALUE_DEPTH.
+		// literal can -- see values.MAX_VALUE_DEPTH. Via nests_too_deep rather than off
+		// values.value_depth directly, because that cached bound over-estimates once a list
+		// has been mutated in place, and deciding off it rejected shallow values outright.
 		values.free_var(base)
 		values.free_var(index)
 		values.free_var(value)

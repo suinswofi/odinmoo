@@ -253,6 +253,33 @@ too_deep :: proc(v: Var) -> bool {
 	return exceeds_depth(v, MAX_VALUE_DEPTH)
 }
 
+// nests_too_deep is too_deep's question asked one step ahead, for the operations that are about
+// to put `v` INSIDE a list and so need to know whether the RESULT would be over the limit
+// before they build it: `l[i] = v`, listappend, listinsert, listset, setadd. Asking ahead is
+// exact rather than approximate here -- nesting v into an existing list l gives a result whose
+// depth is max(depth(l), depth(v) + 1), and l is already a value the server accepted, so
+// depth(v) + 1 is the only term that can push it over.
+//
+// The point of routing them through here is the SECOND line. All five used to decide straight
+// off value_depth, which is a cached upper bound that the in-place mutators raise and cannot
+// lower -- exactly the mistake the comment above too_deep warns about, left behind when the
+// list-literal path was fixed. So `v = {deep}; v[1] = 0` left v as the shallow one-element list
+// `{0}` still carrying the old bound, and all five then raised E_QUOTA on it forever, while
+// `{v}` and `length(v)` on the same value went on working:
+//
+//	;v = 0; for i in [1..256] v = {v}; endfor v[1] = 0; return {v};
+//	 => {{0}}
+//	;v = 0; for i in [1..256] v = {v}; endfor v[1] = 0; return listappend({}, v);
+//	 => E_QUOTA
+//
+// The walk runs only when the cheap bound trips, and only ever descends MAX_VALUE_DEPTH levels.
+nests_too_deep :: proc(v: Var) -> bool {
+	if value_depth(v) + 1 <= MAX_VALUE_DEPTH {
+		return false
+	}
+	return exceeds_depth(v, MAX_VALUE_DEPTH - 1)
+}
+
 empty_list :: proc() -> Var {
 	return list_val(make([]Var, 0))
 }

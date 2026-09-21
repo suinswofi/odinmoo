@@ -4,7 +4,9 @@ package values
 // regression tests protecting the reference-counting and copy-on-write invariants that
 // list.c/utils.c encoded only as comments and calling-convention discipline.
 
+import "core:strings"
 import "core:testing"
+import "core:time"
 
 @(test)
 test_scalar_values_need_no_refcounting :: proc(t: ^testing.T) {
@@ -394,4 +396,170 @@ test_ascii_helpers_are_byte_oriented :: proc(t: ^testing.T) {
 	testing.expect(t, ascii_compare_fold("\xc3", "\xc4") < 0)
 	testing.expect(t, ascii_index_fold("caf\xe9x", "\xe9") == 3)
 	testing.expect(t, ascii_index_fold("caf\xe9x", "\xe8") == -1)
+}
+
+// ---- Substring search cost (values/strutil.odin) ----
+//
+// index()/rindex() are case-folding by DEFAULT in MOO, and that path used to try the needle at
+// every start position: O(len(haystack) * len(needle)), a product of two MAX_STR_LEN-capped
+// inputs. Measured before the fix: 1.8s at 100KB/50KB, 29s at 400KB/200KB, 179s at 1MB/500KB,
+// extrapolating to about twelve hours at MAX_STR_LEN -- all of it inside one built-in holding
+// big_lock, charging one tick, with nothing able to preempt it.
+//
+// A haystack of "a" with a needle of "a"*(m-1) + "b" is the shape that defeats the first-byte
+// skip the old scan relied on, so it is the shape pinned here. At 1MB/500KB the old code took
+// 179s; the ceiling below is two orders of magnitude under that, and generous against the ~5ms
+// this now costs, so it fails on a return to per-position scanning without being flaky.
+@(test)
+test_fold_search_is_not_quadratic :: proc(t: ^testing.T) {
+	n, m := 1_000_000, 500_000
+	hay := make([]byte, n)
+	for i in 0 ..< n { hay[i] = 'a' }
+	nee := make([]byte, m)
+	for i in 0 ..< m { nee[i] = 'a' }
+	nee[m - 1] = 'b'
+	defer delete(hay)
+	defer delete(nee)
+	haystack, needle := string(hay), string(nee)
+
+	started := time.now()
+	testing.expect(t, ascii_index_fold(haystack, needle) == -1)
+	testing.expect(t, ascii_last_index_fold(haystack, needle) == -1)
+	// The case-sensitive pair too: this shape does not defeat core:strings' Rabin-Karp, so
+	// this half is a floor on the KMP path rather than a reproduction of the old blowup.
+	testing.expect(t, ascii_index(haystack, needle) == -1)
+	testing.expect(t, ascii_last_index(haystack, needle) == -1)
+	elapsed := time.since(started)
+	testing.expectf(
+		t,
+		elapsed < 2 * time.Second,
+		"index/rindex over %d bytes with a %d-byte needle took %v -- the per-position scan is back",
+		n, m, elapsed,
+	)
+}
+
+// The long-needle path is a different algorithm from the short-needle one (see
+// SHORT_NEEDLE_FOLD), so the two have to be held to the same answers. Every needle length here
+// straddles that threshold, and the alphabet is deliberately tiny and mixed-case with a
+// non-ASCII byte in it, so near-misses, overlapping occurrences and the ASCII-only folding rule
+// are all exercised densely rather than by luck.
+@(test)
+test_fold_search_agrees_across_the_threshold :: proc(t: ^testing.T) {
+	// Reference: the straightforward scan, which is what both paths must reproduce.
+	matches :: proc(s, prefix: string, fold: bool) -> bool {
+		return ascii_has_prefix_fold(s, prefix) if fold else strings.has_prefix(s, prefix)
+	}
+	ref_index :: proc(haystack, needle: string, fold: bool) -> int {
+		if len(needle) == 0 { return 0 }
+		if len(needle) > len(haystack) { return -1 }
+		for start in 0 ..= len(haystack) - len(needle) {
+			if matches(haystack[start:], needle, fold) { return start }
+		}
+		return -1
+	}
+	ref_last :: proc(haystack, needle: string, fold: bool) -> int {
+		if len(needle) == 0 { return len(haystack) }
+		if len(needle) > len(haystack) { return -1 }
+		for start := len(haystack) - len(needle); start >= 0; start -= 1 {
+			if matches(haystack[start:], needle, fold) { return start }
+		}
+		return -1
+	}
+
+	alphabet := []byte{'a', 'A', 'b', 'B', 0xc3}
+	// A deterministic 32-bit LCG, so a failure here is reproducible rather than a one-off.
+	seed: u32 = 0x1234_5678
+	next :: proc(s: ^u32, n: int) -> int {
+		s^ = s^ * 1664525 + 1013904223
+		return int((s^ >> 16) % u32(n))
+	}
+
+	buf := make([]byte, 100) // 60 for the haystack, then up to 34 for the needle
+	defer delete(buf)
+	for _ in 0 ..< 20_000 {
+		hn := next(&seed, 60)
+		nn := next(&seed, 34) // spans both sides of SHORT_NEEDLE_FOLD
+		for i in 0 ..< hn { buf[i] = alphabet[next(&seed, len(alphabet))] }
+		for i in 0 ..< nn { buf[60 + i] = alphabet[next(&seed, len(alphabet))] }
+		haystack := string(buf[:hn])
+		needle := string(buf[60:60 + nn])
+
+		got_i, want_i := ascii_index_fold(haystack, needle), ref_index(haystack, needle, true)
+		got_l, want_l := ascii_last_index_fold(haystack, needle), ref_last(haystack, needle, true)
+		if got_i != want_i || got_l != want_l {
+			testing.expectf(
+				t, false,
+				"folding: haystack=%q needle=%q: index got %d want %d, rindex got %d want %d",
+				haystack, needle, got_i, want_i, got_l, want_l,
+			)
+			return // one report is enough; the rest would be the same bug
+		}
+		// The case-sensitive pair straddles the same threshold, between core:strings below it
+		// and KMP above, so it has to agree with the reference across it too.
+		got_ci, want_ci := ascii_index(haystack, needle), ref_index(haystack, needle, false)
+		got_cl, want_cl := ascii_last_index(haystack, needle), ref_last(haystack, needle, false)
+		if got_ci != want_ci || got_cl != want_cl {
+			testing.expectf(
+				t, false,
+				"case-sensitive: haystack=%q needle=%q: index got %d want %d, rindex got %d want %d",
+				haystack, needle, got_ci, want_ci, got_cl, want_cl,
+			)
+			return
+		}
+	}
+}
+
+// index(s, "") == 1 and rindex(s, "") == len(s)+1 are the answers core:strings gives and real
+// verb code depends on -- LambdaCore's $site_db trie insert is built on the first one.
+@(test)
+test_fold_search_empty_needle_and_edges :: proc(t: ^testing.T) {
+	testing.expect(t, ascii_index_fold("abc", "") == 0)
+	testing.expect(t, ascii_last_index_fold("abc", "") == 3)
+	testing.expect(t, ascii_index_fold("", "") == 0)
+	testing.expect(t, ascii_index_fold("", "a") == -1)
+	testing.expect(t, ascii_index_fold("abc", "abcd") == -1)
+	testing.expect(t, ascii_index_fold("abc", "ABC") == 0)   // whole-haystack needle, folded
+	testing.expect(t, ascii_last_index_fold("abc", "ABC") == 0)
+	// Overlapping occurrences: a long needle exercises the KMP path's resume-from-table step,
+	// which is what lets the second "aaaa" at 1 be seen after the first at 0 matched.
+	long_hay := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" // 36 a's
+	long_nee := "aaaaaaaaaaaaaaaaaaaa"                 // 20 a's, over SHORT_NEEDLE_FOLD
+	testing.expect(t, ascii_index_fold(long_hay, long_nee) == 0)
+	testing.expect(t, ascii_last_index_fold(long_hay, long_nee) == 16)
+	// Folding is ASCII-only: 0xc3 and 0xe3 are distinct bytes, not a case pair.
+	testing.expect(t, ascii_index_fold("\xc3", "\xe3") == -1)
+}
+
+// ---- nests_too_deep (values/values.odin) ----
+//
+// The cached depth is an upper BOUND that in-place mutation raises and cannot lower, so the
+// operations that nest a value inside a list cannot decide off it directly: `v = {deep}` then
+// `v[1] = 0` leaves v as the shallow one-element list {0} still carrying the old bound. Before
+// this, listappend/listinsert/listset/setadd and `l[i] = v` all raised E_QUOTA on such a value
+// forever, while `{v}` and `length(v)` on the very same value went on working.
+@(test)
+test_nests_too_deep_walks_a_stale_bound :: proc(t: ^testing.T) {
+	// Build a value at exactly MAX_VALUE_DEPTH, the deepest the server accepts.
+	v := int_val(0)
+	for _ in 0 ..< MAX_VALUE_DEPTH {
+		items := make([]Var, 1)
+		items[0] = v
+		v = list_val(items)
+	}
+	testing.expect(t, value_depth(v) == MAX_VALUE_DEPTH)
+	testing.expect(t, !too_deep(v))
+	testing.expect(t, nests_too_deep(v)) // genuinely too deep to nest another level
+
+	// Overwrite the one deep element in place. v is now {0}: actually one level deep, but its
+	// cached bound is untouched, because lowering it per assignment would be quadratic.
+	v = list_set(v, int_val(0), 1)
+	testing.expect(t, value_depth(v) == MAX_VALUE_DEPTH) // the bound is stale, by design
+	testing.expect(t, !too_deep(v))                      // ...and too_deep already walked past it
+	testing.expectf(
+		t,
+		!nests_too_deep(v),
+		"a one-element shallow list was rejected for nesting on its stale cached depth (%d)",
+		value_depth(v),
+	)
+	free_var(v)
 }

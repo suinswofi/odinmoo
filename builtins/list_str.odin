@@ -29,9 +29,13 @@ bf_length :: proc(args: values.Var) -> vm.Call_Result {
 // so can be looped to build the pathologically nested values values.MAX_VALUE_DEPTH exists
 // to prevent; `grows` additionally covers the ones that lengthen the list, against
 // values.MAX_LIST_LEN.
+//
+// values.nests_too_deep, not `value_depth(value) + 1 > MAX_VALUE_DEPTH`: the cached depth is an
+// upper bound that in-place mutation raises and cannot lower, so deciding off it rejected
+// values that are not deep at all. See its header for the case and the repro.
 @(private = "file")
 nest_ok :: proc(list, value: values.Var, grows: bool) -> bool {
-	if values.value_depth(value) + 1 > values.MAX_VALUE_DEPTH {
+	if values.nests_too_deep(value) {
 		return false
 	}
 	if grows && values.list_len(list) >= values.MAX_LIST_LEN {
@@ -220,7 +224,7 @@ bf_index :: proc(args: values.Var) -> vm.Call_Result {
 	case_matters := n == 3 && values.is_true(nth(args, 3))
 	pos: int
 	if case_matters {
-		pos = strings.index(source.data.str.s, what.data.str.s)
+		pos = values.ascii_index(source.data.str.s, what.data.str.s)
 	} else {
 		pos = values.ascii_index_fold(source.data.str.s, what.data.str.s)
 	}
@@ -240,7 +244,7 @@ bf_rindex :: proc(args: values.Var) -> vm.Call_Result {
 	case_matters := n == 3 && values.is_true(nth(args, 3))
 	pos: int
 	if case_matters {
-		pos = strings.last_index(source.data.str.s, what.data.str.s)
+		pos = values.ascii_last_index(source.data.str.s, what.data.str.s)
 	} else {
 		pos = values.ascii_last_index_fold(source.data.str.s, what.data.str.s)
 	}
@@ -269,26 +273,44 @@ bf_strsub :: proc(args: values.Var) -> vm.Call_Result {
 	haystack := subject.data.str.s
 	needle := what.data.str.s
 
+	// Finding each occurrence with a search, rather than asking "does the needle start here"
+	// at every position, is what keeps this linear. The per-position spelling was
+	// O(len(haystack) * len(needle)) -- the same product of two MAX_STR_LEN-capped inputs that
+	// made index() a server wedge, and reached here by the same route, since the prefix test at
+	// each position is itself O(len(needle)). Measured on 400KB of "a" with a 200KB needle that
+	// never matches: 29s folding, 0.95s case-sensitive, both for ONE tick with big_lock held.
+	// values.ascii_index_fold and values.ascii_index are both worst-case linear now (see their
+	// headers), so this loop is O(len(haystack) + len(needle)) overall:
+	// rebuilding a search structure per occurrence is bounded by the bytes that occurrence
+	// consumes, and occurrences do not overlap.
 	b := strings.builder_make()
 	i := 0
 	for i < len(haystack) {
 		// Same doubling guard as tostr/toliteral: `s = strsub(s, "a", "aa")` grew a string past
 		// values.MAX_STR_LEN unchecked (measured: 64MB after 26 iterations, and unbounded after
 		// that). Checked inside the loop so it stops at the limit instead of after the whole
-		// replacement has been materialised.
+		// replacement has been materialised; the transient overshoot is one gap plus one
+		// replacement, each itself already bounded by MAX_STR_LEN.
 		if strings.builder_len(b) > values.MAX_STR_LEN {
 			strings.builder_destroy(&b)
 			return raise_err(.E_QUOTA, "Value too large")
 		}
 		rest := haystack[i:]
-		matched := strings.has_prefix(rest, needle) if case_matters else values.ascii_has_prefix_fold(rest, needle)
-		if matched {
-			strings.write_string(&b, with.data.str.s)
-			i += len(needle)
-		} else {
-			strings.write_byte(&b, haystack[i])
-			i += 1
+		pos := values.ascii_index(rest, needle) if case_matters else values.ascii_index_fold(rest, needle)
+		if pos < 0 {
+			strings.write_string(&b, rest)
+			break
 		}
+		strings.write_string(&b, rest[:pos])
+		strings.write_string(&b, with.data.str.s)
+		i += pos + len(needle)
+	}
+	// The loop's guard runs before each write, so the last one can still carry the result past
+	// the cap; without this a strsub could hand back a string longer than any other path in the
+	// server is willing to build.
+	if strings.builder_len(b) > values.MAX_STR_LEN {
+		strings.builder_destroy(&b)
+		return raise_err(.E_QUOTA, "Value too large")
 	}
 	return vm.call_ok(values.str_val(strings.to_string(b)))
 }
