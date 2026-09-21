@@ -193,12 +193,26 @@ fuzz_db_loader :: proc(base_path: string) {
 // numbers. Every builtin does its own argument checking by hand, which is exactly the kind of
 // code where one missing check is a crash rather than an E_TYPE.
 //
-// Deliberately excluded from the generated grammar: `while`/`for` and `fork` (which spawns
-// threads). The loops were excluded because a generated infinite one would hang the fuzzer
-// rather than fail it; vm/budget.odin's per-task tick budget now bounds them, so this is a
-// candidate to revisit -- it is left as-is only because nothing has exercised it yet. The scheduler is nil, which also makes suspend()/read() unavailable rather than
-// blocking. Everything else -- including verb calls, property access, indexing, scatter
-// assignment and try/except -- is in scope.
+// `while`/`for` ARE in the grammar, which they were not until this was revisited. They were
+// excluded because a generated infinite loop would hang the fuzzer rather than fail it, and
+// vm/budget.odin removed that objection: vm.run opens a Task_Budget for any activation that
+// arrives without one, which is every activation this harness builds, so `while (1)` aborts
+// uncatchably after MAX_TICKS iterations instead of spinning. That abort is itself worth
+// reaching -- charge_iteration is the only thing standing between `while (1) endwhile`, which
+// executes no statements at all, and a dead server, so the fuzzer had no coverage of the one
+// path that makes an unterminating loop survivable.
+//
+// Loop BODIES are drawn from a deliberately small, cheap set rather than from the full
+// statement generator. The subject here is the VM's iteration machinery -- exec_while,
+// exec_for_list, exec_for_range, break/continue unwinding and the budget that stops them --
+// not the built-ins, which the top-level statements already hit with hostile arguments. A body
+// free to call create() or add_property() would run it up to MAX_TICKS times per program and
+// leave hundreds of thousands of objects in the shared database, which would slow every later
+// program down and measure the allocator rather than the VM.
+//
+// Still deliberately excluded: `fork`, which spawns threads. The scheduler is nil, which also
+// makes suspend()/read() unavailable rather than blocking. Everything else -- including verb
+// calls, property access, indexing, scatter assignment and try/except -- is in scope.
 @(private = "file")
 MOO_LITERALS := []string {
 	"0", "1", "-1", "2147483647", "-2147483647 - 1", "1.5", "-0.0", "1.0e308",
@@ -227,14 +241,42 @@ BUILTIN_NAMES := []string {
 }
 
 @(private = "file")
+write_lit :: proc(b: ^strings.Builder) {
+	strings.write_string(b, MOO_LITERALS[int(rand.uint32()) % len(MOO_LITERALS)])
+}
+
+// loop_body writes the single statement a generated loop repeats -- see the note at the top of
+// this section for why it is this short list and not the full statement generator. `break` and
+// `continue` are here because exec_while/exec_for_list have to unwind both correctly, and
+// because a `continue` in a `while` whose condition never changes is another way to reach the
+// budget abort. The two literal-assignment cases deliberately WRITE `r` without reading it, so
+// the loop keeps going rather than dying on E_VARNF at the first iteration and never reaching
+// MAX_TICKS -- which is what a body built out of the general statement generator would mostly
+// do. `r = x` is the opposite case on purpose: `x` is bound in a `for` and unbound in a
+// `while`, so the same body reaches the loop variable in one form and E_VARNF in the other.
+@(private = "file")
+loop_body :: proc(b: ^strings.Builder) {
+	switch rand.uint32() % 5 {
+	case 0, 1:
+		strings.write_string(b, "r = ")
+		write_lit(b)
+		strings.write_string(b, ";\n")
+	case 2:
+		strings.write_string(b, "r = x;\n") // the loop variable, which for-range binds as an int
+	case 3:
+		strings.write_string(b, "break;\n")
+	case 4:
+		strings.write_string(b, "continue;\n")
+	}
+}
+
+@(private = "file")
 random_moo_source :: proc() -> string {
 	b := strings.builder_make()
-	lit :: proc(b: ^strings.Builder) {
-		strings.write_string(b, MOO_LITERALS[int(rand.uint32()) % len(MOO_LITERALS)])
-	}
+	lit :: write_lit
 	nstmt := 1 + int(rand.uint32()) % 3
 	for _ in 0 ..< nstmt {
-		switch rand.uint32() % 6 {
+		switch rand.uint32() % 7 {
 		case 0, 1, 2:
 			// builtin(arg, ...) -- the main event
 			strings.write_string(&b, "r = ")
@@ -295,6 +337,34 @@ random_moo_source :: proc() -> string {
 				lit(&b)
 				strings.write_string(&b, "; endif\n")
 			}
+		case 6:
+			// Loops. Each form is generated with a hostile head as well as a workable one,
+			// because the interesting failures are at the edges: `for x in (<non-list>)` is
+			// the E_TYPE the language requires, `[<non-int>..<non-int>]` is the same for the
+			// range form, and a wide integer range or a permanently-true `while` runs until
+			// vm/budget.odin stops it.
+			switch rand.uint32() % 3 {
+			case 0:
+				strings.write_string(&b, "for x in (")
+				lit(&b)
+				strings.write_string(&b, ")\n\t")
+				loop_body(&b)
+				strings.write_string(&b, "endfor\n")
+			case 1:
+				strings.write_string(&b, "for x in [")
+				lit(&b)
+				strings.write_string(&b, "..")
+				lit(&b)
+				strings.write_string(&b, "]\n\t")
+				loop_body(&b)
+				strings.write_string(&b, "endfor\n")
+			case 2:
+				strings.write_string(&b, "while (")
+				lit(&b)
+				strings.write_string(&b, ")\n\t")
+				loop_body(&b)
+				strings.write_string(&b, "endwhile\n")
+			}
 		}
 	}
 	strings.write_string(&b, "return r;\n")
@@ -318,7 +388,7 @@ fuzz_moo :: proc(core_path: string) {
 	wiz := values.Objid(3) // Minimal.db's wizard; any valid object works for permission checks
 	rand.reset(SEED)
 	cmd_line_alpha := `abc 123 the with at to from in on #$"\\:.*` + "\t"
-	compiled, returned, raised: int
+	compiled, returned, raised, aborted: int
 	errs: map[values.Error]int
 	defer delete(errs)
 	for i in 0 ..< MOO_ITERS {
@@ -358,6 +428,12 @@ fuzz_moo :: proc(core_path: string) {
 				values.free_var(res.value)
 			case .Raised:
 				raised += 1
+				// Counted apart from the rest because it is the statistic this harness's
+				// loops exist to produce: an uncatchable raise is vm/budget.odin aborting
+				// the task, which is the only thing that makes a generated `while (1)`
+				// survivable. A run that reports zero of these is a run whose loops all died
+				// in their head and never reached the iteration machinery at all.
+				if res.err.uncatchable {aborted += 1}
 				errs[res.err.code] += 1
 				delete(res.err.msg)
 				values.free_var(res.err.value)
@@ -385,7 +461,7 @@ fuzz_moo :: proc(core_path: string) {
 		}
 	}
 	fmt.printfln("moo fuzz: %d programs, no crash", MOO_ITERS)
-	fmt.printfln("  compiled=%d returned=%d raised=%d", compiled, returned, raised)
+	fmt.printfln("  compiled=%d returned=%d raised=%d (budget aborts=%d)", compiled, returned, raised, aborted)
 	for code, n in errs {
 		fmt.printfln("    %v %d", code, n)
 	}

@@ -364,10 +364,17 @@ Two structural points that are easy to violate by accident:
   - `./bin/fuzz -db <core.db>` — mutated/truncated `.db` files through the loader.
   - `./bin/fuzz -moo <core.db>` — random MOO programs (builtins with wrong types and argument
     counts, out-of-range indices, invalid objects) actually RUN against that database, plus
-    `parse_command`/`match_object` on random command lines. `while`/`for` are deliberately
-    absent from the generated grammar, historically because a generated infinite loop would
-    hang the fuzzer rather than fail it; the per-task tick budget now bounds them, so that
-    exclusion is worth revisiting.
+    `parse_command`/`match_object` on random command lines. `while`/`for` ARE in the grammar
+    (they were excluded while a generated infinite loop would have hung the fuzzer rather
+    than failing it; `vm.run` opens a budget for any activation arriving without one, which
+    is every activation this harness builds, so `while (1)` now aborts uncatchably after
+    `MAX_TICKS` instead of spinning). Loop bodies are drawn from a short cheap list, not the
+    full statement generator — the subject is the iteration machinery, and a body free to
+    call `create()` would run it `MAX_TICKS` times per program and leave the shared database
+    full of objects. The run reports `budget aborts=N` separately from the raise tally:
+    those are the uncatchable ones, i.e. the loops that actually reached `charge_iteration`,
+    and **a run reporting zero of them has lost its loop coverage** even though nothing
+    fails. `fork` stays excluded (it spawns threads, and the scheduler here is nil).
 - **Test-reported allocator leaks are real bugs.** `core:testing`'s tracking allocator runs on every
   test; a package that starts reporting leaks or double-frees after a change has regressed, and
   should not be treated as noise.
