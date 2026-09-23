@@ -197,6 +197,9 @@ name_table_clone :: proc(t: ^Name_Table) -> Name_Table {
 	for n in t.names {
 		append(&out.names, clone_string_local(n))
 	}
+	if t.index != nil {
+		name_table_build_index(&out)
+	}
 	return out
 }
 

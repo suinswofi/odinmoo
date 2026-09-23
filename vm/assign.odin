@@ -190,8 +190,9 @@ assign_indexed :: proc(ctx: ^Eval_Context, target: compiler.Expr, new_value: val
 	// reference before the set consumes new_value.
 	result_value := values.var_ref(new_value)
 
-	// Apply the outermost set (OP_INDEXSET / EOP_RANGESET), still with `$` visible.
-	updated: Op_Result
+	// Evaluate the outermost step's index (or range endpoints), still with `$` visible. This is
+	// the last MOO code the assignment runs before writing back.
+	final_idx, final_from, final_to: values.Var
 	#partial switch s0 in steps[0] {
 	case ^compiler.Expr_Index:
 		append(&ctx.dollar_stack, bases[0])
@@ -203,7 +204,7 @@ assign_indexed :: proc(ctx: ^Eval_Context, target: compiler.Expr, new_value: val
 			values.free_var(new_value)
 			return idx_r
 		}
-		updated = index_set(bases[0], idx_r.value, new_value) // consumes bases[0], idx, new_value
+		final_idx = idx_r.value
 	case ^compiler.Expr_Range:
 		append(&ctx.dollar_stack, bases[0])
 		from_r := eval_expr(ctx, s0.from)
@@ -223,7 +224,21 @@ assign_indexed :: proc(ctx: ^Eval_Context, target: compiler.Expr, new_value: val
 			values.free_var(new_value)
 			return to_r
 		}
-		updated = range_set(bases[0], from_r.value, to_r.value, new_value) // consumes all four
+		final_from = from_r.value
+		final_to = to_r.value
+	}
+
+	if r, is_local := root.(^compiler.Expr_Id); is_local {
+		take_path_ownership(ctx, r.var_id, steps[0], bases, indices, final_idx, final_from, final_to, new_value)
+	}
+
+	// Apply the outermost set (OP_INDEXSET / EOP_RANGESET).
+	updated: Op_Result
+	#partial switch _ in steps[0] {
+	case ^compiler.Expr_Index:
+		updated = index_set(bases[0], final_idx, new_value) // consumes bases[0], idx, new_value
+	case ^compiler.Expr_Range:
+		updated = range_set(bases[0], final_from, final_to, new_value) // consumes all four
 	}
 	if updated.err != .E_NONE {
 		values.free_var(result_value)
@@ -262,6 +277,103 @@ assign_indexed :: proc(ctx: ^Eval_Context, target: compiler.Expr, new_value: val
 	}
 
 	return ok_expr(result_value)
+}
+
+// take_path_ownership is what lets `l[i] = v` run in O(1) instead of copying all of l.
+//
+// assign_indexed reads the root with a var_ref, so the variable and the descent each hold a
+// reference, index_set sees a refcount of 2, and copies the whole list before changing one
+// element -- every time. Filling a 100000-element list slot by slot was quadratic (10000
+// assignments into a 10000-element list: 0.78s), and index_set's in-place path could never
+// run at all. Nested `l[i][j] = v` copied at every level, for the same reason one level down.
+//
+// Once every index expression has been evaluated -- nothing after this point runs MOO code, so
+// nothing can observe the variable being empty -- the variable's reference is released,
+// leaving the descent the only holder. Then, level by level from the root, while a container
+// is uniquely held, its reference to the next base down is released too (its slot briefly
+// holds 0, and re-assembly writes the rebuilt element straight back). Any list anyone else
+// still holds keeps a refcount above 1 and is copied exactly as before, so no other holder can
+// see the update: this changes the cost, never the value semantics.
+//
+// It is done only when the assignment is PROVEN to succeed -- the outermost set's own
+// validation, plus the depth and size limits the re-assembly would otherwise check level by
+// level -- because after the handover a failure would have no reference left to put back
+// into the variable. When anything is in doubt it does nothing, and the copying path runs.
+@(private = "file")
+take_path_ownership :: proc(
+	ctx: ^Eval_Context,
+	var_id: int,
+	outer: compiler.Expr,
+	bases, indices: []values.Var,
+	idx, from, to, new_value: values.Var,
+) {
+	n := len(bases)
+	root := bases[n - 1]
+	slot := &ctx.activation.locals[var_id]
+	// An index expression may have reassigned the variable (`l[(l = {}) == {} ? 1 | 2] = x`);
+	// then the root is no longer the variable's value, and there is nothing to hand over.
+	if root.type != .List || slot.type != .List || slot.data.list != root.data.list {
+		return
+	}
+
+	// Would the outermost set succeed, and by how much does it change bases[0]'s size?
+	b0 := bases[0]
+	b0_new_size := 0
+	#partial switch _ in outer {
+	case ^compiler.Expr_Index:
+		if index_set_error(b0, idx, new_value) != .E_NONE {
+			return
+		}
+		if b0.type == .List {
+			i := int(idx.data.num)
+			b0_new_size = values.value_size(b0) - values.value_size(values.list_get(b0, i)) + values.value_size(new_value)
+		}
+	case ^compiler.Expr_Range:
+		if range_set_error(b0, from, to, new_value) != .E_NONE {
+			return
+		}
+		if b0.type == .List {
+			b0_new_size = range_set_size(b0, int(from.data.num), int(to.data.num), new_value)
+		}
+	case:
+		return
+	}
+	if n > 1 {
+		// Re-assembly nests the rebuilt element back through n-1 more levels. Sizes are exact
+		// and every intermediate container is part of the root, so the root's new size is the
+		// largest any level reaches. Depth uses the cached bound, which never under-estimates:
+		// new_value ends up at most n levels below the root, and everything else in it is no
+		// deeper than it was in a root the server already accepted.
+		if values.value_size(root) - values.value_size(b0) + b0_new_size > values.MAX_VALUE_SIZE {
+			return
+		}
+		if values.value_depth(new_value) + n > values.MAX_VALUE_DEPTH {
+			return
+		}
+		// And that holds only for a root within the limit itself -- which a variable's value
+		// need not be: a built-in that wraps an argument already at the limit returns one a
+		// level deeper. Re-assembly then fails at the root, where the plain path raises
+		// E_QUOTA with the variable intact and this one would have emptied it.
+		if values.too_deep(root) {
+			return
+		}
+	}
+
+	values.free_var(slot^) // the descent's own reference to root remains
+	slot^ = values.none_val()
+	for k := n - 1; k >= 1; k -= 1 {
+		parent, child := bases[k], bases[k - 1]
+		if parent.type != .List || values.refcount(parent) != 1 || child.type != .List {
+			break
+		}
+		i := int(indices[k].data.num)
+		elem := values.list_get(parent, i)
+		if elem.type != .List || elem.data.list != child.data.list {
+			break
+		}
+		// Frees the parent's reference to child; the descent's (bases[k-1]) remains.
+		bases[k] = values.list_set(parent, values.int_val(0), i)
+	}
 }
 
 // exec_scatter ports EOP_SCATTER's binding algorithm (see the comment on the original in

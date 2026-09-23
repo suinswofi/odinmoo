@@ -48,10 +48,8 @@ validate_hierarchies :: proc(db: ^Database) -> Read_Error {
 	}
 
 	// Cycle detection, on ALL FOUR chains objdb walks -- not just the two it used to cover.
-	// Every chain is bounded by the number of objects, so exceeding that is proof of a loop --
-	// cheaper and simpler than marking visited sets, and it cannot itself run away. A cycle
-	// passes the link check above (every id in it is a real object) but still hangs any walk
-	// that follows it to the end.
+	// A cycle passes the link check above (every id in it is a real object) but still hangs
+	// any walk that follows it to the end.
 	//
 	// parent and location were checked here from the start; contents/next and child/sibling
 	// were not, and that was a straightforward hole in the same invariant, because objdb walks
@@ -60,22 +58,63 @@ validate_hierarchies :: proc(db: ^Database) -> Read_Error {
 	// db_change_parent_links and prop_resync's subtree walks follow child->sibling. A .db with
 	// `#1.contents = #2; #2.next = #2` loaded cleanly and then spun forever (or grew a list
 	// until the process died) the first time anyone looked in that room.
-	//
-	// Cost is linear, not quadratic: each object's contents and child lists are walked once
-	// each, and summed over all objects that is at most one visit per object per chain kind
-	// (an object appears in exactly one contents list and one child list in a well-formed DB).
-	// A cycle is what makes a single walk long, and `limit` cuts that one off immediately.
-	limit := len(db.objects) + 1
-	for _, obj in db.objects {
-		if !chain_ok(db, obj.parent, .Parent, limit) ||
-		   !chain_ok(db, obj.location, .Location, limit) ||
-		   !chain_ok(db, obj.contents, .Next, limit) ||
-		   !chain_ok(db, obj.child, .Sibling, limit) {
+	for l in Link {
+		if !chains_terminate(db, l) {
 			return .Bad_Format
 		}
 	}
 	// Runs last: it walks parent chains, which the loop above has just proved terminate.
 	return check_propval_layout(db)
+}
+
+// chains_terminate proves that following `l` from every object ends at NOTHING, in time
+// linear in the object count.
+//
+// It used to walk each object's chain to the end independently, cutting a walk off after
+// object-count steps as proof of a loop. That is linear for contents/next and child/sibling in
+// a well-formed file, where each list is walked once from its head, but NOT for parent and
+// location: every object re-walked its whole ancestor (or container) chain, O(objects x
+// depth), and `create()` in a loop builds that depth. A 32000-deep parent chain took 19.5
+// seconds to validate -- on every restart, before the server listened -- and 64000 about 80.
+//
+// So each object is resolved once: a walk stops at the first object already proven to reach
+// NOTHING, and everything it passed through is then marked proven too. Reaching an object
+// that is on the CURRENT walk is the loop.
+@(private = "file")
+chains_terminate :: proc(db: ^Database, l: Link) -> bool {
+	Mark :: enum u8 {
+		Unvisited,
+		On_Walk,
+		Proven,
+	}
+	marks := make(map[values.Objid]Mark, len(db.objects))
+	defer delete(marks)
+	path := make([dynamic]values.Objid, 0, 16)
+	defer delete(path)
+	for start in db.objects {
+		clear(&path)
+		id := start
+		for id != values.NOTHING {
+			m := marks[id]
+			if m == .Proven {
+				break
+			}
+			if m == .On_Walk {
+				return false
+			}
+			o, ok := db.objects[id]
+			if !ok {
+				return false
+			}
+			marks[id] = .On_Walk
+			append(&path, id)
+			id = follow_link(o, l)
+		}
+		for p in path {
+			marks[p] = .Proven
+		}
+	}
+	return true
 }
 
 // check_propval_layout enforces the other invariant objdb indexes unguardedly. find_property
@@ -91,23 +130,40 @@ validate_hierarchies :: proc(db: ^Database) -> Read_Error {
 // The walk below is deliberately the same shape as find_property's -- self first, then up to
 // the root -- because the walk order IS the index assignment; if they ever disagree, this is
 // the half that is wrong.
+//
+// Each object's expected count is its own propdefs plus its parent's expected count, so it is
+// memoized rather than re-walked to the root per object -- for the same O(objects x depth)
+// reason chains_terminate explains.
 @(private = "file")
 check_propval_layout :: proc(db: ^Database) -> Read_Error {
-	for oid, obj in db.objects {
-		want := 0
-		cur := oid
-		for {
+	want := make(map[values.Objid]int, len(db.objects))
+	defer delete(want)
+	path := make([dynamic]^Object, 0, 16)
+	defer delete(path)
+	for oid in db.objects {
+		// Climb to the first ancestor whose count is already known (or past the root), then
+		// fill in counts back down the path.
+		clear(&path)
+		base := 0
+		for cur := oid; cur != values.NOTHING; {
+			if n, known := want[cur]; known {
+				base = n
+				break
+			}
 			o, ok := db.objects[cur]
 			if !ok {
 				break
 			}
-			want += len(o.propdefs)
-			if o.parent == values.NOTHING {
-				break
-			}
+			append(&path, o)
 			cur = o.parent
 		}
-		if len(obj.propvals) != want {
+		for i := len(path) - 1; i >= 0; i -= 1 {
+			base += len(path[i].propdefs)
+			want[path[i].id] = base
+		}
+	}
+	for oid, obj in db.objects {
+		if len(obj.propvals) != want[oid] {
 			return .Bad_Format
 		}
 	}
@@ -137,23 +193,4 @@ follow_link :: proc(o: ^Object, l: Link) -> values.Objid {
 		return o.sibling
 	}
 	return values.NOTHING
-}
-
-// chain_ok walks from `head` following `l`, failing on a dangling id or on more than `limit`
-// steps (which, `limit` being the object count, can only mean the chain loops).
-@(private = "file")
-chain_ok :: proc(db: ^Database, head: values.Objid, l: Link, limit: int) -> bool {
-	steps := 0
-	for id := head; id != values.NOTHING; {
-		o, ok := db.objects[id]
-		if !ok {
-			return false
-		}
-		steps += 1
-		if steps > limit {
-			return false
-		}
-		id = follow_link(o, l)
-	}
-	return true
 }

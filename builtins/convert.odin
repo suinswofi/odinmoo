@@ -66,20 +66,22 @@ bf_toliteral :: proc(args: values.Var) -> vm.Call_Result {
 		return arg_count_error()
 	}
 	b := strings.builder_make()
-	write_literal(&b, nth(args, 1))
 	// `s = toliteral(s)` roughly doubles a string of quote characters each call, so this is a
-	// doubling construction too and needs the same cap as tostr/strsub. Checked after building
-	// rather than before: the output size is only knowable by producing it (write_literal
-	// recurses over lists), and it is bounded by about twice an input that already exists.
-	if strings.builder_len(b) > values.MAX_STR_LEN {
+	// doubling construction too and needs the same cap as tostr/strsub. The output size is only
+	// knowable by producing it, so write_literal checks as it goes and stops as soon as it is
+	// over: finishing first and checking afterwards built the whole oversized string before
+	// rejecting it, which on a list sharing sublists (see values.MAX_VALUE_SIZE) is up to
+	// sixteen million elements' worth of text.
+	if !write_literal(&b, nth(args, 1)) || strings.builder_len(b) > values.MAX_STR_LEN {
 		strings.builder_destroy(&b)
 		return raise_err(.E_QUOTA, "Value too large")
 	}
 	return vm.call_ok(values.str_val(strings.to_string(b)))
 }
 
+// write_literal returns false as soon as the output has passed values.MAX_STR_LEN.
 @(private = "file")
-write_literal :: proc(b: ^strings.Builder, v: values.Var) {
+write_literal :: proc(b: ^strings.Builder, v: values.Var) -> bool {
 	#partial switch v.type {
 	case .Int:
 		fmt.sbprintf(b, "%d", v.data.num)
@@ -91,11 +93,15 @@ write_literal :: proc(b: ^strings.Builder, v: values.Var) {
 		write_float_g(b, v.data.fnum)
 	case .Str:
 		strings.write_byte(b, '"')
-		for c in v.data.str.s {
-			if c == '"' || c == '\\' {
+		// By byte, not by rune: MOO strings are byte strings, and ranging over a Odin string
+		// decodes UTF-8 -- every invalid byte came out as U+FFFD's three bytes, so
+		// toliteral("\xff") no longer read back as the value it was made from.
+		s := v.data.str.s
+		for i in 0 ..< len(s) {
+			if s[i] == '"' || s[i] == '\\' {
 				strings.write_byte(b, '\\')
 			}
-			strings.write_rune(b, c)
+			strings.write_byte(b, s[i])
 		}
 		strings.write_byte(b, '"')
 	case .List:
@@ -104,10 +110,13 @@ write_literal :: proc(b: ^strings.Builder, v: values.Var) {
 			if i > 1 {
 				strings.write_string(b, ", ")
 			}
-			write_literal(b, values.list_get(v, i))
+			if !write_literal(b, values.list_get(v, i)) {
+				return false
+			}
 		}
 		strings.write_byte(b, '}')
 	}
+	return strings.builder_len(b^) <= values.MAX_STR_LEN
 }
 
 @(private = "file")

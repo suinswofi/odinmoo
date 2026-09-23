@@ -136,8 +136,18 @@ Two structural points that are easy to violate by accident:
 - **Tasks are real OS threads, not a cooperative single-threaded loop with snapshotted activation
   stacks.** A single `Scheduler.big_lock` mutex guarantees only one task actively touches the object
   DB at a time, preserving the original's effective single-writer semantics. Anything touching the
-  DB must hold it. The visible cost: `queued_tasks()`/`task_stack()` see only genuinely-suspended
-  tasks and report one frame rather than a full chain.
+  DB must hold it. The visible cost: `queued_tasks()`/`task_stack()` see only suspended tasks and
+  pending forks, and report one frame rather than a full chain.
+
+  **Threads scale with *parked* tasks, never with forks** (`tasks/fork.odin`'s header). A
+  delayed fork is a registry entry plus a heap entry for one fork-timer thread; a due fork joins
+  a FIFO run queue drained by a pool that keeps one worker runnable and starts another only when
+  a worker's task parks (`park_wait`'s `fork_worker_parked`). Both halves were learned the hard
+  way: a sleeping thread per delayed fork made shutdown wait out the longest delay and put
+  pending forks beyond `kill_task()`, and 10000 `fork (2)`s hit the process thread limit and
+  silently lost 2113 of them; moving only the sleep into a timer then lost 2107 at the deadline
+  instead, as 10000 threads queued on `big_lock`. Anything new that parks a task's thread must
+  go through `park_wait`, or a parked fork stalls every fork queued behind it.
 - **Every task runs under a tick/wall-clock budget (`vm/budget.odin`), and that is load-bearing
   here in a way it isn't upstream.** A running task holds `big_lock`, so an unterminating loop is
   not a slow task but a dead server — and nothing can preempt it (`kill_task()` only reaches
@@ -231,6 +241,17 @@ Two structural points that are easy to violate by accident:
   working. `MAX_USABLE_VALUE_DEPTH` is the deepest a value can be and still be passable as an
   argument (the argument list costs a level); `dbfile`'s reader holds loaded values to that, so
   a database this server accepts can't contain a value MOO code is unable to touch.
+
+  **Depth and length do not bound a value's size**, because lists share sublists:
+  `x = {x, x}` forty times is forty-one list nodes, two elements and 41 levels each, and 2^40
+  leaves to every recursive walk — `x == y` ran 5.6s at depth 30, and a checkpoint of it could
+  never finish. `values.MAX_VALUE_SIZE` caps the *expanded* size (`Moo_List.size`, counting a
+  shared sublist once per place it appears), enforced alongside depth at every growth point:
+  `too_big`/`grows_too_big` in the list literal, `ok_result_checked`, `nest_ok`, and
+  `index_set_error`/`range_set_error`. Unlike `depth`, `size` is **exact**, kept so in O(1) by
+  the in-place mutators — a list is mutated in place only at refcount 1, and a list inside
+  another has refcount ≥ 2, so no container's cached size can go stale. Anything new that
+  builds a list out of caller-supplied values needs the size check as well as the depth check.
 - **Each connection gets its own thread with a blocking socket**, instead of one `select()`/`poll()`
   multiplexing loop. There is no event loop to add a descriptor to. Outbound writes never happen
   inline: `send_line` appends to a bounded per-connection buffer drained by a dedicated writer
@@ -275,6 +296,15 @@ Two structural points that are easy to violate by accident:
   single-threaded, but here a Var's refcount is touched outside `big_lock` in the connection
   layer (a connection's option store, and the value `read()` is resumed with), so a plain
   `++`/`--` is a double free waiting for a disconnect at the wrong moment.
+
+  **`l[i] = v` on a local is in place**, and that depends on `vm/assign.odin`'s
+  `take_path_ownership` releasing the variable's (and each uniquely-held parent's) reference
+  once every index expression has run. Without it the descent's own `var_ref` kept every
+  refcount at 2, so `index_set` copied the whole list per assignment — filling a list slot by
+  slot was quadratic, and its in-place path was dead code. The handover happens only when the
+  set is *proven* to succeed (`index_set_error`/`range_set_error` plus the depth and size the
+  re-assembly would reach), because afterwards a failure has no reference left to restore the
+  variable from. Keep the validation and the mutation of those two ops in step.
 - **The verb `d` (debug) flag is load-bearing, not legacy.** In a verb with `d` clear, an error
   from that verb's *own* operation — a built-in returning an error, an undispatchable verb call,
   a missing property — becomes the value of the expression rather than raising (`call_to_expr`

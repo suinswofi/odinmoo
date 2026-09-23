@@ -130,9 +130,9 @@ test_big_lock_serializes_concurrent_tasks :: proc(t: ^testing.T) {
 	counter_lock = &lock
 	world := make_test_world(&s)
 
-	// Fork N independent tasks that all race to bump the same counter. Each fork_thread_proc
-	// acquires the scheduler's big lock before running its body, so even though N OS threads
-	// really do exist concurrently, only one is ever inside `bump_counter` at a time.
+	// Fork N independent tasks that all race to bump the same counter. Each run_fork_job
+	// acquires the scheduler's big lock before running its body, so however many fork workers
+	// exist concurrently, only one is ever inside `bump_counter` at a time.
 	sync.mutex_lock(&s.big_lock)
 	N :: 20
 	for _ in 0 ..< N {
@@ -504,4 +504,89 @@ test_fork_owns_the_activation_strings_it_carries :: proc(t: ^testing.T) {
 	)
 
 	scheduler_shutdown(&s) // kill the parked task and wait for the fork thread to exit
+}
+
+// ---- Regression: a delayed fork is a queued task, not a sleeping thread ----
+//
+// Each delayed fork used to be an OS thread in time.sleep: invisible to kill_task(), and
+// waited out in full by shutdown -- `fork (86400)` held up SIGTERM for a day. It is now a
+// registry entry plus a heap entry for the fork timer (fork.odin's header).
+@(test)
+test_delayed_fork_is_killable_and_does_not_hold_up_shutdown :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
+	sync.mutex_lock(&serial_tests)
+	defer sync.mutex_unlock(&serial_tests)
+	s := scheduler_init()
+	defer scheduler_destroy(&s)
+	counter := 0
+	lock: sync.Mutex
+	counter_target = &counter
+	counter_lock = &lock
+	world := make_test_world(&s)
+
+	sync.mutex_lock(&s.big_lock)
+	r1 := run_src(t, &world, new_task_id(&s), `fork t (60) bump_counter(); endfork return t;`)
+	r2 := run_src(t, &world, new_task_id(&s), `fork t (60) bump_counter(); endfork return t;`)
+	sync.mutex_unlock(&s.big_lock)
+	defer values.free_var(r1.value)
+	defer values.free_var(r2.value)
+	id1, id2 := int(r1.value.data.num), int(r2.value.data.num)
+	testing.expect(t, task_exists(&s, id1) && task_exists(&s, id2), "a pending fork is a registered task")
+
+	task_arg :: proc(id: int) -> values.Var {
+		items := make([]values.Var, 1)
+		items[0] = values.int_val(i32(id))
+		return values.list_val(items)
+	}
+	rr := bf_resume(&s, task_arg(id1))
+	testing.expect(t, rr.raised && rr.code == .E_INVARG, "a pending fork is queued, not suspended: resume() refuses it")
+	if rr.raised {
+		delete(rr.msg)
+	}
+	kr := bf_kill_task(&s, task_arg(id1))
+	testing.expect(t, !kr.raised, "kill_task() reaches a fork that hasn't started")
+	testing.expect(t, !task_exists(&s, id1), "and it is gone at once")
+
+	start := time.now()
+	scheduler_shutdown(&s)
+	testing.expectf(t, time.since(start) < 5 * time.Second, "shutdown waited %v on a 60-second fork", time.since(start))
+	testing.expect(t, counter == 0, "neither fork ran")
+}
+
+// ---- Regression: a forked task parked in suspend() doesn't hold up the forks behind it ----
+//
+// Due forks drain from one run queue on a pool that keeps one worker runnable; a worker whose
+// task parks must hand the queue to another, or every later fork waits on that resume().
+@(test)
+test_parked_fork_does_not_block_the_run_queue :: proc(t: ^testing.T) {
+	mu: mem.Mutex_Allocator
+	context.allocator = thread_safe_allocator(&mu)
+	sync.mutex_lock(&serial_tests)
+	defer sync.mutex_unlock(&serial_tests)
+	s := scheduler_init()
+	defer scheduler_destroy(&s)
+	counter := 0
+	lock: sync.Mutex
+	counter_target = &counter
+	counter_lock = &lock
+	world := make_test_world(&s)
+
+	sync.mutex_lock(&s.big_lock)
+	r := run_src(t, &world, new_task_id(&s), `fork (0) suspend(); endfork fork (0) bump_counter(); endfork return 0;`)
+	sync.mutex_unlock(&s.big_lock)
+	values.free_var(r.value)
+
+	deadline := time.time_add(time.now(), 5 * time.Second)
+	for time.diff(time.now(), deadline) > 0 {
+		sync.mutex_lock(&lock)
+		done := counter == 1
+		sync.mutex_unlock(&lock)
+		if done {
+			break
+		}
+		time.sleep(time.Millisecond)
+	}
+	testing.expect(t, counter == 1, "the fork queued behind a parked one still ran")
+	scheduler_shutdown(&s) // kills the parked one
 }

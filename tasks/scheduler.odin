@@ -31,6 +31,7 @@ package tasks
 import "../values"
 import "../vm"
 import "base:runtime"
+import "core:container/queue"
 import "core:sync"
 import "core:thread"
 import "core:time"
@@ -41,6 +42,28 @@ Scheduler :: struct {
 	tasks:       map[int]^Task_Info,
 	next_id:     int,
 	active_forks: sync.Wait_Group, // lets tests/shutdown wait for outstanding forked tasks
+
+	// Delayed forks waiting for their start time (fork.odin's fork timer). All guarded by
+	// meta_lock. A min-heap on deadline, drained by ONE timer thread that exists only while
+	// something is pending -- not a sleeping thread per fork (see fork.odin's header).
+	pending_forks: [dynamic]Pending_Fork,
+	timer_cond:    sync.Cond, // signalled when the heap's head changes or shutdown begins
+	timer_running: bool,
+	shutting_down: bool, // set by scheduler_shutdown; queued forks are dropped from then on
+
+	// Forks that are due to run, drained in order by fork workers (fork.odin's header).
+	// Guarded by meta_lock. `runners` counts the workers not parked in suspend()/read().
+	run_queue:     queue.Queue(rawptr),
+	runners:       int,
+	service_wg:    sync.Wait_Group, // the timer and every fork worker, so shutdown/destroy can wait them out
+}
+
+// Pending_Fork is one delayed fork in Scheduler.pending_forks. `job` is fork.odin's private
+// Fork_Job; `info` is its registry entry, so kill_task()/queued_tasks() can see it.
+Pending_Fork :: struct {
+	deadline: time.Time,
+	job:      rawptr,
+	info:     ^Task_Info,
 }
 
 Task_Info :: struct {
@@ -49,6 +72,7 @@ Task_Info :: struct {
 	woken:        bool,
 	killed:       bool,
 	resume_value: values.Var, // set by resume(), consumed by the waiting suspend() call
+	fork_pending: bool, // a delayed fork not yet started: killable, but not resumable
 
 	// Snapshot of the suspending activation, captured once at register_task() time -- lets
 	// queued_tasks()/task_stack() (tasks/introspection.odin) report real (if single-frame,
@@ -87,19 +111,35 @@ scheduler_init :: proc() -> Scheduler {
 // there was no tick budget to cut one off with, so shutdown waited on it forever. There is
 // one now (vm/budget.odin), and a forked task gets its own the same way any other task does,
 // so such a loop ends on its own and this wait terminates.
+//
+// Delayed forks that have not started yet are dropped, not waited for: waiting used to mean
+// waiting out the longest pending delay, because each one was a thread in an uninterruptible
+// sleep -- `fork (86400)` held up SIGTERM for a day.
 scheduler_shutdown :: proc(s: ^Scheduler) {
 	sync.mutex_lock(&s.meta_lock)
 	for _, info in s.tasks {
 		info.killed = true
 		sync.cond_signal(&info.cond)
 	}
+	s.shutting_down = true
+	if !s.timer_running {
+		drop_pending_forks_locked(s) // nothing else will
+	}
+	if s.runners == 0 {
+		drop_runnable_forks_locked(s) // likewise
+	}
+	sync.cond_signal(&s.timer_cond)
 	sync.mutex_unlock(&s.meta_lock)
 	sync.wait_group_wait(&s.active_forks)
+	sync.wait_group_wait(&s.service_wg)
 	reap_workers()
 }
 
 scheduler_destroy :: proc(s: ^Scheduler) {
+	sync.wait_group_wait(&s.service_wg)
 	sync.mutex_lock(&s.meta_lock)
+	delete(s.pending_forks)
+	queue.destroy(&s.run_queue)
 	for _, info in s.tasks {
 		free(info)
 	}

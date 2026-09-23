@@ -644,3 +644,62 @@ test_for_list_loop_requires_a_list :: proc(t: ^testing.T) {
 	expect_return_int(t, `n = 0; for x in ({4, 5, 6}) n = n + x; endfor return n;`, 15)
 	expect_return_int(t, `n = 7; for x in ({}) n = 0; endfor return n;`, 7)
 }
+
+// ---- Regression: `l[i] = v` on a variable updates in place, and stays invisible to aliases ----
+//
+// assign_indexed used to hold its own reference to the variable's list, so index_set always saw
+// a refcount of 2 and copied the whole list for every one-element update: filling a list slot by
+// slot was quadratic, and 10000 assignments into a 100000-element list ran past the wall-clock
+// budget. take_path_ownership hands the variable's reference over once every index expression
+// has run. The point of the aliasing cases is that it must change only the cost -- every other
+// holder of the list (another variable, an enclosing list, a for loop) still sees the old value.
+// (No built-ins here: this package's test World has none.)
+@(test)
+test_indexed_assignment_in_place :: proc(t: ^testing.T) {
+	expect_return_int(t, `
+		l = {0}; n = 1;
+		while (n < 100000) l = {@l, @l}; n = n * 2; endwhile
+		for i in [1..10000] l[i] = i; endfor
+		return l[10000] + l[10001] + l[$];
+	`, 10000)
+	expect_return_int(t, `
+		a = {{1, 2}, {3, 4}}; b = a; c = a[1];
+		a[1][2] = 9;
+		return b[1][2] * 100 + c[2] * 10 + a[1][2];
+	`, 229)
+	expect_return_int(t, `
+		a = {1, 2, 3}; s = 0;
+		for x in (a) a[2] = 99; s = s + x; endfor
+		return s * 1000 + a[2];
+	`, 6099)
+	// An index expression that reassigns the variable: the update applies to the list that was
+	// read first, and the result replaces whatever the variable holds by then.
+	expect_return_int(t, `
+		l = {1, 2};
+		l[(l = {5, 6, 7}) ? 1 | 2] = 0;
+		return l[1] * 10 + l[$];
+	`, 2)
+	// A failed assignment leaves the variable exactly as it was, at any nesting depth.
+	expect_return_int(t, `l = {1, 2, 3}; try l[5] = 1; except (E_RANGE) endtry return l[$];`, 3)
+	expect_return_int(t, `l = {{1}, 2}; try l[1][1][1] = 1; except (E_TYPE) endtry return l[1][1];`, 1)
+	expect_return_int(t, `
+		x = {1}; for i in [1..22] x = {x, x}; endfor
+		l = {{x, 1}};
+		try l[1][2] = x; except (E_QUOTA) endtry
+		return l[1][2];
+	`, 1)
+}
+
+// ---- Regression: a list that reuses its sublists is bounded by its expanded size ----
+//
+// `x = {x, x}` doubles x's size as every recursive walk sees it (equality, toliteral, the
+// database writer) while adding one list node, so forty iterations built a value no walk could
+// finish. values.MAX_VALUE_SIZE stops it at every point a list can grow.
+@(test)
+test_shared_sublist_growth_is_capped :: proc(t: ^testing.T) {
+	expect_raised(t, `x = {1}; for i in [1..40] x = {x, x}; endfor return 1;`, .E_QUOTA)
+	expect_raised(t, `x = {1}; for i in [1..40] x[1] = {x[1], x[1]}; endfor return 1;`, .E_QUOTA)
+	expect_raised(t, `x = {{1}}; for i in [1..40] x[1..0] = x; endfor return 1;`, .E_QUOTA)
+	// Well under the cap is untouched.
+	expect_return_int(t, `x = {1}; for i in [1..10] x = {x, x}; endfor return x[2][2][2][2][2][2][2][2][2][2][1];`, 1)
+}

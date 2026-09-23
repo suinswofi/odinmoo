@@ -9,11 +9,10 @@ package objdb
 // beneath it, and not a real source line number (this port's tree-walking interpreter has no
 // per-statement PC to read one back from). task_stack() therefore always returns a
 // single-frame list instead of the original's full call stack, and its line-number field is
-// always 0. Forked-but-not-yet-started tasks (still sleeping out their delay in
-// tasks/fork.odin) also aren't visible here, since they aren't registered with the scheduler
-// until they'd suspend -- the original's queued_tasks() does show these. Both are honest,
-// narrow divergences given the architecture, not silent stubs: real suspended tasks report
-// real ids/owners/verb/this/player/start-time.
+// always 0. That is an honest, narrow divergence given the architecture, not a silent stub:
+// real suspended tasks report real ids/owners/verb/this/player/start-time. Delayed forks that
+// haven't started are listed too, as the original lists them, with their scheduled start time
+// (tasks/fork.odin registers each one when it is queued).
 
 import "../tasks"
 import "../values"

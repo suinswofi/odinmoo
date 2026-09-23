@@ -293,31 +293,47 @@ range_get :: proc(base, from, to: values.Var) -> Op_Result {
 	return ok_result(values.sub_list(values.var_ref(base), f, t))
 }
 
-// index_set ports OP_INDEXSET (`base[index] = value`): consumes base, index, and value;
-// returns the updated base. String targets require a single-character replacement value
-// (E_INVARG otherwise) since MOO strings have no independent character type.
-index_set :: proc(base, index, value: values.Var) -> Op_Result {
+// index_set_error is index_set's validation on its own: the error `base[index] = value` would
+// raise, or .E_NONE, consuming nothing. Separate so that assign_indexed can prove an update will
+// succeed BEFORE it hands a variable's value over to be mutated in place (see its header).
+index_set_error :: proc(base, index, value: values.Var) -> values.Error {
 	if (base.type != .List && base.type != .Str) || index.type != .Int || (base.type == .Str && value.type != .Str) {
-		values.free_var(base)
-		values.free_var(index)
-		values.free_var(value)
-		return err_result(.E_TYPE)
+		return .E_TYPE
 	}
 	i := int(index.data.num)
 	n := base.type == .List ? values.list_len(base) : len(base.data.str.s)
 	if i < 1 || i > n {
+		return .E_RANGE
+	}
+	if base.type == .Str {
+		return len(value.data.str.s) == 1 ? .E_NONE : .E_INVARG
+	}
+	// `l[i] = v` nests v one level inside l, so it can grow depth exactly like a list literal
+	// can -- see values.MAX_VALUE_DEPTH. Via nests_too_deep rather than off values.value_depth
+	// directly, because that cached bound over-estimates once a list has been mutated in
+	// place, and deciding off it rejected shallow values outright. And `l[1] = {l[1], l[1]}`
+	// doubles l's expanded size without lengthening it -- see values.MAX_VALUE_SIZE.
+	if values.nests_too_deep(value) || values.grows_too_big(base, value, values.list_get(base, i), false) {
+		return .E_QUOTA
+	}
+	return .E_NONE
+}
+
+// index_set ports OP_INDEXSET (`base[index] = value`): consumes base, index, and value;
+// returns the updated base. String targets require a single-character replacement value
+// (E_INVARG otherwise) since MOO strings have no independent character type.
+//
+// A list base whose refcount is 1 is updated in place, in O(1); a shared one is copied first,
+// which is what makes the update invisible to every other holder (MOO's value semantics).
+index_set :: proc(base, index, value: values.Var) -> Op_Result {
+	if e := index_set_error(base, index, value); e != .E_NONE {
 		values.free_var(base)
 		values.free_var(index)
 		values.free_var(value)
-		return err_result(.E_RANGE)
+		return err_result(e)
 	}
+	i := int(index.data.num)
 	if base.type == .Str {
-		if len(value.data.str.s) != 1 {
-			values.free_var(base)
-			values.free_var(index)
-			values.free_var(value)
-			return err_result(.E_INVARG)
-		}
 		buf := make([]byte, len(base.data.str.s))
 		copy(buf, base.data.str.s)
 		buf[i - 1] = value.data.str.s[0]
@@ -325,16 +341,6 @@ index_set :: proc(base, index, value: values.Var) -> Op_Result {
 		values.free_var(index)
 		values.free_var(value)
 		return ok_result(values.str_val(string(buf)))
-	}
-	if values.nests_too_deep(value) {
-		// `l[i] = v` nests v one level inside l, so it can grow depth exactly like a list
-		// literal can -- see values.MAX_VALUE_DEPTH. Via nests_too_deep rather than off
-		// values.value_depth directly, because that cached bound over-estimates once a list
-		// has been mutated in place, and deciding off it rejected shallow values outright.
-		values.free_var(base)
-		values.free_var(index)
-		values.free_var(value)
-		return err_result(.E_QUOTA)
 	}
 	result := base
 	if sync.atomic_load(&base.data.list.rc) != 1 { // atomic: see values.odin's refcount note
@@ -346,59 +352,78 @@ index_set :: proc(base, index, value: values.Var) -> Op_Result {
 	return ok_result(result)
 }
 
+// range_set_error is range_set's validation on its own, consuming nothing -- index_set_error's
+// counterpart, for the same reason.
+range_set_error :: proc(base, from, to, value: values.Var) -> values.Error {
+	if from.type != .Int || to.type != .Int || (base.type != .List && base.type != .Str) || (value.type != .List && value.type != .Str) || base.type != value.type {
+		return .E_TYPE
+	}
+	f, t := int(from.data.num), int(to.data.num)
+	n := base.type == .Str ? len(base.data.str.s) : values.list_len(base)
+	if f > n + 1 || t < 0 {
+		return .E_RANGE
+	}
+	left_n := f > 1 ? f - 1 : 0
+	right_n := n > t ? n - t : 0
+	if base.type == .Str {
+		// The other half of the doubling guard in do_string_concat: `s[1..0] = s` grows a
+		// string just as fast as `s + s` does.
+		if left_n + len(value.data.str.s) + right_n > values.MAX_STR_LEN {
+			return .E_QUOTA
+		}
+		return .E_NONE
+	}
+	// `l[1..0] = l` doubles the expanded size (values.MAX_VALUE_SIZE) as well as the length.
+	if left_n + values.list_len(value) + right_n > values.MAX_LIST_LEN || range_set_size(base, f, t, value) > values.MAX_VALUE_SIZE {
+		return .E_QUOTA
+	}
+	// list_range_set splices value's ELEMENTS in rather than nesting value itself, so the
+	// result can be no deeper than its two inputs already were -- no depth check needed.
+	return .E_NONE
+}
+
+// range_set_size is the exact expanded size (values.MAX_VALUE_SIZE) of `base[f..t] = value` for
+// a list base: the elements kept on the left, value's, and the elements kept on the right,
+// counted from the parts rather than as base's less the dropped range, because a reversed
+// range (`l[3..1] = v`) keeps an element on BOTH sides and so drops a negative number.
+range_set_size :: proc(base: values.Var, f, t: int, value: values.Var) -> int {
+	n := values.list_len(base)
+	left_n := f > 1 ? f - 1 : 0
+	right_n := n > t ? n - t : 0
+	size := values.value_size(value)
+	for k in 0 ..< left_n {
+		size = values.size_add(size, 1 + values.value_size(values.list_get(base, k + 1)))
+	}
+	for k in n - right_n ..< n {
+		size = values.size_add(size, 1 + values.value_size(values.list_get(base, k + 1)))
+	}
+	return size
+}
+
 // range_set ports EOP_RANGESET (`base[from..to] = value`) plus execute.c's
 // rangeset_check(): unlike range_get's read-only bounds check, this is deliberately
 // permissive -- `from == len+1` appends, `to == 0` prepends, allowing the range to grow or
 // shrink the base. (The original's SVO_MAX_*_CONCAT quota check needs `$server_options`,
 // which doesn't exist until Phase 4's object DB does; skipped here, same as do_string_concat.)
 range_set :: proc(base, from, to, value: values.Var) -> Op_Result {
-	if from.type != .Int || to.type != .Int || (base.type != .List && base.type != .Str) || (value.type != .List && value.type != .Str) || base.type != value.type {
+	if e := range_set_error(base, from, to, value); e != .E_NONE {
 		values.free_var(base)
 		values.free_var(from)
 		values.free_var(to)
 		values.free_var(value)
-		return err_result(.E_TYPE)
+		return err_result(e)
 	}
 	f, t := int(from.data.num), int(to.data.num)
-	n := base.type == .Str ? len(base.data.str.s) : values.list_len(base)
-	if f > n + 1 || t < 0 {
-		values.free_var(base)
-		values.free_var(from)
-		values.free_var(to)
-		values.free_var(value)
-		return err_result(.E_RANGE)
-	}
+	values.free_var(from)
+	values.free_var(to)
 	if base.type == .Str {
+		n := len(base.data.str.s)
 		left := f > 1 ? base.data.str.s[:f - 1] : ""
 		right := n > t ? base.data.str.s[t:] : ""
-		if len(left) + len(value.data.str.s) + len(right) > values.MAX_STR_LEN {
-			// The other half of the doubling guard in do_string_concat: `s[1..0] = s`
-			// grows a string just as fast as `s + s` does.
-			values.free_var(base)
-			values.free_var(from)
-			values.free_var(to)
-			values.free_var(value)
-			return err_result(.E_QUOTA)
-		}
 		joined := strings.concatenate({left, value.data.str.s, right})
 		values.free_var(base)
-		values.free_var(from)
-		values.free_var(to)
 		values.free_var(value)
 		return ok_result(values.str_val(joined))
 	}
-	left_n := f > 1 ? f - 1 : 0
-	right_n := n > t ? n - t : 0
-	if left_n + values.list_len(value) + right_n > values.MAX_LIST_LEN {
-		values.free_var(base)
-		values.free_var(from)
-		values.free_var(to)
-		values.free_var(value)
-		return err_result(.E_QUOTA)
-	}
-	values.free_var(from)
-	values.free_var(to)
-	// list_range_set splices value's ELEMENTS in rather than nesting value itself, so the
-	// result can be no deeper than its two inputs already were -- no depth check needed.
 	return ok_result(values.list_range_set(base, f, t, value))
 }

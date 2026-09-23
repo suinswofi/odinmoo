@@ -88,6 +88,7 @@ bf_suspend :: proc(s: ^Scheduler, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 park_wait :: proc(s: ^Scheduler, id: int, info: ^Task_Info, seconds: f64) -> (resume_value: values.Var, killed: bool) {
 	sync.mutex_lock(&s.meta_lock)
 	sync.mutex_unlock(&s.big_lock) // stop competing for the DB while parked
+	fork_worker_parked(s) // a forked task parking mustn't hold up the forks queued behind it
 	if seconds < 0 {
 		for !info.woken && !info.killed {
 			sync.cond_wait(&info.cond, &s.meta_lock)
@@ -102,6 +103,7 @@ park_wait :: proc(s: ^Scheduler, id: int, info: ^Task_Info, seconds: f64) -> (re
 			sync.cond_wait_with_timeout(&info.cond, &s.meta_lock, remaining)
 		}
 	}
+	fork_worker_unparked(s)
 	resume_value = info.resume_value
 	killed = info.killed
 	// Unregistering must be ATOMIC with reading the outcome, inside this same meta_lock
@@ -157,7 +159,9 @@ bf_resume :: proc(s: ^Scheduler, args: values.Var) -> vm.Call_Result {
 	// handed its outcome and just hasn't torn the entry down yet. Treating it as resumable
 	// would overwrite (and leak) the first resume's value -- the original's resume_task()
 	// likewise only accepts tasks actually in the suspended queue.
-	if !ok || info.woken || info.killed {
+	// A delayed fork that hasn't started is queued, not suspended -- the original's
+	// resume_task() refuses those too.
+	if !ok || info.woken || info.killed || info.fork_pending {
 		sync.mutex_unlock(&s.meta_lock)
 		return raise_err(.E_INVARG, "Task is not suspended")
 	}
@@ -193,7 +197,15 @@ bf_kill_task :: proc(s: ^Scheduler, args: values.Var) -> vm.Call_Result {
 		return raise_err(.E_INVARG, "Task is not suspended")
 	}
 	info.killed = true
-	sync.cond_signal(&info.cond)
+	if info.fork_pending {
+		// A delayed fork that hasn't started: it leaves the registry now, and the fork timer
+		// discards the job (and frees `info`) when it next looks at it. It used to be a thread
+		// asleep in time.sleep and absent from the registry, so it could not be killed at all.
+		delete_key(&s.tasks, id)
+		sync.cond_signal(&s.timer_cond)
+	} else {
+		sync.cond_signal(&info.cond)
+	}
 	sync.mutex_unlock(&s.meta_lock)
 	return vm.call_ok(values.int_val(0))
 }

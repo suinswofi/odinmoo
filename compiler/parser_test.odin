@@ -1,5 +1,6 @@
 package compiler
 
+import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:testing"
@@ -340,4 +341,42 @@ test_moderate_nesting_still_parses :: proc(t: ^testing.T) {
 	defer delete(src)
 	r := parse_ok(t, src)
 	result_destroy(&r)
+}
+
+// ---- Regression: variable lookup is hashed once a verb has many names ----
+//
+// find_or_add scanned every name per identifier, making parsing O(identifiers x distinct
+// names): 80000 distinct variables in one eval() string took 37 seconds. Past
+// NAME_INDEX_THRESHOLD it uses a folded-name index, which must keep the scan's semantics --
+// case-insensitive, first spelling wins -- and must survive name_table_clone (fork's copy).
+@(test)
+test_name_table_index_keeps_scan_semantics :: proc(t: ^testing.T) {
+	b := strings.builder_make()
+	defer strings.builder_destroy(&b)
+	for i in 0 ..< 200 {
+		fmt.sbprintf(&b, "Var%d = %d;\n", i, i)
+	}
+	strings.write_string(&b, "return VAR150 + var3;")
+	r := parse_program(strings.to_string(b), DBV_Float)
+	defer {
+		free_stmts(r.body)
+		name_table_destroy(&r.names)
+		for e in r.errors do delete(e)
+		delete(r.errors)
+	}
+	testing.expect(t, len(r.errors) == 0)
+	testing.expect(t, r.names.index != nil, "a 200-name table is indexed")
+	base := first_user_slot(DBV_Float)
+	testing.expect_value(t, len(r.names.names), base + 200)
+	testing.expect_value(t, find(&r.names, "vAr150"), base + 150)
+	testing.expect_value(t, r.names.names[base + 150], "Var150") // first spelling kept
+	testing.expect_value(t, find(&r.names, "player"), 5)
+	testing.expect_value(t, find(&r.names, "nosuch"), -1)
+
+	c := name_table_clone(&r.names)
+	defer name_table_destroy(&c)
+	testing.expect_value(t, find(&c, "VAR199"), base + 199)
+	testing.expect_value(t, find_or_add(&c, "var7"), base + 7)
+	testing.expect_value(t, find_or_add(&c, "brand_new"), base + 200)
+	testing.expect_value(t, find(&c, "BRAND_NEW"), base + 200)
 }

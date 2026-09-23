@@ -25,6 +25,9 @@ list_get :: proc(v: Var, pos: int) -> Var {
 // original.
 list_set :: proc(list: Var, value: Var, pos: int) -> Var {
 	l := list.data.list
+	// Exact, unlike depth: see MAX_VALUE_SIZE for why an in-place update can't leave a
+	// container's size stale.
+	l.size = size_add(l.size - value_size(l.items[pos - 1]), value_size(value))
 	free_var(l.items[pos - 1])
 	l.items[pos - 1] = value
 	// Raise the cached depth if the new element is deeper than anything the list held.
@@ -69,6 +72,7 @@ do_insert :: proc(list: Var, value: Var, pos: int) -> Var {
 		delete(l.items)
 		grown[n] = value
 		l.items = grown
+		l.size = size_add(l.size + 1, value_size(value))
 		if d := value_depth(value) + 1; d > l.depth {
 			l.depth = d // same in-place depth maintenance as list_set's
 		}

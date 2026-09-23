@@ -77,12 +77,13 @@ Moo_String :: struct {
 // be redundant and is a common source of off-by-one bugs in the original). MOO-level 1-based
 // indexing is a language-surface concern handled at the builtins/VM boundary, not here.
 //
-// `depth` is this port's own addition, and it is a memory-safety device rather than
-// bookkeeping -- see MAX_VALUE_DEPTH.
+// `depth` and `size` are this port's own additions, and they are memory-safety devices
+// rather than bookkeeping -- see MAX_VALUE_DEPTH and MAX_VALUE_SIZE.
 Moo_List :: struct {
 	rc:    int,
 	items: []Var,
 	depth: int, // 1 + the greatest depth among items; a list of scalars has depth 1
+	size:  int, // len(items) + the size of every list among them: see MAX_VALUE_SIZE
 }
 
 Var_Data :: struct #raw_union {
@@ -156,13 +157,28 @@ list_val :: proc(items: []Var) -> Var {
 	ml.rc = 1
 	ml.items = items
 	deepest := 0
+	size := len(items)
 	for item in items {
-		if item.type == .List && item.data.list.depth > deepest {
-			deepest = item.data.list.depth
+		if item.type == .List {
+			if item.data.list.depth > deepest {
+				deepest = item.data.list.depth
+			}
+			size = size_add(size, item.data.list.size)
 		}
 	}
 	ml.depth = deepest + 1
+	ml.size = size
 	return Var{type = .List, data = {list = ml}}
+}
+
+// size_add saturates rather than wrapping. Sizes are only ever compared against
+// MAX_VALUE_SIZE, and a list built by something that doesn't enforce it (one level of it, at
+// most -- the next nesting is checked) can hold MAX_LIST_LEN elements each just under the cap,
+// which still fits an int; saturating just means no sum of them ever can wrap to small.
+size_add :: proc(a, b: int) -> int {
+	SATURATED :: 1 << 60
+	s := a + b
+	return s > SATURATED ? SATURATED : s
 }
 
 // MAX_VALUE_DEPTH caps how deeply MOO values may nest inside one another. Like the
@@ -197,6 +213,60 @@ MAX_VALUE_DEPTH :: 256
 MAX_LIST_LEN :: 1 << 20
 MAX_STR_LEN :: 1 << 24
 
+// MAX_VALUE_SIZE bounds the number of elements a value has when it is FULLY EXPANDED -- counting
+// each shared sublist once per place it appears, which is how every recursive walk sees it:
+// equality, toliteral(), value_bytes(), exceeds_depth below, and the database writer.
+//
+// Neither of the other two limits catches the construction this one exists for:
+//
+//   x = {1}; for i in [1..40] x = {x, x}; endfor
+//
+// forty ticks, forty-one list nodes in memory, every list two elements long and 41 deep -- and
+// 2^40 leaves to anything that walks it. `x == y` against a second list built the same way ran
+// 5.6 seconds at depth 30 in one statement with big_lock held (the `a.data.list == b.data.list`
+// shortcut in `equality` only helps when the two sides are the same node), and toliteral() and
+// the CHECKPOINT writer grew their output by the same factor, so storing x in a property left a
+// database that could never be written again. Capping the expanded size bounds every one of
+// those walks by the cap instead of by 2^depth.
+//
+// Unlike `depth`, `size` is kept EXACT by the in-place mutators, because a list is only ever
+// mutated in place when its refcount is 1 -- and a list another list contains has a refcount
+// of at least 2 (the container's, plus the one the mutator is working through). So an in-place
+// update can never leave a CONTAINER's cached size stale, and the element's own size changes by
+// exactly what was put in minus what was taken out. That makes the limit a plain O(1) field read
+// wherever it is checked, with no slow path.
+//
+// 16M, like MAX_STR_LEN, and for the same reason: no legitimate MOO value approaches it (it is
+// sixteen times MAX_LIST_LEN), and a walk over that many elements is a fraction of a second.
+MAX_VALUE_SIZE :: 1 << 24
+
+// value_size reports v's expanded size (see MAX_VALUE_SIZE). Scalars are 0; `{1, {2, 3}}` is 4.
+value_size :: proc(v: Var) -> int {
+	if v.type == .List {
+		return v.data.list.size
+	}
+	return 0
+}
+
+// too_big is the guard every value-building operation applies to its RESULT: too_deep, plus
+// MAX_VALUE_SIZE. Anything that nests or splices caller-supplied values into a list should use
+// this rather than too_deep alone.
+too_big :: proc(v: Var) -> bool {
+	return value_size(v) > MAX_VALUE_SIZE || too_deep(v)
+}
+
+// grows_too_big asks MAX_VALUE_SIZE's question one step ahead, for the operations that put
+// `value` inside `list` in place of `replaced` (none_val() when nothing is replaced, as for an
+// insertion): the result's size is exactly list's, minus replaced's, plus value's, plus one for
+// a new slot. Exact because sizes are (see MAX_VALUE_SIZE), so this needs no walk.
+grows_too_big :: proc(list, value, replaced: Var, adds_slot: bool) -> bool {
+	s := value_size(list) - value_size(replaced) + value_size(value)
+	if adds_slot {
+		s += 1
+	}
+	return s > MAX_VALUE_SIZE
+}
+
 // MAX_USABLE_VALUE_DEPTH is the deepest a value may be and still be passable to a verb or
 // built-in: the argument list carrying it is itself a value and costs one level, so it must fit
 // under MAX_VALUE_DEPTH too. Values loaded from a database are held to this rather than to
@@ -220,6 +290,13 @@ value_depth :: proc(v: Var) -> int {
 // exceeds_depth answers "does v nest more than `budget` levels" by walking it, stopping as soon
 // as it knows. Its own recursion is bounded by `budget`, so it cannot overflow the stack even on
 // a value whose cached bound is wrong.
+//
+// It descends only into items whose cached bound is itself over the remaining budget: the bound
+// is never an UNDER-estimate, so an item within it is proven shallow enough without a look.
+// Walking everything instead cost fanout^depth on a list that reuses its sublists --
+// `a = {a,a,a,a,a,a,a,a}` eleven times, then `{a, deep}` with the one genuinely stale-bounded
+// item last, ran 18 seconds in one statement. MAX_VALUE_SIZE bounds that walk too, but this
+// makes the common case -- one stale path through an otherwise honest value -- O(depth x fanout).
 @(private = "file")
 exceeds_depth :: proc(v: Var, budget: int) -> bool {
 	if v.type != .List {
@@ -229,6 +306,9 @@ exceeds_depth :: proc(v: Var, budget: int) -> bool {
 		return true
 	}
 	for item in v.data.list.items {
+		if value_depth(item) <= budget - 1 {
+			continue
+		}
 		if exceeds_depth(item, budget - 1) {
 			return true
 		}

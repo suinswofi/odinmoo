@@ -33,6 +33,7 @@ package netio
 
 import "../tasks"
 import "../values"
+import "core:container/queue"
 import "core:net"
 import "core:strings"
 import "core:sync"
@@ -66,11 +67,8 @@ connection_io_destroy :: proc(conn: ^Connection) {
 		values.free_var(v)
 	}
 	delete(conn.options)
-	for line in conn.pending_lines {
-		delete(line)
-	}
-	delete(conn.pending_lines)
-	conn.pending_bytes = 0
+	clear_pending_locked(conn)
+	queue.destroy(&conn.pending_lines)
 	sync.mutex_unlock(&conn.io_lock)
 	if tid != 0 {
 		// The connection is gone while a task was parked in read() on it -- wake it with an
@@ -126,7 +124,7 @@ deliver :: proc(conn: ^Connection, line: string, at_front: bool, from_other_thre
 			send_line(conn, ">> Forced input line too long: discarded <<")
 			return
 		}
-		if conn.pending_bytes + len(line) > MAX_QUEUED_INPUT {
+		if conn.pending_bytes + len(line) > MAX_QUEUED_INPUT || queue.len(conn.pending_lines) >= MAX_QUEUED_INPUT {
 			// The queue has outrun whatever is meant to be draining it: a client typing
 			// faster than its commands run, one that set "hold-input" and then kept typing,
 			// or a verb in a force_input() loop. Same policy as the outbound side's
@@ -134,11 +132,7 @@ deliver :: proc(conn: ^Connection, line: string, at_front: bool, from_other_thre
 			// flush: drop the backlog, say so, keep the newest line. Dropping the OLDEST
 			// is what makes this recoverable -- the connection stays usable and the command
 			// the player just typed is the one that survives.
-			for l in conn.pending_lines {
-				delete(l)
-			}
-			clear(&conn.pending_lines)
-			conn.pending_bytes = 0
+			clear_pending_locked(conn)
 			// Safe to notify without dropping io_lock: send_line only ever reaches
 			// out_lock (connection.odin's enqueue_output), and nothing anywhere takes
 			// io_lock while holding out_lock, so there is no inversion to create. Keeping
@@ -148,16 +142,9 @@ deliver :: proc(conn: ^Connection, line: string, at_front: bool, from_other_thre
 		}
 		conn.pending_bytes += len(line)
 		if at_front {
-			old := conn.pending_lines
-			new_lines: [dynamic]string
-			append(&new_lines, line)
-			for l in old {
-				append(&new_lines, l)
-			}
-			delete(old)
-			conn.pending_lines = new_lines
+			queue.push_front(&conn.pending_lines, line)
 		} else {
-			append(&conn.pending_lines, line)
+			queue.push_back(&conn.pending_lines, line)
 		}
 		sync.mutex_unlock(&conn.io_lock)
 		if from_other_thread && !hold {
@@ -235,14 +222,14 @@ drain_thread_proc :: proc(data: rawptr) {
 	defer free_all(context.temp_allocator)
 	for {
 		sync.mutex_lock(&conn.io_lock)
-		if values.is_true(conn.options["hold-input"]) || len(conn.pending_lines) == 0 || conn.reader_task_id != 0 {
+		if values.is_true(conn.options["hold-input"]) || queue.len(conn.pending_lines) == 0 || conn.reader_task_id != 0 {
 			conn.drain_running = false
 			sync.mutex_unlock(&conn.io_lock)
 			return
 		}
-		line := conn.pending_lines[0]
-		copy(conn.pending_lines[:], conn.pending_lines[1:])
-		resize(&conn.pending_lines, len(conn.pending_lines) - 1)
+		// A ring buffer's pop, not `copy(q[:], q[1:])` -- shifting the whole queue down per
+		// line made draining N queued lines O(N^2): 400k bare newlines took 11 seconds.
+		line := queue.pop_front(&conn.pending_lines)
 		conn.pending_bytes -= len(line)
 		sync.mutex_unlock(&conn.io_lock)
 		dispatch_now(conn, line)
@@ -253,14 +240,21 @@ drain_thread_proc :: proc(data: rawptr) {
 try_dequeue :: proc(conn: ^Connection) -> (line: string, ok: bool) {
 	sync.mutex_lock(&conn.io_lock)
 	defer sync.mutex_unlock(&conn.io_lock)
-	if len(conn.pending_lines) == 0 {
+	if queue.len(conn.pending_lines) == 0 {
 		return "", false
 	}
-	line = conn.pending_lines[0]
-	copy(conn.pending_lines[:], conn.pending_lines[1:])
-	resize(&conn.pending_lines, len(conn.pending_lines) - 1)
+	line = queue.pop_front(&conn.pending_lines)
 	conn.pending_bytes -= len(line)
 	return line, true
+}
+
+// clear_pending_locked frees every queued line. Caller holds conn.io_lock.
+@(private = "file")
+clear_pending_locked :: proc(conn: ^Connection) {
+	for queue.len(conn.pending_lines) > 0 {
+		delete(queue.pop_front(&conn.pending_lines))
+	}
+	conn.pending_bytes = 0
 }
 
 @(private = "file")
@@ -330,7 +324,7 @@ hook_unregister_reader :: proc(user_data: rawptr, player: values.Objid, task_id:
 	// The drain worker stands down while a reader is parked; if lines queued up in the
 	// meantime (or the read consumed only some of them), restart it now that the reader is
 	// gone, or they'd sit until the next line happened to arrive.
-	kick := len(conn.pending_lines) > 0 && !values.is_true(conn.options["hold-input"])
+	kick := queue.len(conn.pending_lines) > 0 && !values.is_true(conn.options["hold-input"])
 	sync.mutex_unlock(&conn.io_lock)
 	if kick {
 		spawn_drain(conn)
@@ -358,11 +352,7 @@ hook_flush_input :: proc(user_data: rawptr, player: values.Objid, show_messages:
 		return false
 	}
 	sync.mutex_lock(&conn.io_lock)
-	for l in conn.pending_lines {
-		delete(l)
-	}
-	clear(&conn.pending_lines)
-	conn.pending_bytes = 0
+	clear_pending_locked(conn)
 	sync.mutex_unlock(&conn.io_lock)
 	if show_messages {
 		send_line(conn, "*** Flushed ***")

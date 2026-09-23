@@ -213,7 +213,15 @@ read_var :: proc(r: ^Reader, version: int, intern: ^values.Intern_Table, depth: 
 			}
 			items[i] = item
 		}
-		return values.list_val(items), .None
+		result := values.list_val(items)
+		// The load-time half of values.MAX_VALUE_SIZE, for the same reason depth is checked
+		// above: less one, since the argument list that passes a value to a verb or built-in
+		// adds a slot of its own. A file can't share sublists, so this is at most its length.
+		if values.value_size(result) > values.MAX_VALUE_SIZE - 1 {
+			values.free_var(result)
+			return values.none_val(), .Bad_Format
+		}
+		return result, .None
 	}
 	return values.none_val(), .Bad_Format
 }

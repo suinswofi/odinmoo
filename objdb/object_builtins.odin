@@ -178,7 +178,7 @@ ok_result :: proc(v: values.Var) -> vm.Call_Result {
 //
 // Use this rather than another one-off check wherever a built-in nests a value it was handed.
 ok_result_checked :: proc(v: values.Var) -> vm.Call_Result {
-	if values.too_deep(v) {
+	if values.too_big(v) {
 		values.free_var(v)
 		return err_result_local(.E_QUOTA, "Value too large")
 	}

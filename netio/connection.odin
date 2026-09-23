@@ -32,6 +32,7 @@ import "../objdb"
 import "../tasks"
 import "../values"
 import "../vm"
+import "core:container/queue"
 import "core:net"
 import "core:strings"
 import "core:sync"
@@ -61,7 +62,7 @@ Connection :: struct {
 	// (see input_queue.odin's header for the full design). Protected by io_lock throughout.
 	io_lock:        sync.Mutex,
 	reader_task_id: int, // 0 = no task currently parked in read() on this connection
-	pending_lines:  [dynamic]string, // queued while "hold-input" is set, or awaiting a non-blocking read()
+	pending_lines:  queue.Queue(string), // queued while "hold-input" is set, or awaiting a non-blocking read(); a ring buffer, so taking the head is O(1)
 	pending_bytes:  int, // total length of pending_lines, kept incrementally so the MAX_QUEUED_INPUT check stays O(1)
 	options:        map[string]values.Var, // connection-option store, see input_queue.odin's option_defaults
 	drains:         sync.Wait_Group, // outstanding drain threads (input_queue.odin's spawn_drain)
@@ -138,6 +139,11 @@ MAX_QUEUED_OUTPUT :: 65536
 // separate, so each is checked against it. Over-limit policy matches the original's
 // (net_multi.c's "input flushed" handling) and this file's own output side: drop what is
 // queued, tell the client, keep the connection alive.
+//
+// The queue is bounded in LINES as well as bytes, by the same number: an empty line costs
+// nothing against a byte budget, so a client sending bare "\n" (or "\r\n") could queue
+// them without limit -- a megabyte of newlines is a million queued lines, each of which
+// becomes a command dispatch (a login attempt, before authentication) under big_lock.
 MAX_QUEUED_INPUT :: 65536
 
 // enqueue_output appends msg to conn's outbound buffer and wakes the writer thread. Never
