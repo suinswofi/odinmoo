@@ -9,9 +9,11 @@ package objdb
 // `server` package/`moo` binary) needs `-extra-linker-flags:"-lcrypt"` or the link step fails
 // with "undefined reference to `crypt'".
 
+import "../dbfile"
 import "../values"
 import "../vm"
 import "core:crypto"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 import "core:sys/posix"
@@ -76,22 +78,42 @@ bf_crypt :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 }
 
 // bf_players ports objects.c's bf_players(): every currently-live object with FLAG_USER set.
-// The original maintains an incrementally-updated all_users set; here it's just computed by
-// scanning, which is equivalent (players() is not a hot path).
+//
+// It used to scan every object on every call -- 137us at 50000 objects, from a built-in both
+// stock cores call in dozens of places, including `for p in (players())` loops in periodic
+// code. The original keeps an all_users set up to date instead; here the RESULT is kept, as a
+// MOO list shared by reference (so a call is O(1)), and dropped by players_cache_invalidate
+// at the only three places that can change who is a player: set_player_flag(), recycle() and
+// renumber(). Recomputing it is the old scan, in ascending id order -- a stable order where
+// the scan's was the hash map's, i.e. none in particular.
 bf_players :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 	defer values.free_var(args)
 	if values.list_len(args) != 0 {
 		return err_result_local(.E_ARGS, "Incorrect number of arguments")
 	}
-	items: [dynamic]values.Var
-	for oid, obj in w.db.objects {
-		if (obj.flags & (1 << uint(Object_Flag.User))) != 0 {
-			append(&items, values.obj_val(oid))
+	if w.db.players_cache.type != .List {
+		ids: [dynamic]values.Objid
+		defer delete(ids)
+		for oid, obj in w.db.objects {
+			if (obj.flags & (1 << uint(Object_Flag.User))) != 0 {
+				append(&ids, oid)
+			}
 		}
+		slice.sort(ids[:])
+		items := make([]values.Var, len(ids))
+		for id, i in ids {
+			items[i] = values.obj_val(id)
+		}
+		w.db.players_cache = values.list_val(items)
 	}
-	// Exact-length allocation: the receiver frees this with delete(). See vm/eval_expr.odin.
-	shrink(&items)
-	return ok_result(values.list_val(items[:]))
+	return ok_result(values.var_ref(w.db.players_cache))
+}
+
+// players_cache_invalidate drops the cached players() result. Call it wherever an object can
+// gain or lose FLAG_USER, or a player's id can stop naming it.
+players_cache_invalidate :: proc(db: ^dbfile.Database) {
+	values.free_var(db.players_cache)
+	db.players_cache = values.none_val()
 }
 
 // bf_set_player_flag ports objects.c's bf_set_player_flag(): wizard-only; setting the flag
@@ -122,5 +144,6 @@ bf_set_player_flag :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Con
 		}
 		obj.flags &~= 1 << uint(Object_Flag.User)
 	}
+	players_cache_invalidate(w.db)
 	return ok_result(values.int_val(0))
 }

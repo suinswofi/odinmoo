@@ -171,7 +171,11 @@ Two structural points that are easy to violate by accident:
   `big_lock` held — i.e. exactly the server-wedging the budget exists to prevent, straight
   through it. **A built-in must do work bounded by its inputs** (which are themselves bounded by
   `MAX_STR_LEN`/`MAX_LIST_LEN`); one that loops on its own recognizance needs its own internal
-  ceiling, like `regex.MAX_STEPS`, and that ceiling must be per-call.
+  ceiling, like `regex.MAX_STEPS`, and that ceiling must be per-call. It must also not be a
+  bare constant when the legitimate work is linear in the input: a flat per-call
+  `MAX_STEPS` was spent by the scan itself (a step or two per start position), so a match more
+  than ~1MB into its subject came back as *no match*. The budget is now `MAX_STEPS +
+  ATTEMPT_STEPS × len(subject)` — still bounded by the input, no longer wrong on it.
 
   Two corollaries, both learned the hard way after that fix. **The ceiling has to cover the
   set-up, not just the loop**: `regex`'s per-attempt `runner_reset` cleared an
@@ -321,6 +325,17 @@ Two structural points that are easy to violate by accident:
   still reports against JHCore; LambdaCore calls none of them.
   Databases at format version 5+ (e.g. HellCore) are rejected cleanly at load — stock LambdaMOO's
   `DB_Version` stops at 4, and so does this.
+- **Three caches stand in for walks over the object DB, and each is only as correct as its
+  invalidation.** The callable-verb cache (`objdb/verb.odin`, like upstream's) must be cleared
+  by `verb_cache_clear` on any change to a verbdef's name, perms or position, or to any
+  object's parent or existence — today `add_verb`, `delete_verb`, `set_verb_info`,
+  `chparent`, `recycle`, `renumber`. The `players()` result (`players_cache_invalidate`) must be
+  dropped wherever `FLAG_USER` or a player's id can change. The child/contents list hints on
+  `dbfile.Object` (`objdb/link_lists.odin`) need no invalidation at all, by design: every use
+  checks the hint against the real links first and walks when it is wrong, so any code may
+  relink objects by hand without knowing they exist. Adding a new way to change verbs, parents
+  or player status means adding the matching clear — a stale verb cache dispatches to the
+  wrong verb, silently.
 - **Never remove an object from `db.objects` while anything still points at it.**
   `destroy_object` (`objdb/object_crud.odin`) enforces its own "barren orphan" precondition
   rather than trusting callers, because `bf_recycle` broke it: when a contained object refused to

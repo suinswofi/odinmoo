@@ -62,36 +62,10 @@ property_defined_at_or_below :: proc(db: ^dbfile.Database, name: string, oid: va
 db_change_parent_links :: proc(db: ^dbfile.Database, oid, new_parent: values.Objid) {
 	old_parent := db.objects[oid].parent
 	if valid(db, old_parent) {
-		p := db.objects[old_parent]
-		o := db.objects[oid]
-		if p.child == oid {
-			p.child = o.sibling
-		} else {
-			lid := p.child
-			for lid != values.NOTHING {
-				lo := db.objects[lid]
-				if lo.sibling == oid {
-					lo.sibling = o.sibling
-					break
-				}
-				lid = lo.sibling
-			}
-		}
-		o.sibling = values.NOTHING
+		chain_unlink(db, .Children, old_parent, oid)
 	}
 	if valid(db, new_parent) {
-		p := db.objects[new_parent]
-		o := db.objects[oid]
-		if p.child == values.NOTHING {
-			p.child = oid
-		} else {
-			lid := p.child
-			for db.objects[lid].sibling != values.NOTHING {
-				lid = db.objects[lid].sibling
-			}
-			db.objects[lid].sibling = oid
-		}
-		o.sibling = values.NOTHING
+		chain_append(db, .Children, new_parent, oid)
 	}
 	db.objects[oid].parent = new_parent
 }
@@ -313,6 +287,8 @@ bf_recycle :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) ->
 	incr_quota(w.db, owner)
 	destroy_object(w.db, oid)
 	compile_cache_invalidate_object(&w.cache, oid)
+	verb_cache_clear(w.db) // the object is gone and its children have a new parent
+	players_cache_invalidate(w.db)
 	if squelch {
 		// Demolition complete; NOW the :recycle body's raise continues into the caller.
 		return pending
@@ -393,6 +369,7 @@ bf_chparent :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -
 	snap := prop_layout_snapshot(w.db, what)
 	defer prop_layout_snapshot_destroy(&snap)
 	db_change_parent_links(w.db, what, new_parent)
+	verb_cache_clear(w.db) // every lookup from `what`'s subtree now walks a different chain
 	resync_subtree_propvals(w.db, what, w.db.objects[what].owner, &snap)
 	return ok_result(values.int_val(0))
 }
@@ -436,6 +413,8 @@ bf_renumber :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -
 	// (a stale leftover from whatever previously occupied that slot before being recycled).
 	compile_cache_invalidate_object(&w.cache, old)
 	compile_cache_invalidate_object(&w.cache, new_id)
+	verb_cache_clear(w.db) // cached handles name `old` as a definer, and `new_id` as dead
+	players_cache_invalidate(w.db)
 
 	obj := w.db.objects[old]
 	delete_key(&w.db.objects, old)

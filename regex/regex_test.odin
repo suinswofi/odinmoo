@@ -321,3 +321,41 @@ test_zero_width_loop_guard_spans_attempts :: proc(t: ^testing.T) {
 	late := match_pattern(&prog, "xxxaaab", false, true)
 	testing.expectf(t, late.found && late.start == 3 && late.end == 7, "got %v", late)
 }
+
+// ---- Regression: a long subject no longer exhausts the step budget just by scanning ----
+//
+// MAX_STEPS was the whole call's budget, and every start position costs a step or two even when
+// it fails at once, so a match more than about a million bytes in was reported as no match.
+// Each position now adds ATTEMPT_STEPS to the budget, and literal-first patterns skip
+// positions without running at all. Both paths are covered: "b" (literal first) and "[b]"
+// (a class, so every position really is attempted), forwards and in reverse.
+@(test)
+test_match_far_into_a_long_subject :: proc(t: ^testing.T) {
+	subject := strings.concatenate({strings.repeat("a", 3_000_000, context.temp_allocator), "b"}, context.temp_allocator)
+	for pat in ([]string{"b", "[b]", "%(b%)", "[^a]"}) {
+		prog, ok := compile(pat)
+		defer program_destroy(&prog)
+		testing.expect(t, ok)
+		fwd := match_pattern(&prog, subject, false, true)
+		testing.expectf(t, fwd.found && fwd.start == 3_000_000, "%s forward: %v", pat, fwd.found)
+		rev := match_pattern(&prog, subject, true, true)
+		testing.expectf(t, rev.found && rev.start == 3_000_000, "%s reverse: %v", pat, rev.found)
+	}
+	// Case folding still applies to the literal-first skip.
+	prog, _ := compile("B")
+	defer program_destroy(&prog)
+	testing.expect(t, match_pattern(&prog, subject, false, true).found)
+	testing.expect(t, !match_pattern(&prog, subject, false, false).found)
+}
+
+// ---- Regression: character classes are shared, and %w/%W still mean opposite things ----
+@(test)
+test_class_table_is_shared :: proc(t: ^testing.T) {
+	prog, ok := compile("%w%W[a-z][a-z]%w")
+	defer program_destroy(&prog)
+	testing.expect(t, ok)
+	testing.expect_value(t, len(prog.classes), 2) // one word set, one [a-z]
+	res := match_pattern(&prog, "!! x.ab9 ", false, false)
+	testing.expect(t, res.found && res.start == 3 && res.end == 8)
+	testing.expect_value(t, size_of(Instr), 16)
+}

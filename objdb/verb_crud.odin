@@ -174,6 +174,7 @@ bf_add_verb :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -
 
 	obj := w.db.objects[oid]
 	full_perms := perms | (dobj << 4) | (iobj << 6)
+	verb_cache_clear(w.db)
 	append(&obj.verbdefs, dbfile.Verbdef{
 		name        = dbfile.intern_name(&w.db.name_intern, names),
 		owner       = owner,
@@ -214,6 +215,7 @@ bf_delete_verb :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context
 	obj := w.db.objects[oid]
 	delete(obj.verbdefs[h.index].program_source)
 	ordered_remove_verbdef(&obj.verbdefs, h.index)
+	verb_cache_clear(w.db)
 	// Every verbdef after the removed one just shifted down by one index, so their cache
 	// entries (which are keyed by index) now point at the wrong verb. Dropping every entry for
 	// this object covers the removed verb and the shifted ones alike -- they just recompile
@@ -262,6 +264,7 @@ bf_set_verb_info :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Conte
 	vd.owner = new_owner
 	vd.perms = new_perms | dobj_iobj_bits
 	vd.name = dbfile.intern_name(&w.db.name_intern, new_names)
+	verb_cache_clear(w.db) // names and the x bit both decide callable lookups
 	return ok_result(values.int_val(0))
 }
 

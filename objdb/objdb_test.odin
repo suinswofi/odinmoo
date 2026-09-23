@@ -93,6 +93,9 @@ db_destroy :: proc(db: ^dbfile.Database) {
 		free(o)
 	}
 	delete(db.objects)
+	verb_cache_clear(db)
+	delete(db.verb_cache)
+	values.free_var(db.players_cache)
 	// build_hierarchy() constructs a Database by hand rather than through
 	// dbfile.load_database(), so name_intern starts zero-valued (a nil map, safe to
 	// write into -- Odin auto-allocates on first assignment) rather than explicitly

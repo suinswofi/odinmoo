@@ -786,36 +786,10 @@ db_object_location :: proc(w: ^Object_World, oid: values.Objid) -> values.Objid 
 db_change_location :: proc(w: ^Object_World, what, location: values.Objid) {
 	old_location := w.db.objects[what].location
 	if valid(w.db, old_location) {
-		dest_obj := w.db.objects[old_location]
-		what_obj := w.db.objects[what]
-		if dest_obj.contents == what {
-			dest_obj.contents = what_obj.next
-		} else {
-			lid := dest_obj.contents
-			for lid != values.NOTHING {
-				lo := w.db.objects[lid]
-				if lo.next == what {
-					lo.next = what_obj.next
-					break
-				}
-				lid = lo.next
-			}
-		}
-		what_obj.next = values.NOTHING
+		chain_unlink(w.db, .Contents, old_location, what)
 	}
 	if valid(w.db, location) {
-		dest_obj := w.db.objects[location]
-		what_obj := w.db.objects[what]
-		if dest_obj.contents == values.NOTHING {
-			dest_obj.contents = what
-		} else {
-			lid := dest_obj.contents
-			for w.db.objects[lid].next != values.NOTHING {
-				lid = w.db.objects[lid].next
-			}
-			w.db.objects[lid].next = what
-		}
-		what_obj.next = values.NOTHING
+		chain_append(w.db, .Contents, location, what)
 	}
 	w.db.objects[what].location = location
 }

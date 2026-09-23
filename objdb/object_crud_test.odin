@@ -69,6 +69,9 @@ crud_world_destroy :: proc(db: ^dbfile.Database) {
 		free(o)
 	}
 	delete(db.objects)
+	verb_cache_clear(db)
+	delete(db.verb_cache)
+	values.free_var(db.players_cache)
 	dbfile.name_intern_destroy(&db.name_intern)
 }
 

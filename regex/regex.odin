@@ -25,7 +25,14 @@ package regex
 
 import "core:strings"
 
-Op :: enum {
+// Op is a u8 and Instr is packed to 16 bytes because a pattern is an ordinary MOO string of up
+// to values.MAX_STR_LEN, compiled on every match() call: at the old 56-byte Instr, plus a
+// separately heap-allocated 256-byte table per `[...]`/`%w`/`%W`, plus two per-instruction
+// int arrays in the Runner, compiling cost about 170x the pattern's size -- one match() with an
+// 8MB pattern of "%w" allocated 1.35GB. Character classes now live once each in
+// Program.classes (32-byte bit sets, identical ones shared), and the loop guard is sized by the
+// number of loops rather than the number of instructions.
+Op :: enum u8 {
 	Char,
 	Any,
 	Class,
@@ -39,12 +46,23 @@ Op :: enum {
 	Match,
 }
 
+// Char_Set is a 256-bit membership set, one bit per byte value (Odin's bit_set stops at 128).
+Char_Set :: [4]u64
+
+@(private = "file")
+set_add :: proc(s: ^Char_Set, b: int) {
+	s[b >> 6] |= 1 << uint(b & 63)
+}
+
+@(private = "file")
+set_has :: proc(s: Char_Set, b: byte) -> bool {
+	return s[b >> 6] & (1 << uint(b & 63)) != 0
+}
+
 Instr :: struct {
 	op:      Op,
 	c:       byte, // Char
-	set:     ^[256]bool, // Class; owned
 	negate:  bool, // Class
-	x, y:    int, // Jmp target (x); Split targets (x, y); Save slot (x)
 	is_loop: bool, // Split only: true for */+'s loop-back split (wrap_star/wrap_plus) --
 	// tells run() to guard against infinite recursion when the loop body matches zero
 	// width (e.g. `%(a*%)*`): without this, a body that matches empty re-enters the same
@@ -52,19 +70,19 @@ Instr :: struct {
 	// unbounded work) and crashes the process with a stack overflow before MAX_STEPS is
 	// ever reached. Not set for compile_alt's alternation split or wrap_opt's `?` split,
 	// neither of which loop back to themselves.
+	x, y:    i32, // Jmp target (x); Split targets (x, y); Save slot (x); Class: index into Program.classes (x)
+	loop:    i32, // loop-Split only: its slot in the Runner's loop guard, 0..<Program.n_loops
 }
 
 Program :: struct {
-	instrs: []Instr,
+	instrs:  []Instr,
+	classes: []Char_Set,
+	n_loops: int,
 }
 
 program_destroy :: proc(p: ^Program) {
-	for instr in p.instrs {
-		if instr.set != nil {
-			free(instr.set)
-		}
-	}
 	delete(p.instrs)
+	delete(p.classes)
 }
 
 @(private = "file")
@@ -72,6 +90,9 @@ Parser :: struct {
 	pat:   string,
 	pos:   int,
 	instrs: [dynamic]Instr,
+	classes: [dynamic]Char_Set,
+	class_index: map[Char_Set]i32, // dedup: one table entry per distinct set
+	n_loops: int,
 	ngroup: int,
 	depth:  int, // compile_alt recursion depth -- see MAX_ALT_DEPTH
 	ok:     bool,
@@ -107,6 +128,38 @@ emit :: proc(p: ^Parser, instr: Instr) -> int {
 	return len(p.instrs) - 1
 }
 
+// emit_class emits a Class instruction for `set`, sharing its table entry with any identical
+// set already in the pattern.
+@(private = "file")
+emit_class :: proc(p: ^Parser, set: Char_Set, negate: bool) {
+	idx, seen := p.class_index[set]
+	if !seen {
+		idx = i32(len(p.classes))
+		append(&p.classes, set)
+		p.class_index[set] = idx
+	}
+	emit(p, Instr{op = .Class, x = idx, negate = negate})
+}
+
+// emit_loop_split emits a */+ loop-back Split and gives it the next loop-guard slot.
+@(private = "file")
+emit_loop_split :: proc(p: ^Parser) -> int {
+	i := emit(p, Instr{op = .Split, is_loop = true, loop = i32(p.n_loops)})
+	p.n_loops += 1
+	return i
+}
+
+@(private = "file")
+word_set :: proc() -> Char_Set {
+	set: Char_Set
+	for b in 0 ..< 256 {
+		if is_word_byte(byte(b)) {
+			set_add(&set, b)
+		}
+	}
+	return set
+}
+
 // escape_needs_backslash mirrors pattern.c's translate_pattern() strchr set: these are the
 // characters that become "special" (in our engine: their own opcode) when %-escaped.
 // Everything else %-escaped just becomes that literal character (translate_pattern's
@@ -139,7 +192,7 @@ compile_alt :: proc(p: ^Parser) {
 	resize(&p.instrs, branch_start)
 	split_idx := emit(p, Instr{op = .Split})
 	l1 := len(p.instrs)
-	shift_body_targets(saved, l1 - branch_start)
+	shift_body_targets(saved, i32(l1 - branch_start))
 	append(&p.instrs, ..saved[:])
 	delete(saved)
 	jmp_idx := emit(p, Instr{op = .Jmp})
@@ -147,9 +200,9 @@ compile_alt :: proc(p: ^Parser) {
 	p.pos += 2 // consume '%|'
 	compile_alt(p)
 	end := len(p.instrs)
-	p.instrs[split_idx].x = l1
-	p.instrs[split_idx].y = l2
-	p.instrs[jmp_idx].x = end
+	p.instrs[split_idx].x = i32(l1)
+	p.instrs[split_idx].y = i32(l2)
+	p.instrs[jmp_idx].x = i32(end)
 }
 
 @(private = "file")
@@ -201,7 +254,7 @@ compile_quant :: proc(p: ^Parser) {
 // unguarded recursion). `.Save`'s `x` is a capture-group SLOT number, not a PC, and must
 // never be shifted; `.Char`/`.Class`/anchors don't have PC-valued fields at all.
 @(private = "file")
-shift_body_targets :: proc(body: []Instr, delta: int) {
+shift_body_targets :: proc(body: []Instr, delta: i32) {
 	for i in 0 ..< len(body) {
 		#partial switch body[i].op {
 		case .Jmp:
@@ -220,25 +273,25 @@ wrap_star :: proc(p: ^Parser, start: int) {
 	body := make([]Instr, len(p.instrs) - start)
 	copy(body, p.instrs[start:])
 	resize(&p.instrs, start)
-	split_idx := emit(p, Instr{op = .Split, is_loop = true})
+	split_idx := emit_loop_split(p)
 	body_start := len(p.instrs)
-	shift_body_targets(body, body_start - start)
+	shift_body_targets(body, i32(body_start - start))
 	append(&p.instrs, ..body)
 	delete(body)
-	jmp_idx := emit(p, Instr{op = .Jmp, x = split_idx})
+	jmp_idx := emit(p, Instr{op = .Jmp, x = i32(split_idx)})
 	after := len(p.instrs)
-	p.instrs[split_idx].x = body_start
-	p.instrs[split_idx].y = after
+	p.instrs[split_idx].x = i32(body_start)
+	p.instrs[split_idx].y = i32(after)
 	_ = jmp_idx
 }
 
 @(private = "file")
 wrap_plus :: proc(p: ^Parser, start: int) {
 	// body; split body_start, after
-	split_idx := emit(p, Instr{op = .Split, is_loop = true})
+	split_idx := emit_loop_split(p)
 	after := len(p.instrs)
-	p.instrs[split_idx].x = start
-	p.instrs[split_idx].y = after
+	p.instrs[split_idx].x = i32(start)
+	p.instrs[split_idx].y = i32(after)
 }
 
 @(private = "file")
@@ -248,17 +301,17 @@ wrap_opt :: proc(p: ^Parser, start: int) {
 	resize(&p.instrs, start)
 	split_idx := emit(p, Instr{op = .Split})
 	body_start := len(p.instrs)
-	shift_body_targets(body, body_start - start)
+	shift_body_targets(body, i32(body_start - start))
 	append(&p.instrs, ..body)
 	delete(body)
 	after := len(p.instrs)
-	p.instrs[split_idx].x = body_start
-	p.instrs[split_idx].y = after
+	p.instrs[split_idx].x = i32(body_start)
+	p.instrs[split_idx].y = i32(after)
 }
 
 @(private = "file")
 compile_class :: proc(p: ^Parser) {
-	set := new([256]bool)
+	set: Char_Set
 	negate := false
 	p.pos += 1 // consume '['
 	if p.pos < len(p.pat) && p.pat[p.pos] == '^' {
@@ -272,21 +325,20 @@ compile_class :: proc(p: ^Parser) {
 		if p.pos + 2 < len(p.pat) && p.pat[p.pos + 1] == '-' && p.pat[p.pos + 2] != ']' {
 			lo, hi := c, p.pat[p.pos + 2]
 			for b := int(lo); b <= int(hi); b += 1 {
-				set[b] = true
+				set_add(&set, b)
 			}
 			p.pos += 3
 		} else {
-			set[c] = true
+			set_add(&set, int(c))
 			p.pos += 1
 		}
 	}
 	if p.pos >= len(p.pat) {
 		p.ok = false
-		free(set)
 		return
 	}
 	p.pos += 1 // consume ']'
-	emit(p, Instr{op = .Class, set = set, negate = negate})
+	emit_class(p, set, negate)
 }
 
 @(private = "file")
@@ -322,30 +374,22 @@ compile_atom :: proc(p: ^Parser) {
 				return
 			}
 			slot := p.ngroup
-			emit(p, Instr{op = .Save, x = 2 * slot})
+			emit(p, Instr{op = .Save, x = i32(2 * slot)})
 			compile_alt(p)
 			if !p.ok || p.pos + 1 >= len(p.pat) || p.pat[p.pos] != '%' || p.pat[p.pos + 1] != ')' {
 				p.ok = false
 				return
 			}
 			p.pos += 2
-			emit(p, Instr{op = .Save, x = 2 * slot + 1})
+			emit(p, Instr{op = .Save, x = i32(2 * slot + 1)})
 		case 'b':
 			emit(p, Instr{op = .Wordb})
 		case 'B':
 			emit(p, Instr{op = .NWordb})
 		case 'w':
-			set := new([256]bool)
-			for b in 0 ..< 256 {
-				set[b] = is_word_byte(byte(b))
-			}
-			emit(p, Instr{op = .Class, set = set})
+			emit_class(p, word_set(), false)
 		case 'W':
-			set := new([256]bool)
-			for b in 0 ..< 256 {
-				set[b] = is_word_byte(byte(b))
-			}
-			emit(p, Instr{op = .Class, set = set, negate = true})
+			emit_class(p, word_set(), true) // shares %w's table entry
 		case:
 			// Falls back to a literal (covers %.%*%+%?%[%^%$%)  and any unsupported escape
 			// like in-pattern backreferences %1-%9, %<, %>, matching translate_pattern's own
@@ -362,23 +406,23 @@ compile_atom :: proc(p: ^Parser) {
 // group/class, more than 9 groups, trailing '%').
 compile :: proc(pattern: string) -> (prog: Program, ok: bool) {
 	p := Parser{pat = pattern, ok = true}
+	defer delete(p.class_index)
 	emit(&p, Instr{op = .Save, x = 0})
 	compile_alt(&p)
 	if p.ok && p.pos != len(pattern) {
 		p.ok = false // e.g. a stray unmatched '%)' left unconsumed
 	}
 	if !p.ok {
-		for instr in p.instrs {
-			if instr.set != nil {
-				free(instr.set)
-			}
-		}
 		delete(p.instrs)
+		delete(p.classes)
 		return Program{}, false
 	}
 	emit(&p, Instr{op = .Save, x = 1})
 	emit(&p, Instr{op = .Match})
-	return Program{instrs = p.instrs[:]}, true
+	// Exact-length slices: shrink() drops the growth slack, which at these sizes is real memory.
+	shrink(&p.instrs)
+	shrink(&p.classes)
+	return Program{instrs = p.instrs[:], classes = p.classes[:], n_loops = p.n_loops}, true
 }
 
 Match_Result :: struct {
@@ -397,7 +441,8 @@ Runner :: struct {
 	subject:    string,
 	case_fold:  bool,
 	steps:      int,
-	loop_entry: []int, // per-pc "pos we last entered this loop-Split at" (see Instr.is_loop)
+	max_steps:  int, // this call's step budget -- see match_pattern
+	loop_entry: []int, // per loop-Split (Instr.loop): "pos we last entered it at" (see Instr.is_loop)
 	// loop_stamp[pc] records WHICH attempt loop_entry[pc] was written during, so a new attempt
 	// invalidates every entry by bumping one counter instead of rewriting the whole array.
 	// That is not a micro-optimisation: runner_reset runs once per start position, so an O(len
@@ -420,8 +465,9 @@ runner_make :: proc(prog: ^Program, subject: string, case_fold: bool) -> Runner 
 		prog       = prog,
 		subject    = subject,
 		case_fold  = case_fold,
-		loop_entry = make([]int, len(prog.instrs)),
-		loop_stamp = make([]int, len(prog.instrs)), // zeroed: no attempt has stamped anything yet
+		max_steps  = MAX_STEPS,
+		loop_entry = make([]int, prog.n_loops),
+		loop_stamp = make([]int, prog.n_loops), // zeroed: no attempt has stamped anything yet
 		choices    = make([dynamic]Choice, 0, 32),
 		undos      = make([dynamic]Undo, 0, 16),
 	}
@@ -521,7 +567,7 @@ run :: proc(r: ^Runner, start_pc: int, start_pos: int) -> (end: int, ok: bool) {
 	pc, pos := start_pc, start_pos
 	for {
 		r.steps += 1
-		if r.steps > MAX_STEPS {
+		if r.steps > r.max_steps {
 			return 0, false
 		}
 		instr := r.prog.instrs[pc]
@@ -544,7 +590,8 @@ run :: proc(r: ^Runner, start_pc: int, start_pos: int) -> (end: int, ok: bool) {
 		case .Class:
 			if pos < len(r.subject) {
 				c := r.subject[pos]
-				member := instr.set[c]
+				set := r.prog.classes[instr.x]
+				member := set_has(set, c)
 				if !member && r.case_fold {
 					alt := c
 					if alt >= 'a' && alt <= 'z' {
@@ -552,7 +599,7 @@ run :: proc(r: ^Runner, start_pc: int, start_pos: int) -> (end: int, ok: bool) {
 					} else if alt >= 'A' && alt <= 'Z' {
 						alt += 32
 					}
-					member = instr.set[alt]
+					member = set_has(set, alt)
 				}
 				if member != instr.negate {
 					pc += 1
@@ -579,28 +626,28 @@ run :: proc(r: ^Runner, start_pc: int, start_pos: int) -> (end: int, ok: bool) {
 				continue
 			}
 		case .Jmp:
-			pc = instr.x
+			pc = int(instr.x)
 			continue
 		case .Split:
 			if instr.is_loop {
 				// Refuse to re-enter this loop's body at the exact position we last entered it
 				// at -- a body that matches zero-width would otherwise spin here forever (see
 				// Instr.is_loop). Entering at a NEW position is genuine progress, always allowed.
-				if r.loop_stamp[pc] == r.attempt && r.loop_entry[pc] == pos {
-					pc = instr.y
+				if r.loop_stamp[instr.loop] == r.attempt && r.loop_entry[instr.loop] == pos {
+					pc = int(instr.y)
 					continue
 				}
-				r.loop_stamp[pc] = r.attempt
-				r.loop_entry[pc] = pos
+				r.loop_stamp[instr.loop] = r.attempt
+				r.loop_entry[instr.loop] = pos
 			}
 			if len(r.choices) >= MAX_BACKTRACK {
 				return 0, false
 			}
-			append(&r.choices, Choice{pc = instr.y, pos = pos, undo_top = len(r.undos)})
-			pc = instr.x
+			append(&r.choices, Choice{pc = int(instr.y), pos = pos, undo_top = len(r.undos)})
+			pc = int(instr.x)
 			continue
 		case .Save:
-			append(&r.undos, Undo{slot = instr.x, old = r.saves[instr.x]})
+			append(&r.undos, Undo{slot = int(instr.x), old = r.saves[instr.x]})
 			r.saves[instr.x] = pos
 			pc += 1
 			continue
@@ -638,6 +685,36 @@ match_attempt :: proc(r: ^Runner, start: int) -> (Match_Result, bool) {
 	return res, true
 }
 
+// ATTEMPT_STEPS is how many steps each start position adds to a call's budget.
+//
+// MAX_STEPS alone bounds a call's total work, which is right for backtracking but wrong for
+// scanning: every start position costs at least a step or two even when it fails at once, so a
+// long enough subject used up the whole budget just LOOKING, and a match far enough in was
+// reported as no match -- `match("a" * 1100000 + "b", "b")` found nothing, where 900000 worked.
+// Adding a few steps per position makes the scan itself free while keeping the total bounded
+// by the input -- MAX_STEPS + ATTEMPT_STEPS x len(subject), linear, which is the requirement a
+// built-in has to meet. Patterns that begin with a literal skip non-starting positions outright
+// (first_byte), so they don't spend even that.
+@(private = "file")
+ATTEMPT_STEPS :: 8
+
+// first_byte reports the byte every match must start with, when the pattern begins with a
+// literal (after its leading group Saves) -- the common case, and one that lets the scan skip
+// positions without running the program at all.
+@(private = "file")
+first_byte :: proc(prog: ^Program) -> (c: byte, ok: bool) {
+	for instr in prog.instrs {
+		#partial switch instr.op {
+		case .Save:
+			continue
+		case .Char:
+			return instr.c, true
+		}
+		return 0, false
+	}
+	return 0, false
+}
+
 // match_pattern searches for the first (reverse=false) or last (reverse=true) match
 // anywhere in `subject`, ported from pattern.c's match_pattern()/re_search() driving loop
 // (which tries every start position since this VM, like the original, isn't anchored by
@@ -645,16 +722,27 @@ match_attempt :: proc(r: ^Runner, start: int) -> (Match_Result, bool) {
 match_pattern :: proc(prog: ^Program, subject: string, reverse: bool, case_fold: bool) -> Match_Result {
 	r := runner_make(prog, subject, case_fold)
 	defer runner_destroy(&r)
+	r.max_steps = MAX_STEPS + ATTEMPT_STEPS * (len(subject) + 1)
+	lead, has_lead := first_byte(prog)
+	can_start :: proc(r: ^Runner, start: int, lead: byte) -> bool {
+		return start < len(r.subject) && byte_eq(r, r.subject[start], lead)
+	}
 	// Once the step budget is gone every remaining attempt can only report "no match", so stop
 	// scanning rather than paying for len(subject) more of them.
 	if !reverse {
-		for start := 0; start <= len(subject) && r.steps <= MAX_STEPS; start += 1 {
+		for start := 0; start <= len(subject) && r.steps <= r.max_steps; start += 1 {
+			if has_lead && !can_start(&r, start, lead) {
+				continue
+			}
 			if res, ok := match_attempt(&r, start); ok {
 				return res
 			}
 		}
 	} else {
-		for start := len(subject); start >= 0 && r.steps <= MAX_STEPS; start -= 1 {
+		for start := len(subject); start >= 0 && r.steps <= r.max_steps; start -= 1 {
+			if has_lead && !can_start(&r, start, lead) {
+				continue
+			}
 			if res, ok := match_attempt(&r, start); ok {
 				return res
 			}

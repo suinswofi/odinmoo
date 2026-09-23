@@ -99,6 +99,17 @@ Object :: struct {
 	verbdefs: [dynamic]Verbdef,
 	propdefs: [dynamic]Propdef,
 	propvals: [dynamic]Propval,
+
+	// In-memory HINTS for objdb's list splices (objdb/link_lists.odin), never written to disk:
+	// the last object in this one's child/contents list, and the object before this one in its
+	// own sibling/contents list. They make appending to and removing from those singly-linked
+	// lists O(1) instead of a walk. Being hints, they are allowed to be wrong -- including the
+	// zero value, and anything a test or the loader never set -- because every use checks one
+	// against the links themselves first and falls back to the walk when it doesn't hold.
+	last_child:   values.Objid,
+	prev_sibling: values.Objid,
+	last_content: values.Objid,
+	prev_content: values.Objid,
 }
 
 // Forked_Task_Record is a queued (not-yet-run) `fork` task pulled from a checkpoint,
@@ -135,9 +146,28 @@ Database :: struct {
 	connections:        [dynamic]Connection_Record,
 	str_intern:         values.Intern_Table, // genuine STR Var payloads
 	name_intern:        Name_Intern,          // structural names (objects/verbs/props)
+	// objdb's callable-verb lookup cache (objdb/verb.odin), keyed by start object + folded
+	// verb name, keys owned. In-memory only; lives here because every lookup takes the
+	// Database, and it must die with it.
+	verb_cache:         map[string]Verb_Cache_Entry,
+	// objdb's players() result, shared by reference until player status can have changed
+	// (objdb/player_security.odin); a .None Var when it has to be recomputed.
+	players_cache:      values.Var,
+}
+
+// Verb_Cache_Entry is one cached find_callable_verb result, negative results included.
+Verb_Cache_Entry :: struct {
+	definer: values.Objid,
+	index:   int,
+	found:   bool,
 }
 
 database_destroy :: proc(db: ^Database) {
+	for k in db.verb_cache {
+		delete(k)
+	}
+	delete(db.verb_cache)
+	values.free_var(db.players_cache)
 	values.intern_table_destroy(&db.str_intern)
 	name_intern_destroy(&db.name_intern)
 	for _, obj in db.objects {
