@@ -38,8 +38,29 @@ raised_from_expr :: proc(r: Expr_Result) -> Stmt_Result {
 // directly would hand delete() a pointer into static data -- an invalid free that only shows up
 // when the error is actually caught, i.e. in exactly the try/except code written to handle it.
 @(private = "file")
-raised_stmt :: proc(code: values.Error, msg: string) -> Stmt_Result {
-	return Stmt_Result{signal = .Raised, err = Error_Info{code = code, msg = strings.clone(msg), value = values.int_val(0)}}
+raised_stmt :: proc(ctx: ^Eval_Context, code: values.Error, msg: string) -> Stmt_Result {
+	r := Stmt_Result{signal = .Raised, err = Error_Info{code = code, msg = strings.clone(msg), value = values.int_val(0)}}
+	record_error(ctx, &r.err)
+	return r
+}
+
+// stmt_error ports RAISE_ERROR (execute.c): the error is raised only when the verb has its
+// `d` flag set. In a !d verb the statement simply doesn't happen -- a `for` over a non-list
+// skips its body, a `fork` with a bad delay doesn't fork -- which is how JHCore's
+// $code_utils:help_db_list survives an object whose .help is neither a list nor an object.
+@(private = "file")
+stmt_error :: proc(ctx: ^Eval_Context, code: values.Error) -> Stmt_Result {
+	if !ctx.activation.debug {
+		return normal_result()
+	}
+	return raised_stmt(ctx, code, error_message(code))
+}
+
+@(private = "file")
+budget_abort :: proc(ctx: ^Eval_Context) -> Stmt_Result {
+	r := Stmt_Result{signal = .Raised, err = budget_abort_error(ctx.activation.budget)}
+	record_error(ctx, &r.err)
+	return r
 }
 
 // charge_iteration bills one tick for going round a loop, and is the reason the budget
@@ -56,7 +77,7 @@ charge_iteration :: proc(ctx: ^Eval_Context) -> (r: Stmt_Result, exhausted: bool
 	if budget_charge(ctx.activation.budget) {
 		return {}, false
 	}
-	return Stmt_Result{signal = .Raised, err = budget_abort_error(ctx.activation.budget)}, true
+	return budget_abort(ctx), true
 }
 
 exec_stmts :: proc(ctx: ^Eval_Context, stmts: []compiler.Stmt) -> Stmt_Result {
@@ -76,11 +97,15 @@ exec_stmt :: proc(ctx: ^Eval_Context, s: compiler.Stmt) -> Stmt_Result {
 	// with an empty body executes no statements at all, which is what charge_iteration above
 	// is for. Both are needed.
 	if !budget_charge(ctx.activation.budget) {
-		return Stmt_Result{signal = .Raised, err = budget_abort_error(ctx.activation.budget)}
+		return budget_abort(ctx)
+	}
+	if values.stack_exhausted() { // nested blocks recurse too -- see values/stack_guard.odin
+		return raised_stmt(ctx, .E_MAXREC, error_message(.E_MAXREC))
 	}
 	switch v in s {
 	case ^compiler.Stmt_Cond:
 		for arm in v.arms {
+			ctx.activation.line = arm.line // an error in an `elseif` test is blamed on its line
 			cond_r := eval_expr(ctx, arm.condition)
 			if cond_r.raised {
 				return raised_from_expr(cond_r)
@@ -94,9 +119,11 @@ exec_stmt :: proc(ctx: ^Eval_Context, s: compiler.Stmt) -> Stmt_Result {
 		return exec_stmts(ctx, v.otherwise)
 
 	case ^compiler.Stmt_List_Loop:
+		ctx.activation.line = v.line
 		return exec_list_loop(ctx, v)
 
 	case ^compiler.Stmt_Range_Loop:
+		ctx.activation.line = v.line
 		return exec_range_loop(ctx, v)
 
 	case ^compiler.Stmt_While:
@@ -108,25 +135,32 @@ exec_stmt :: proc(ctx: ^Eval_Context, s: compiler.Stmt) -> Stmt_Result {
 		// optional `fork ident (...)` variable is bound -- in both the parent and the forked
 		// task's snapshot -- by do_fork itself (tasks.c's enqueue_forked_task2 assigns the new
 		// task id into the shared rt_env before copying it).
+		ctx.activation.line = v.line
 		delay_r := eval_expr(ctx, v.time)
 		if delay_r.raised {
 			return raised_from_expr(delay_r)
 		}
 		if delay_r.value.type != .Int {
 			values.free_var(delay_r.value)
-			return raised_stmt(.E_TYPE, "Type mismatch")
+			return stmt_error(ctx, .E_TYPE)
 		}
 		if delay_r.value.data.num < 0 {
 			values.free_var(delay_r.value)
-			return raised_stmt(.E_INVARG, "Invalid argument")
+			return stmt_error(ctx, .E_INVARG)
 		}
 		if ctx.world.do_fork != nil {
-			ctx.world.do_fork(ctx.world, delay_r.value, v.body, ctx.names, v.var_id, ctx)
+			// E_QUOTA when the forking verb's owner is at $server_options.queued_task_limit
+			// (tasks.c's check_user_task_limit) -- also a RAISE_ERROR, so also d-flag gated.
+			if e := ctx.world.do_fork(ctx.world, delay_r.value, v.body, ctx.names, v.var_id, ctx); e != .E_NONE {
+				values.free_var(delay_r.value)
+				return stmt_error(ctx, e)
+			}
 		}
 		values.free_var(delay_r.value)
 		return normal_result()
 
 	case ^compiler.Stmt_Expr:
+		ctx.activation.line = v.line
 		r := eval_expr(ctx, v.expr)
 		if r.raised {
 			return raised_from_expr(r)
@@ -135,6 +169,7 @@ exec_stmt :: proc(ctx: ^Eval_Context, s: compiler.Stmt) -> Stmt_Result {
 		return normal_result()
 
 	case ^compiler.Stmt_Return:
+		ctx.activation.line = v.line
 		if v.expr == nil {
 			return Stmt_Result{signal = .Return, value = values.int_val(0)}
 		}
@@ -145,15 +180,19 @@ exec_stmt :: proc(ctx: ^Eval_Context, s: compiler.Stmt) -> Stmt_Result {
 		return Stmt_Result{signal = .Return, value = r.value}
 
 	case ^compiler.Stmt_Try_Except:
+		ctx.activation.line = v.line
 		return exec_try_except(ctx, v)
 
 	case ^compiler.Stmt_Try_Finally:
+		ctx.activation.line = v.line
 		return exec_try_finally(ctx, v)
 
 	case ^compiler.Stmt_Break:
+		ctx.activation.line = v.line
 		return Stmt_Result{signal = .Break, loop_name = loop_name_of(ctx, v.var_id)}
 
 	case ^compiler.Stmt_Continue:
+		ctx.activation.line = v.line
 		return Stmt_Result{signal = .Continue, loop_name = loop_name_of(ctx, v.var_id)}
 	}
 	return normal_result()
@@ -183,7 +222,7 @@ exec_list_loop :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_List_Loop) -> Stmt_
 	defer values.free_var(list_r.value)
 
 	if list_r.value.type != .List {
-		return raised_stmt(.E_TYPE, "List required")
+		return stmt_error(ctx, .E_TYPE) // OP_FOR_LIST: RAISE_ERROR(E_TYPE), so `d`-gated
 	}
 	n := values.list_len(list_r.value)
 
@@ -208,6 +247,8 @@ exec_list_loop :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_List_Loop) -> Stmt_
 	return normal_result()
 }
 
+// exec_range_loop ports OP_FOR_RANGE: both bounds INT, or both OBJ (`for o in [#1..#10]`),
+// anything else E_TYPE (d-flag gated, like OP_FOR_LIST). The bounds are evaluated once.
 @(private = "file")
 exec_range_loop :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_Range_Loop) -> Stmt_Result {
 	from_r := eval_expr(ctx, v.from)
@@ -221,18 +262,23 @@ exec_range_loop :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_Range_Loop) -> Stm
 	}
 	defer values.free_var(from_r.value)
 	defer values.free_var(to_r.value)
-	if from_r.value.type != .Int || to_r.value.type != .Int {
-		return raised_stmt(.E_TYPE, "Integer required")
+	kind := to_r.value.type
+	if (kind != .Int && kind != .Obj) || from_r.value.type != kind {
+		return stmt_error(ctx, .E_TYPE)
 	}
 
-	i := from_r.value.data.num
-	to := to_r.value.data.num
+	i, to: i32
+	if kind == .Int {
+		i, to = from_r.value.data.num, to_r.value.data.num
+	} else {
+		i, to = i32(from_r.value.data.obj), i32(to_r.value.data.obj)
+	}
 	for i <= to {
 		if r, exhausted := charge_iteration(ctx); exhausted {
 			return r
 		}
 		values.free_var(ctx.activation.locals[v.var_id])
-		ctx.activation.locals[v.var_id] = values.int_val(i)
+		ctx.activation.locals[v.var_id] = kind == .Int ? values.int_val(i) : values.obj_val(values.Objid(i))
 
 		r := exec_stmts(ctx, v.body)
 		mine := r.loop_name == "" || r.loop_name == loop_name_of(ctx, v.var_id)
@@ -246,10 +292,8 @@ exec_range_loop :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_Range_Loop) -> Stm
 		// and i32 addition wraps, so the increment after the last iteration used to produce
 		// min(i32) -- still <= to -- and the loop restarted from the bottom of the range and
 		// never finished. `for i in [2147483645..2147483647]`, which the language says runs
-		// exactly three times, ran forever. A different bug from an unbounded loop, and not
-		// one the tick budget above would excuse: this made a loop the language says is
-		// BOUNDED fail to terminate, i.e. gave a wrong answer, rather than letting an
-		// intentionally-unbounded one run.
+		// exactly three times, ran forever. (The original avoids the same wrap by decrementing
+		// `to` instead once `from` reaches MAXINT.)
 		if i == to {
 			break
 		}
@@ -265,6 +309,7 @@ exec_while :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_While) -> Stmt_Result {
 		if r, exhausted := charge_iteration(ctx); exhausted {
 			return r
 		}
+		ctx.activation.line = v.line // the test is blamed on the `while` line, every time round
 		cond_r := eval_expr(ctx, v.condition)
 		if cond_r.raised {
 			return raised_from_expr(cond_r)
@@ -311,7 +356,7 @@ exec_try_except :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_Try_Except) -> Stm
 			continue
 		}
 		if arm.var_id >= 0 {
-			tuple := raised_tuple(r.err)
+			tuple := raised_tuple(ctx, r.err)
 			values.free_var(ctx.activation.locals[arm.var_id])
 			ctx.activation.locals[arm.var_id] = tuple
 		}
@@ -321,16 +366,18 @@ exec_try_except :: proc(ctx: ^Eval_Context, v: ^compiler.Stmt_Try_Except) -> Stm
 	return r
 }
 
-// raised_tuple builds the {code, message, value, backtrace} tuple bound to a try/except
-// arm's variable (ports code_gen.c's STMT_TRY_EXCEPT: `emit_var_op(OP_PUT, ex->id, ...)`
-// storing the whole exception tuple, not just the code). The backtrace slot is an empty
-// list for now -- building a real one needs Phase 4's object DB to describe stack frames.
-raised_tuple :: proc(e: Error_Info) -> values.Var {
+// raised_tuple builds the {code, message, value, stack} tuple bound to a try/except arm's
+// variable (raise_error's 4-element value). `stack` is make_stack_list from the handling
+// activation up to the one that raised, each frame {this, verb, programmer, verb-loc, player,
+// line} -- what LambdaCore's #0:user_connected prints when a confunc fails.
+raised_tuple :: proc(ctx: ^Eval_Context, e: Error_Info) -> values.Var {
 	items := make([]values.Var, 4)
 	items[0] = values.err_val(e.code)
 	items[1] = values.str_val(strings.clone(e.msg))
 	items[2] = values.var_ref(e.value)
-	items[3] = values.empty_list()
+	frames, owned := error_frames(ctx.activation, e.serial)
+	items[3] = stack_list(frames, ctx.activation.depth)
+	release_frames(&frames, owned)
 	return values.list_val(items)
 }
 

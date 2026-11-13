@@ -30,12 +30,15 @@ package netio
 // server_stop() returns; a connection thread still touching either at that point would be a
 // real use-after-free, not just an academic concern.
 
+import "../dbfile"
+import "../objdb"
 import "../tasks"
 import "../values"
 import "../vm"
 import "core:net"
 import "core:strings"
 import "core:sync"
+import "core:time"
 
 Server :: struct {
 	listener:      net.TCP_Socket,
@@ -53,6 +56,7 @@ Server :: struct {
 	// thread happens to be executing MOO code (notify() can be called from any task) or
 	// accepting/closing a connection (which isn't task execution at all).
 	players:       map[values.Objid]^Connection, // player-or-placeholder -> its connection
+	next_seq:      u64, // accept order, see Connection.seq; only touched by the accept loop
 	next_unconnected: values.Objid, // ports server.c's next_unconnected_player counter (starts
 	// at NOTHING-1, decrements): every fresh connection gets one of these negative IDs
 	// before login so notify()/do_login_command have someone to address, exactly like the
@@ -144,7 +148,7 @@ server_stop :: proc(s: ^Server) {
 		conn.reader_task_id = 0
 		sync.mutex_unlock(&conn.io_lock)
 		if tid != 0 {
-			wake_reader(s.scheduler, tid, strings.clone(""))
+			wake_reader_closed(s.scheduler, tid)
 		}
 		// shutdown(), and deliberately NOT close(): a thread blocked in recv_tcp() on this
 		// socket is not reliably woken by another thread merely close()ing the fd on Linux
@@ -160,6 +164,11 @@ server_stop :: proc(s: ^Server) {
 		// and the owner's close then tears down that unrelated connection instead. Rare, but
 		// silent and unbounded in consequence when it does happen, so the rule is one closer
 		// per socket -- everyone else only ever shuts down.
+		// The server is going down: no #0:user_*disconnected for this one (the original runs
+		// no notifier at shutdown; the next startup reports the connections recorded in the
+		// final dump instead). Running one here would also let any player's :disfunc that calls
+		// suspend() park this connection's teardown -- and server_stop waits on it below.
+		conn.close_reason = .Shutdown
 		net.shutdown(conn.socket, .Both)
 	}
 	sync.mutex_unlock(&s.players_lock)
@@ -189,7 +198,13 @@ accept_loop :: proc(data: rawptr) {
 		conn.socket = client
 		conn.server = s
 		conn.ansi_enabled = true
-		conn.options = init_option_defaults()
+		flush_cmd := default_flush_command(s)
+		conn.options = init_option_defaults(flush_cmd)
+		delete(flush_cmd)
+		conn.last_activity = time.now()
+		conn.name = connection_name_for(client, s.listener)
+		s.next_seq += 1
+		conn.seq = s.next_seq
 		// Registered here, on the accept thread, rather than as the first thing the
 		// connection thread does: server_stop's sweep can only shut down connections it can
 		// see in `players`, and it runs as soon as this loop exits. A connection registered
@@ -205,12 +220,50 @@ accept_loop :: proc(data: rawptr) {
 			// would hang server_stop on a connection that never existed.
 			unregister_conn(s, conn)
 			net.close(conn.socket)
-			for _, v in conn.options {
-				values.free_var(v)
-			}
-			delete(conn.options)
+			delete(conn.options.flush_cmd)
+			delete(conn.name)
 			free(conn)
 			sync.wait_group_done(&s.conns_done)
 		}
+	}
+}
+
+// default_flush_command ports tasks.c's default_flush_command(): $server_options'
+// default_flush_command if it exists (a non-string or empty one meaning "none"), else
+// ".flush". Owned result.
+@(private = "file")
+default_flush_command :: proc(s: ^Server) -> string {
+	sync.mutex_lock(&s.scheduler.big_lock)
+	defer sync.mutex_unlock(&s.scheduler.big_lock)
+	cmd, present := objdb.server_string_option(world_of(s), "default_flush_command", ".flush")
+	if !present {
+		return ""
+	}
+	return cmd
+}
+
+// live_connections lists every open connection as {player, listener} -- what
+// write_active_connections() records in each dump, so that the next startup can tell the
+// database that all of them were dropped (#0:user_disconnected, run before
+// #0:server_started). Includes connections still logging in, with their negative ids, as the
+// original does. Owned slice.
+live_connections :: proc(s: ^Server) -> []dbfile.Connection_Record {
+	sync.mutex_lock(&s.players_lock)
+	defer sync.mutex_unlock(&s.players_lock)
+	out := make([]dbfile.Connection_Record, len(s.players))
+	i := 0
+	for player in s.players {
+		out[i] = dbfile.Connection_Record{who = player, listener = values.SYSTEM_OBJECT}
+		i += 1
+	}
+	return out
+}
+
+// broadcast_raw sends `line` to every open connection (send_shutdown_message).
+broadcast_raw :: proc(s: ^Server, line: string) {
+	sync.mutex_lock(&s.players_lock)
+	defer sync.mutex_unlock(&s.players_lock)
+	for _, conn in s.players {
+		send_line_raw(conn, line)
 	}
 }

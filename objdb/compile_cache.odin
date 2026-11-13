@@ -104,7 +104,7 @@ get_compiled_verb :: proc(db: ^dbfile.Database, cache: ^Compile_Cache, h: Verb_H
 	}
 	obj := db.objects[h.definer]
 	vd := obj.verbdefs[h.index]
-	r := compiler.parse_program(vd.program_source, db.version)
+	r := compiler.parse_program(vd.program_source, db.version, unknown_builtin_is_error = false)
 	result := new(Compiled_Verb)
 	result^ = Compiled_Verb{body = r.body, names = r.names, ok = len(r.errors) == 0, rc = 1}
 	for e in r.errors {

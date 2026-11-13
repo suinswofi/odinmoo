@@ -50,7 +50,13 @@ bf_read :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 		return err_result_local(.E_ARGS, "Incorrect number of arguments")
 	}
 	explicit := n >= 1
-	conn_oid := ctx.activation.player
+	// A bare read() reads the connection of the task's ROOT activation's player
+	// (activ_stack[0].player), not whatever `player` a nested verb was handed.
+	root := ctx.activation
+	for root.parent != nil && root.parent.depth >= 0 {
+		root = root.parent
+	}
+	conn_oid := root.player
 	if explicit {
 		v := values.list_get(args, 1)
 		if v.type != .Obj {
@@ -133,9 +139,9 @@ bf_read :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	}
 	if killed {
 		values.free_var(value)
-		return err_result_local(.E_INVARG, "Task killed")
+		return tasks.killed_result(ctx)
 	}
-	return ok_result(value)
+	return tasks.resumed_result(value)
 }
 
 // bf_force_input ports tasks.c's bf_force_input(): (conn, string, [at-front]) -> injects a
@@ -372,7 +378,7 @@ bf_eval :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	// eval() runs its compiled body on the native call stack just like a verb call does, so it
 	// needs the same depth ceiling -- see MAX_VERB_DEPTH in world.odin for why exceeding it is a
 	// crash rather than an error here.
-	if ctx.activation.depth + 1 >= MAX_VERB_DEPTH {
+	if ctx.activation.depth + 1 >= task_max_depth(ctx.activation) {
 		return err_result_local(.E_MAXREC, "Too many verb calls")
 	}
 
@@ -401,7 +407,13 @@ bf_eval :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	act.programmer = progr
 	act.caller_programmer = ctx.activation.programmer // caller_perms() inside eval'd code sees the eval() caller's perms
 	act.verb_loc = values.NOTHING
-	act.verb_name = "Input to EVAL"
+	// setup_activ_for_eval: RUN_ACTIV.verb is "" (what callers() and pass() see) and
+	// RUN_ACTIV.verbname is "Input to EVAL" (what a traceback prints), and the activation is
+	// one the eval() built-in invoked, so stack lists show {#-1, "eval", ...} after it.
+	act.verb_name = ""
+	act.verb_names = "Input to EVAL"
+	act.bi_func_name = "eval"
+	act.bi_func_pc = 2
 	act.debug = true
 	act.task_id = ctx.activation.task_id
 	act.depth = ctx.activation.depth + 1
@@ -462,7 +474,7 @@ bf_eval :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	case .Raised:
 		// Like a verb call, eval()'d code runs in its own activation, so a raise inside it
 		// unwinds through eval()'s caller rather than becoming that caller's inline value.
-		return vm.Call_Result{raised = true, code = result.err.code, msg = result.err.msg, rvalue = result.err.value, unwinding = true, uncatchable = result.err.uncatchable}
+		return vm.Call_Result{raised = true, code = result.err.code, msg = result.err.msg, rvalue = result.err.value, unwinding = true, uncatchable = result.err.uncatchable, serial = result.err.serial}
 	case .Normal, .Break, .Continue:
 		items := make([]values.Var, 2)
 		items[0] = values.int_val(1)

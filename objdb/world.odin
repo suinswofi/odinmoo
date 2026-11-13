@@ -6,6 +6,7 @@ package objdb
 // scheduler for fork/suspend/resume/kill_task/task_id.
 
 import "../builtins"
+import "base:runtime"
 import "../compiler"
 import "../dbfile"
 import "../tasks"
@@ -29,6 +30,7 @@ Connection_Hooks :: struct {
 	boot_player:      proc(user_data: rawptr, player: values.Objid),
 	connected_players: proc(user_data: rawptr, include_all: bool) -> []values.Objid, // owned slice
 	connected_seconds: proc(user_data: rawptr, player: values.Objid) -> (secs: i64, found: bool),
+	idle_seconds:      proc(user_data: rawptr, player: values.Objid) -> (secs: i64, found: bool),
 
 	// Back read()/force_input()/flush_input()/set_connection_option()/connection_option(s)()
 	// -- see netio/input_queue.odin's header for the full design these implement.
@@ -104,6 +106,9 @@ Object_World :: struct {
 	// default. Per-world rather than a package global purely so that constructing a second
 	// Object_World isn't a write to state other threads are concurrently reading.
 	trace_errors: bool,
+
+	// options holds what load_server_options() caches from $server_options (protect_*).
+	options: Server_Options_Cache,
 }
 
 object_world_init :: proc(db: ^dbfile.Database, scheduler: ^tasks.Scheduler = nil) -> Object_World {
@@ -117,6 +122,7 @@ object_world_init :: proc(db: ^dbfile.Database, scheduler: ^tasks.Scheduler = ni
 
 object_world_destroy :: proc(w: ^Object_World) {
 	compile_cache_destroy(&w.cache)
+	server_options_cache_destroy(&w.options)
 }
 
 make_world :: proc(w: ^Object_World) -> vm.World {
@@ -126,6 +132,9 @@ make_world :: proc(w: ^Object_World) -> vm.World {
 		set_prop = world_set_prop,
 		call_verb = world_call_verb,
 		call_builtin = world_call_builtin,
+		task_limits = world_task_limits,
+		task_aborted = world_task_aborted,
+		queued_task_limit = world_queued_task_limit,
 	}
 	if w.scheduler != nil {
 		// Fills in both do_fork and fork_data; the scheduler rides in the World rather than
@@ -151,10 +160,14 @@ world_get_prop :: proc(vw: ^vm.World, obj: values.Objid, name: string, ctx: ^vm.
 		return err_result(.E_PROPNF, "Property not found")
 	}
 	// Ports OP_GET_PROP's permission check (execute.c:1443-1446): built-in pseudo-properties
-	// are always readable (bi_prop_protected() only bites when $server_options.protect_* is
-	// set, which this port -- like a stock LambdaCore -- never has), regular properties need
+	// are readable unless $server_options.protect_<name> is set (cached by
+	// load_server_options), in which case only wizards may read them; regular properties need
 	// PF_READ / ownership / wizardliness.
-	if h.builtin == .None && !prop_allows(w.db, h.value_perms, h.value_owner, ctx.activation.programmer, .Read) {
+	progr := ctx.activation.programmer
+	denied := h.builtin == .None \
+		? !prop_allows(w.db, h.value_perms, h.value_owner, progr, .Read) \
+		: h.builtin in w.options.protected_props && !is_wizard(w.db, progr) // bi_prop_protected
+	if denied {
 		return err_result(.E_PERM, "Permission denied")
 	}
 	// property_value already returns an owned value (see its own comment) -- no extra
@@ -244,9 +257,9 @@ world_call_verb :: proc(vw: ^vm.World, obj: values.Objid, name: string, args: va
 	return call_verb_from(w, vw, obj, obj, name, args, ctx)
 }
 
-// MAX_VERB_DEPTH caps how deep MOO verb calls may nest before E_MAXREC, matching the
-// original's DEFAULT_MAX_STACK_DEPTH (options.h) exactly -- so verb code that runs on the C
-// server hits the same ceiling here rather than a different one.
+// MAX_VERB_DEPTH is the default ceiling on nested verb calls (E_MAXREC beyond it): the
+// original's DEFAULT_MAX_STACK_DEPTH, which $server_options.max_stack_depth overrides for each
+// new task (vm.Task_Budget.max_depth, filled in by world_task_limits).
 //
 // This is load-bearing, not a tidiness limit. Because this port runs nested verb calls on the
 // NATIVE call stack (see vm/activation.odin's header on why that's what makes suspend/resume
@@ -256,9 +269,18 @@ world_call_verb :: proc(vw: ^vm.World, obj: values.Objid, name: string, args: va
 // reachable: `.program me:loop` / `this:loop();` is enough for anyone with a programmer bit.
 // So the check has to happen before recursing, and it's checked here because this is the one
 // funnel every verb call goes through -- ordinary `obj:verb()`, pass(), and command dispatch
-// alike. The original's $server_options.max_stack_depth override isn't supported (this port has
-// no $server_options plumbing); the fixed default is the conservative direction to differ in.
-MAX_VERB_DEPTH :: 50
+// alike. For the same reason a database's max_stack_depth is honored only up to
+// MAX_VERB_DEPTH_CEILING: a larger value is not a policy this process can actually carry out.
+MAX_VERB_DEPTH :: vm.DEFAULT_MAX_STACK_DEPTH
+MAX_VERB_DEPTH_CEILING :: 400
+
+// task_max_depth is the verb-depth ceiling for the task `a` belongs to.
+task_max_depth :: proc(a: ^vm.Activation) -> int {
+	if a.budget != nil && a.budget.max_depth > 0 {
+		return a.budget.max_depth
+	}
+	return MAX_VERB_DEPTH
+}
 
 // call_verb_from is world_call_verb's body, generalized with a separate `search_from`
 // (where verb lookup starts) distinct from `this_obj` (what `this` is bound to in the
@@ -283,9 +305,9 @@ MAX_VERB_DEPTH :: 50
 // wrongly rejected as E_VERBNF by a second, stricter search here if this function re-searched
 // on its own; passing the already-resolved handle through keeps the two searches from
 // disagreeing.
-call_verb_from :: proc(w: ^Object_World, vw: ^vm.World, this_obj, search_from: values.Objid, name: string, args: values.Var, ctx: ^vm.Eval_Context, cmd: ^Parsed_Command = nil, vh_hint: Verb_Handle = {}, via_builtin: string = "") -> vm.Call_Result {
+call_verb_from :: proc(w: ^Object_World, vw: ^vm.World, this_obj, search_from: values.Objid, name: string, args: values.Var, ctx: ^vm.Eval_Context, cmd: ^Parsed_Command = nil, vh_hint: Verb_Handle = {}, via_builtin: string = "", via_builtin_pc: int = 1) -> vm.Call_Result {
 	defer values.free_var(args)
-	if ctx.activation.depth + 1 >= MAX_VERB_DEPTH {
+	if ctx.activation.depth + 1 >= task_max_depth(ctx.activation) || values.stack_exhausted() {
 		return err_result(.E_MAXREC, "Too many verb calls")
 	}
 	if !valid(w.db, this_obj) {
@@ -315,7 +337,7 @@ call_verb_from :: proc(w: ^Object_World, vw: ^vm.World, this_obj, search_from: v
 	act := vm.activation_make(len(cv.names.names), &cv.names)
 	defer vm.activation_destroy(&act)
 	act.this = this_obj
-	act.player = ctx.activation.player
+	act.player = caller_player(w, ctx)
 	act.caller = ctx.activation.this
 	act.programmer = vd.owner
 	act.caller_programmer = ctx.activation.programmer
@@ -334,8 +356,10 @@ call_verb_from :: proc(w: ^Object_World, vw: ^vm.World, this_obj, search_from: v
 	// (execute.c:2606), so getting this backwards makes pass() search for a verb matching
 	// the wrong string and silently dead-end with E_VERBNF.
 	act.verb_name = name
+	act.verb_names = vd.name // the full alias string, which a traceback prints (RUN_ACTIV.verbname)
 	act.debug = (vd.perms & (1 << uint(Verb_Flag.Debug))) != 0
 	act.bi_func_name = via_builtin // non-empty only when a built-in dispatched this verb
+	act.bi_func_pc = via_builtin_pc
 
 	if cmd != nil {
 		act.dobj = cmd.dobj
@@ -399,36 +423,176 @@ call_verb_from :: proc(w: ^Object_World, vw: ^vm.World, this_obj, search_from: v
 			// a poor man's version of the traceback the original logs for uncaught errors.
 			fmt.eprintfln("TRACE: #%d:%s (defined on #%d, programmer #%d) raised %s: %s", this_obj, name, vh.definer, act.programmer, compiler.error_name(r.err.code), r.err.msg)
 		}
-		return vm.Call_Result{raised = true, code = r.err.code, msg = r.err.msg, rvalue = r.err.value, unwinding = true, uncatchable = r.err.uncatchable}
+		return vm.Call_Result{raised = true, code = r.err.code, msg = r.err.msg, rvalue = r.err.value, unwinding = true, uncatchable = r.err.uncatchable, serial = r.err.serial}
 	case .Normal, .Break, .Continue:
 		return vm.call_ok(values.int_val(0))
 	}
 	return vm.call_ok(values.int_val(0))
 }
 
-// world_call_builtin tries builtins' pure dispatch table first, then this package's own
-// small set of object-aware built-ins (which need `w.db` and so can't live in builtins
-// without creating a package cycle -- see builtins/dispatch.odin's header note), then (if a
-// Scheduler was supplied) tasks' suspend/resume/kill_task/task_id.
+// caller_player ports call_verb2's `player` binding: a WIZARD caller whose `player` variable
+// holds an object passes that value on (so `player = who; this:tell_them()` in wizard code
+// really does change who the callee thinks the player is); anyone else's callee inherits the
+// caller's activation player regardless of what the variable says.
+@(private = "file")
+caller_player :: proc(w: ^Object_World, ctx: ^vm.Eval_Context) -> values.Objid {
+	a := ctx.activation
+	if ctx.names != nil && is_wizard(w.db, a.programmer) {
+		if slot := compiler.find(ctx.names, "player"); slot >= 0 && slot < len(a.locals) {
+			if v := a.locals[slot]; v.type == .Obj {
+				return v.data.obj
+			}
+		}
+	}
+	return a.player
+}
+
+// world_call_builtin ports call_bi_func()'s gatekeeping and then dispatches: builtins' pure
+// table first, then this package's object-aware set, then (if a Scheduler was supplied) the
+// task built-ins.
+//
+// The gate runs before any built-in sees its arguments, in the original's order:
+//  1. protect_<name> (load_server_options' cache): unless the caller is #0 itself, the call is
+//     redirected to #0:bf_<name>(@args), whose answer is the answer. With no such verb, a
+//     non-wizard gets E_PERM and a wizard gets the real built-in. Both bundled cores depend on
+//     this -- LambdaCore's #0:bf_add_verb/bf_add_property/bf_recycle/... are where its quota
+//     and permission policy for non-wizards lives.
+//  2. argument count (E_ARGS) and declared argument types (E_TYPE), from bf_prototypes -- one
+//     table, so every built-in reports these exactly as the original does.
+// A name with no built-in at all raises E_INVARG "Unknown built-in function" with the name as
+// the value (bf_call_function's answer, which is what the parser's rewrite of an unknown `foo()`
+// to call_function("foo", ...) reaches).
 @(private = "file")
 world_call_builtin :: proc(vw: ^vm.World, name: string, is_known: bool, args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
-	if result, found := builtins.call(name, args); found {
-		return result
-	}
 	w := (^Object_World)(vw.user_data)
+	if w.options.protected_functions != nil && w.options.protected_functions[name] && ctx.activation.this != values.SYSTEM_OBJECT {
+		if r, done := call_protected_wrapper(w, vw, name, args, ctx); done {
+			return r
+		}
+	}
+	if proto, has := bf_proto(name); has {
+		if e := check_builtin_args(proto, args); e != .E_NONE {
+			values.free_var(args)
+			return err_result(e, vm.error_message(e))
+		}
+	}
+
+	if result, found := builtins.call(name, args); found {
+		return standard_message(name, result)
+	}
 	if result, found := object_builtin(w, name, args, ctx); found {
-		return result
+		return standard_message(name, result)
 	}
 	if w.scheduler != nil {
 		if result, denied := task_control_denied(w, name, args, ctx); denied {
 			return result
 		}
 		if result, found := tasks.scheduler_builtin(w.scheduler, name, args, ctx); found {
-			return result
+			return standard_message(name, result)
 		}
 	}
 	values.free_var(args)
-	return err_result(.E_VERBNF, "Unknown built-in function")
+	return vm.Call_Result{raised = true, code = .E_INVARG, msg = strings.clone("Unknown built-in function"), rvalue = values.str_val(strings.clone(name))}
+}
+
+// standard_message gives a built-in's own error the message the original gives it. Built-ins
+// report errors through make_error_pack(), whose message is always unparse_error(code) --
+// "Permission denied", "Resource limit exceeded", ... -- and that text is what an `except`
+// arm's e[2], a traceback and #0:handle_uncaught_error see. Only three built-ins say anything
+// else (make_raise_pack): raise() itself, call_function() of an unknown name, and
+// db_disk_size(). An error that UNWOUND through the built-in -- from a verb it called -- is the
+// verb's, and keeps its own message.
+@(private = "file")
+standard_message :: proc(name: string, r: vm.Call_Result) -> vm.Call_Result {
+	if !r.raised || r.unwinding || r.uncatchable {
+		return r
+	}
+	switch name {
+	case "raise", "call_function", "db_disk_size":
+		return r
+	}
+	std := vm.error_message(r.code)
+	if r.msg == std {
+		return r
+	}
+	out := r
+	delete(r.msg)
+	out.msg = strings.clone(std)
+	return out
+}
+
+// call_protected_wrapper is call_bi_func's protect_<name> branch. done=false means "run the
+// real built-in" (a wizard caller and no #0:bf_<name>); `args` is consumed only when done.
+@(private = "file")
+call_protected_wrapper :: proc(w: ^Object_World, vw: ^vm.World, name: string, args: values.Var, ctx: ^vm.Eval_Context) -> (result: vm.Call_Result, done: bool) {
+	verb := strings.concatenate({"bf_", name})
+	defer delete(verb)
+	r := call_verb_from(w, vw, values.SYSTEM_OBJECT, values.SYSTEM_OBJECT, verb, values.var_ref(args), ctx)
+	dispatch_failed := r.raised && !r.unwinding && (r.code == .E_VERBNF || r.code == .E_MAXREC || r.code == .E_INVIND)
+	if !dispatch_failed {
+		values.free_var(args)
+		return r, true
+	}
+	code := r.code
+	delete(r.msg)
+	values.free_var(r.rvalue)
+	if code == .E_MAXREC || !is_wizard(w.db, ctx.activation.programmer) {
+		values.free_var(args)
+		e := code == .E_MAXREC ? values.Error.E_MAXREC : values.Error.E_PERM
+		return err_result(e, vm.error_message(e)), true
+	}
+	return {}, false
+}
+
+@(private = "file")
+bf_proto_index: map[string]int
+
+@(init, private = "file")
+build_bf_proto_index :: proc "contextless" () {
+	context = runtime.default_context()
+	bf_proto_index = make(map[string]int, len(bf_prototypes))
+	for p, i in bf_prototypes {
+		bf_proto_index[p.name] = i
+	}
+}
+
+@(fini, private = "file")
+destroy_bf_proto_index :: proc "contextless" () {
+	context = runtime.default_context()
+	delete(bf_proto_index)
+}
+
+bf_proto :: proc(name: string) -> (Bf_Proto, bool) {
+	i, ok := bf_proto_index[name]
+	if !ok {
+		return {}, false
+	}
+	return bf_prototypes[i], true
+}
+
+// check_builtin_args is call_bi_func's argument-count and argument-type check.
+check_builtin_args :: proc(proto: Bf_Proto, args: values.Var) -> values.Error {
+	n := values.list_len(args)
+	if n < proto.min || (proto.max != -1 && n > proto.max) {
+		return .E_ARGS
+	}
+	ncheck := proto.max == -1 ? proto.min : n
+	for k in 0 ..< ncheck {
+		want := proto.types[k]
+		got := values.list_get(args, k + 1).type
+		switch want {
+		case -1:
+		case -2:
+			if got != .Int && got != .Float {
+				return .E_TYPE
+			}
+		case:
+			if int(got) != want {
+				return .E_TYPE
+			}
+		}
+	}
+	return .E_NONE
 }
 
 // task_control_denied enforces the owner-or-wizard rule on resume()/kill_task(), which

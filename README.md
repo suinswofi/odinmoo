@@ -40,17 +40,27 @@ Known, deliberate gaps (all documented at the point in the code where they matte
 outbound network connections (`open_network_connection()`) are disabled, matching the original's
 own default (non-`OUTBOUND_NETWORK`) build configuration; `queued_tasks()`/`task_stack()` only
 see genuinely-suspended tasks and report one call frame, not a full chain, an inherent
-consequence of the concurrency redesign described below; a handful of `set_connection_option()`
-flags (`binary`, `disable-oob`) are accepted and stored but don't change wire behavior, since
-nothing else in this port implements what they'd toggle.
+consequence of the concurrency redesign described below; the `binary` connection option is
+accepted and stored but doesn't change wire behavior.
 
-Four built-ins JHCore references remain unimplemented, none on a path ordinary play reaches:
+Three built-ins JHCore references remain unimplemented, none on a path ordinary play reaches:
 `listen()`/`unlisten()` (creating and destroying listening points at runtime -- `listeners()`
 does work, reporting the single command-line listener the original also creates as
-`new_slistener(SYSTEM_OBJECT, port, 1, 0)`), `disassemble()` (there is no bytecode to
-disassemble here -- see the VM note below), and `decode_binary()` (part of the binary-connection
-surface whose `set_connection_option()` flags are inert, above). Calling one raises `E_VERBNF`
-rather than failing to compile, since the compiler recognizes every name the original does.
+`new_slistener(SYSTEM_OBJECT, port, 1, 0)`) and `disassemble()` (there is no bytecode to
+disassemble here -- see the VM note below). Calling one raises `E_INVARG` ("Unknown built-in
+function"), exactly as calling any function the server lacks does in the original.
+
+The server is LambdaMOO **1.8.3**-compatible (`server_version()` reports `1.8.3+odin`), and it
+honors `$server_options` as the original does: tick and second limits for foreground and
+background tasks, `max_stack_depth` (capped at 400, since verb calls nest on the native stack
+here), `queued_task_limit`, the `protect_*` flags that route non-wizard calls through
+`#0:bf_*` wrappers (LambdaCore's quota policy lives there), the connection messages,
+`connect_timeout`, `default_flush_command` and `support_numeric_verbname_strings`. The database
+is notified of everything the original notifies it of (`#0:user_connected`/`user_created`/
+`user_reconnected`/`user_disconnected`/`user_client_disconnected`, `server_started`,
+`checkpoint_started`/`checkpoint_finished`, out-of-band `#$#` lines), and an error nobody
+catches goes to `#0:handle_uncaught_error` or, failing that, prints the original's traceback
+(with listing line numbers) to the player.
 
 `db_disk_size()` and `buffered_output_length()` were on that list until the outbound side grew a
 real per-connection buffer to measure and the server started tracking which file its database
@@ -207,9 +217,13 @@ Or invoke the server directly, e.g. to point at a different/your-own database:
 - Default port is 7777 if omitted.
 - `SIGINT`/`SIGTERM` shut down cleanly (checkpointing first); `SIGUSR2` schedules an immediate
   checkpoint without stopping the server.
-- `./bin/moo -e <core.db>` starts **emergency wizard mode**: a local stdin/stdout MOO-expression
-  REPL against the loaded database, no network involved — for recovering a database broken by bad
-  verb code.
+- `./bin/moo -e <core.db> <checkpoint-path.db>` starts **emergency wizard mode**, the original's
+  local stdin/stdout console with no network involved — `;expr`, `;;statements`, `list` and
+  `program` for verbs, `wizard #N`, `debug`, then `continue` (start the server), `quit` (save
+  and exit) or `abort` (exit without saving) — for recovering a database broken by bad verb
+  code. Type `help` there for the list.
+- Checkpoints also happen on their own every `#0.dump_interval` seconds (default 3600), and are
+  written to a temporary `<path>.#N#` file that is renamed into place only once complete.
 
 Then connect with any telnet-compatible client:
 
@@ -293,7 +307,7 @@ regex/          MOO's %-escaped pattern dialect (match()/rmatch()/substitute())
 netio/          TCP server, login state machine, command dispatch, the `.program` editor,
                 PREFIX/SUFFIX, connection option handling
 ansi/           %-code and |NN pipe-code color markup -> real ANSI SGR escapes
-server/         main(), CLI, signal handling, checkpoint (fork()-based), emergency mode
+server/         main(), CLI, signal handling, checkpoint (in-memory snapshot + writer thread), emergency mode
 cmd/            small standalone dev tools (dumpverb, loadcheck, replserver, jhverify, dbscript)
                 -- like the tests above, these load `LambdaCore.db` via a relative path, so run
                 them from the repo root (`odin run cmd/replserver`, etc.)

@@ -1,17 +1,12 @@
 #+feature dynamic-literals
 package builtins
 
-// Built-in function library, ported from functions.c's registration plus the individual
-// bf_* implementations scattered through list.c/numbers.c. Scope note: the C server
-// registers ~125-129 built-ins (server startup logs "128 built-in functions"); this package
-// covers the pure, DB-independent core (~30 functions: type conversion, list/string
-// manipulation, math, a few misc) that's usable in isolation and covers the large majority
-// of what real verb code actually calls. Object-DB-dependent built-ins (create, move,
-// chparent, add_property, add_verb, ...) and connection/task-control built-ins (notify,
-// read, suspend, ...) are out of scope here -- object-dependent ones belong next to objdb's
-// World implementation (see objdb/world.odin's call_builtin, which tries this package's
-// table first and falls through to its own small object-aware set), and connection/task
-// ones need Phase 6/7 (the scheduler and network layer) to mean anything.
+// Built-in function library, ported from the bf_* implementations in list.c/numbers.c/
+// objects.c: the pure, DB-independent part (type conversion, list/string manipulation, math,
+// hashing and binary strings, regex matching) that is usable and testable in isolation.
+// Object-DB-, connection- and task-dependent built-ins live next to objdb's World
+// (objdb/world.odin's call_builtin, which gates every call against the original's prototype
+// table and then tries this package's table first).
 //
 // Deliberately NOT a cycle back to objdb or vm.World: every function here has the signature
 // `proc(args: values.Var) -> vm.Call_Result` -- no Eval_Context, no database. That's what
@@ -68,10 +63,20 @@ table: map[string]Builtin_Fn = {
 	"asin"  = bf_asin,
 	"acos"  = bf_acos,
 	"atan"  = bf_atan,
+	"sinh"  = bf_sinh,
+	"cosh"  = bf_cosh,
+	"tanh"  = bf_tanh,
 	"exp"   = bf_exp,
 	"log"   = bf_log,
 	"log10" = bf_log10,
 	"random" = bf_random,
+
+	// Hashes and binary strings
+	"string_hash"   = bf_string_hash,
+	"binary_hash"   = bf_binary_hash,
+	"value_hash"    = bf_value_hash,
+	"decode_binary" = bf_decode_binary,
+	"encode_binary" = bf_encode_binary,
 
 	// Misc
 	"time"  = bf_time,

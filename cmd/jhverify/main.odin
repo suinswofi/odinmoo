@@ -349,7 +349,7 @@ compile_all :: proc(db: ^dbfile.Database, c: ^Census) {
 			c.verbs_prog += 1
 			c.site = fmt.tprintf("#%d:%s", oid, verb.name)
 
-			r := compiler.parse_program(verb.program_source, db.version)
+			r := compiler.parse_program(verb.program_source, db.version, unknown_builtin_is_error = false)
 			if len(r.errors) > 0 {
 				c.parse_fail += 1
 				if c.parse_fail <= 20 {

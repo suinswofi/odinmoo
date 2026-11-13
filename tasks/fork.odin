@@ -86,6 +86,7 @@ Fork_Job :: struct {
 	// (this port used to leave them empty, and dobj/iobj defaulted to Objid(0) -- i.e. #0, the
 	// System Object, not #-1).
 	verb_name:  string,
+	verb_names: string,
 	dobjstr:    string,
 	iobjstr:    string,
 	prepstr:    string,
@@ -99,6 +100,7 @@ Fork_Job :: struct {
 @(private = "file")
 fork_job_release_strings :: proc(job: ^Fork_Job) {
 	delete(job.verb_name)
+	delete(job.verb_names)
 	delete(job.dobjstr)
 	delete(job.iobjstr)
 	delete(job.prepstr)
@@ -106,8 +108,11 @@ fork_job_release_strings :: proc(job: ^Fork_Job) {
 }
 
 @(private = "file")
-do_fork :: proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^compiler.Name_Table, var_id: int, ctx: ^vm.Eval_Context) {
+do_fork :: proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^compiler.Name_Table, var_id: int, ctx: ^vm.Eval_Context) -> values.Error {
 	s := (^Scheduler)(w.fork_data)
+	if over_task_limit(s, w, ctx.activation.programmer) {
+		return .E_QUOTA
+	}
 	delay_secs := 0.0
 	#partial switch delay.type {
 	case .Int:
@@ -156,6 +161,7 @@ do_fork :: proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^
 		task_id    = task_id,
 		// Cloned, never borrowed -- see Fork_Job's comment on why this is load-bearing.
 		verb_name  = strings.clone(ctx.activation.verb_name),
+		verb_names = strings.clone(ctx.activation.verb_names),
 		dobjstr    = strings.clone(ctx.activation.dobjstr),
 		iobjstr    = strings.clone(ctx.activation.iobjstr),
 		prepstr    = strings.clone(ctx.activation.prepstr),
@@ -179,11 +185,12 @@ do_fork :: proc(w: ^vm.World, delay: values.Var, body: []compiler.Stmt, names: ^
 	job_ptr := new_clone(job)
 	if delay_secs > 0 {
 		schedule_fork(s, job_ptr)
-		return
+		return .E_NONE
 	}
 	sync.mutex_lock(&s.meta_lock)
 	enqueue_runnable_locked(s, job_ptr)
 	sync.mutex_unlock(&s.meta_lock)
+	return .E_NONE
 }
 
 // enqueue_runnable_locked adds a due fork to the run queue, starting a fork worker if none is
@@ -468,6 +475,7 @@ run_fork_job :: proc(job: ^Fork_Job) {
 		programmer = job.programmer,
 		verb_loc   = job.verb_loc,
 		verb_name  = job.verb_name,
+		verb_names = job.verb_names,
 		debug      = job.debug,
 		task_id    = job.task_id,
 		// The forking verb's command context, carried across so a verb CALLED by the forked
@@ -483,17 +491,38 @@ run_fork_job :: proc(job: ^Fork_Job) {
 	}
 	defer vm.activation_destroy(&act)
 
+	// A forked task is a BACKGROUND task: bg_ticks/bg_seconds (do_forked_task's
+	// run_interpreter(..., 0/*bg*/, ...)).
+	budget: vm.Task_Budget
+	vm.budget_open(&budget, job.w, true)
+	defer vm.budget_close(&budget)
+	act.budget = &budget
+
 	r := vm.run(job.body, &job.names, job.w, &act)
 	switch r.signal {
 	case .Return:
 		values.free_var(r.value)
 	case .Raised:
-		// No caller left to propagate to -- a forked task's uncaught error just ends the
-		// task. The original logs it via #0:handle_uncaught_error; that needs Phase 4/5's
-		// full object-DB dispatch machinery wired up to mean anything here, so for now the
-		// error is simply discarded (its allocations still freed, not leaked).
+		// No caller left to propagate to: like any task, an error nobody caught goes to
+		// #0:handle_uncaught_error (or a timeout to #0:handle_task_timeout), and failing that
+		// its traceback is printed to the task's player -- run_interpreter's tail.
+		if job.w.task_aborted != nil && !budget.killed {
+			job.w.task_aborted(job.w, &r.err, &act)
+		}
 		delete(r.err.msg)
 		values.free_var(r.err.value)
 	case .Normal, .Break, .Continue:
 	}
+}
+
+// runnable_forks_owned_by_locked counts the due-but-not-started forks in the run queue whose
+// programmer is `owner`. Caller holds meta_lock.
+runnable_forks_owned_by_locked :: proc(s: ^Scheduler, owner: values.Objid) -> int {
+	n := 0
+	for i in 0 ..< queue.len(s.run_queue) {
+		if job := (^Fork_Job)(queue.get(&s.run_queue, i)); job.programmer == owner {
+			n += 1
+		}
+	}
+	return n
 }

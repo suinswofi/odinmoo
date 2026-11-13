@@ -24,7 +24,9 @@ ok_expr :: proc(v: values.Var) -> Expr_Result {return Expr_Result{value = v}}
 // just gets the bare ERR value pushed as an ordinary result, matching very old MOO behavior.
 raise_or_value :: proc(ctx: ^Eval_Context, code: values.Error) -> Expr_Result {
 	if ctx.activation.debug {
-		return Expr_Result{raised = true, err = Error_Info{code = code, msg = strings.clone(error_message(code)), value = values.int_val(0)}}
+		r := Expr_Result{raised = true, err = Error_Info{code = code, msg = strings.clone(error_message(code)), value = values.int_val(0)}}
+		record_error(ctx, &r.err)
+		return r
 	}
 	return ok_expr(values.err_val(code))
 }
@@ -61,12 +63,23 @@ call_to_expr :: proc(ctx: ^Eval_Context, r: Call_Result) -> Expr_Result {
 			values.free_var(r.rvalue)
 			return ok_expr(values.err_val(r.code))
 		}
-		return Expr_Result{raised = true, err = Error_Info{code = r.code, msg = r.msg, value = r.rvalue, uncatchable = r.uncatchable}}
+		out := Expr_Result{raised = true, err = Error_Info{code = r.code, msg = r.msg, value = r.rvalue, uncatchable = r.uncatchable, serial = r.serial}}
+		if r.serial == 0 && !r.uncatchable {
+			// Raised by this activation's own operation (a built-in, a failed dispatch): this
+			// is where the error originates, so this is where its frames are recorded.
+			record_error(ctx, &out.err)
+		}
+		return out
 	}
 	return ok_expr(r.value)
 }
 
 eval_expr :: proc(ctx: ^Eval_Context, e: compiler.Expr) -> Expr_Result {
+	// Every nested expression comes through here, so this is where native-stack depth is
+	// checked -- see values/stack_guard.odin for why counting levels doesn't bound it.
+	if values.stack_exhausted() {
+		return raise_or_value(ctx, .E_MAXREC)
+	}
 	switch v in e {
 	case ^compiler.Expr_Var:
 		return ok_expr(values.var_ref(v.value))

@@ -133,7 +133,7 @@ bf_create :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> 
 	resync_subtree_propvals(w.db, oid, obj.owner, &snap)
 
 	init_args := values.list_val(make([]values.Var, 0))
-	result := call_verb_from(w, ctx.world, oid, oid, "initialize", init_args, ctx, via_builtin = "create")
+	result := call_verb_from(w, ctx.world, oid, oid, "initialize", init_args, ctx, via_builtin = "create", via_builtin_pc = 2)
 	if result.raised {
 		// A raise from the :initialize body unwinds through create()'s caller (in the
 		// original it never returns to bf_create -- the squelch path discards the
@@ -188,7 +188,7 @@ bf_recycle :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) ->
 	pending: vm.Call_Result
 	squelch := false
 	recycle_args := values.list_val(make([]values.Var, 0))
-	rresult := call_verb_from(w, ctx.world, oid, oid, "recycle", recycle_args, ctx, via_builtin = "recycle")
+	rresult := call_verb_from(w, ctx.world, oid, oid, "recycle", recycle_args, ctx, via_builtin = "recycle", via_builtin_pc = 2)
 	if rresult.raised {
 		if rresult.unwinding {
 			pending = rresult

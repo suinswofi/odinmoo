@@ -121,18 +121,7 @@ write_literal :: proc(b: ^strings.Builder, v: values.Var) -> bool {
 
 @(private = "file")
 write_float_g :: proc(b: ^strings.Builder, f: f64) {
-	s := fmt.tprintf("%g", f)
-	has_marker := false
-	for c in s {
-		if c == '.' || c == 'e' || c == 'E' || c == 'n' || c == 'i' {
-			has_marker = true
-			break
-		}
-	}
-	strings.write_string(b, s)
-	if !has_marker {
-		strings.write_string(b, ".0")
-	}
+	strings.write_string(b, values.format_float(f, context.temp_allocator))
 }
 
 // bf_toint ports become_integer(): STR parses as int (falling back to float-then-truncate),

@@ -118,19 +118,23 @@ start_programming :: proc(conn: ^Connection, ow: ^objdb.Object_World, verbref: s
 		send_line(conn, program_object_error_message(oid, obj_part))
 		return
 	}
-	h := objdb.find_defined_verb(ow.db, oid, verb_part)
+	numeric := objdb.server_flag_option(ow, "support_numeric_verbname_strings", false)
+	h := objdb.find_defined_verb(ow.db, oid, verb_part, numeric)
 	if !h.found {
 		sync.mutex_unlock(&conn.server.scheduler.big_lock)
 		send_line(conn, "That object does not have that verb definition.")
 		return
 	}
 	vd := ow.db.objects[h.definer].verbdefs[h.index]
-	if !objdb.verb_allows(ow.db, vd.perms, vd.owner, conn.player, .Write) {
+	// find_verb_for_programming: the verb must be writable by the player, and with
+	// $server_options.protect_set_verb_code set only wizards may use `.program` at all.
+	if !objdb.verb_allows(ow.db, vd.perms, vd.owner, conn.player, .Write) ||
+	   (objdb.server_flag_option(ow, "protect_set_verb_code", false) && !objdb.is_wizard(ow.db, conn.player)) {
 		sync.mutex_unlock(&conn.server.scheduler.big_lock)
 		send_line(conn, "Permission denied.")
 		return
 	}
-	confirmation := fmt.tprintf(`Now programming %s (#%d):%s.  Use "." to end.`, ow.db.objects[h.definer].name, h.definer, vd.name)
+	confirmation := fmt.tprintf(`Now programming %s:%s.  Use "." to end.`, ow.db.objects[h.definer].name, vd.name)
 	confirmation_owned := strings.clone(confirmation)
 	sync.mutex_unlock(&conn.server.scheduler.big_lock)
 
@@ -142,8 +146,6 @@ start_programming :: proc(conn: ^Connection, ow: ^objdb.Object_World, verbref: s
 
 	send_line(conn, confirmation_owned)
 	delete(confirmation_owned)
-
-	echo_existing_source(conn, ow, h)
 }
 
 @(private = "file")
@@ -176,33 +178,6 @@ program_object_error_message :: proc(oid: values.Objid, obj_part: string) -> str
 	}
 }
 
-// echo_existing_source shows the verb's current body before capture begins, raw (no color
-// translation) -- reuses bf_verb_code exactly like a MOO-level listing tool would, run as
-// the connected player so the same read-permission check applies.
-@(private = "file")
-echo_existing_source :: proc(conn: ^Connection, ow: ^objdb.Object_World, h: objdb.Verb_Handle) {
-	args := make([]values.Var, 2)
-	args[0] = values.obj_val(h.definer)
-	args[1] = values.str_val(strings.clone(conn.program_verb_name))
-	act := vm.Activation{this = values.NOTHING, player = conn.player, programmer = conn.player, task_id = tasks.new_task_id(conn.server.scheduler), depth = -1}
-	ctx := vm.Eval_Context{activation = &act, world = conn.server.world}
-
-	sync.mutex_lock(&conn.server.scheduler.big_lock)
-	result := objdb.bf_verb_code(ow, values.list_val(args), &ctx)
-	sync.mutex_unlock(&conn.server.scheduler.big_lock)
-
-	if result.raised {
-		delete(result.msg)
-		values.free_var(result.rvalue)
-		return
-	}
-	defer values.free_var(result.value)
-	n := values.list_len(result.value)
-	for i in 1 ..= n {
-		send_line_raw(conn, values.list_get(result.value, i).data.str.s)
-	}
-}
-
 // finish_programming ports end_programming(): re-resolve the verb (it may have been
 // deleted while typing), then install the accumulated body via bf_set_verb_code -- the same
 // compile-and-install path set_verb_code() uses, so `.program` and MOO-level programming
@@ -224,7 +199,7 @@ finish_programming :: proc(conn: ^Connection) {
 		send_line(conn, "That object appears to have disappeared ...")
 		return
 	}
-	h := objdb.find_defined_verb(ow.db, conn.program_obj, conn.program_verb_name)
+	h := objdb.find_defined_verb(ow.db, conn.program_obj, conn.program_verb_name, objdb.server_flag_option(ow, "support_numeric_verbname_strings", false))
 	if !h.found {
 		sync.mutex_unlock(&conn.server.scheduler.big_lock)
 		send_line(conn, "That verb appears to have disappeared ...")
@@ -250,7 +225,13 @@ finish_programming :: proc(conn: ^Connection) {
 		return
 	}
 	defer values.free_var(result.value)
+	// end_programming: each compiler message as the parser reports it, then the count.
 	nerrs := values.list_len(result.value)
+	for i in 1 ..= nerrs {
+		if e := values.list_get(result.value, i); e.type == .Str {
+			send_line_raw(conn, e.data.str.s)
+		}
+	}
 	send_line(conn, fmt.tprintf("%d error(s).", nerrs))
 	if nerrs == 0 {
 		send_line(conn, "Verb programmed.")

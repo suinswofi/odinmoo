@@ -42,15 +42,21 @@ odin test <package> -extra-linker-flags:"-lcrypt"              # test one packag
   longer needs `-define:ODIN_TEST_THREADS=1`.
 - The Odin compiler ships as rolling nightly source builds, so it may not be on `PATH`; use the path
   to your own checkout's `./odin` if `odin` is not found.
-- Shutdown order is deliberate: `server_stop()` (no new input, every connection thread joined),
-  then `tasks.scheduler_shutdown()` (suspended tasks killed, forked tasks waited for), and only
-  then the final dump. Letting forked tasks run on while the database is dumped and freed is a
+- Shutdown order is deliberate: `tasks.scheduler_begin_shutdown()` (parked tasks killed, and any
+  task that parks later dies at once -- a player's `:disfunc` that calls `suspend()` would
+  otherwise park its connection's teardown, which the next step waits for), then `server_stop()`
+  (no new input, every connection thread joined), then `tasks.scheduler_shutdown()` (forked
+  tasks waited for), and only then the final dump. Letting forked tasks run on while the database is dumped and freed is a
   use-after-free, and `active_forks` had nothing waiting on it before.
 - `./bin/moo <core.db> <checkpoint.db> [port]` runs the server directly (default port 7777). Never
   point the checkpoint at the same file as the initial DB — a crash mid-write destroys the only
-  copy. `./bin/moo -e <core.db>` is emergency wizard mode: a local stdin/stdout MOO-expression REPL
-  with no network, for recovering a database broken by bad verb code. `SIGINT`/`SIGTERM` shut down
-  cleanly (checkpointing first); `SIGUSR2` checkpoints immediately without stopping.
+  copy. `./bin/moo -e <core.db> <checkpoint.db>` is emergency wizard mode (server.c's
+  `emergency_mode()`): a local stdin/stdout console with no network — `;expr`, `;;statements`,
+  `program`/`list OBJ:VERB`, `wizard #N`, `debug`, then `continue` (start the server), `quit`
+  (save and exit) or `abort` — for recovering a database broken by bad verb code.
+  `SIGINT`/`SIGTERM` shut down cleanly (checkpointing first); `SIGUSR2` checkpoints immediately
+  without stopping. Checkpoints are written to `<path>.#N#` and renamed into place, as the
+  original's are, and happen on their own every `#0.dump_interval` seconds (default 3600).
 - `bin/` and `*.db` are gitignored except the three bundled cores (`LambdaCore.db`, `jhcore.db`,
   `Minimal.db`) and their themed copies (`LambdaCore-ansi.db`, `jhcore-ansi.db`, see below).
   Checkpoint output is regenerated runtime state — never commit it.
@@ -104,14 +110,23 @@ Two structural points that are easy to violate by accident:
   point possible.
 - **Anything recursive runs on the native stack, so every such recursion needs an explicit
   ceiling** — this port turns what is a growable heap array (or a bison value stack) upstream into
-  a segfault that takes the whole server down. There are five, and they are a family, not
-  unrelated constants: `compiler.MAX_PARSE_DEPTH` (nested expressions and statement blocks —
+  a segfault that takes the whole server down. There are five ceilings, and they are a family,
+  not unrelated constants: `compiler.MAX_PARSE_DEPTH` (nested expressions and statement blocks —
   `.program`, `eval()`, `set_verb_code()` and a `.db`'s verb text all reach the parser),
   `objdb.MAX_VERB_DEPTH` (nested verb calls), `values.MAX_VALUE_DEPTH` (nested values),
   `regex.MAX_ALT_DEPTH` (a pattern's `%|` branch count — `compile_alt` recurses once per
   branch, so `"a%|" * 100000` from any `match()` call used to segfault outright), and
   `dbfile`'s reader applying MAX_VALUE_DEPTH at load. Adding a new recursive walk over
   attacker-shaped input means asking which of these bounds it.
+
+  **The ceilings don't compose, so there is also a direct stack check** (`values/stack_guard.odin`):
+  `eval_expr`, `exec_stmt`, `call_verb_from` and the parser's `enter_nesting` refuse to go deeper
+  (`E_MAXREC` / "too deeply nested") once less than `STACK_RESERVE` (512KB) of the thread's real
+  stack remains (`pthread_getattr_np`). It exists because each verb level may legitimately hold
+  an expression nested to the parser's limit, and evaluating nesting costs ~2KB of native stack
+  per level: a verb whose recursive call sat inside ~190 levels of parentheses overflowed an 8MB
+  stack in under 20 calls — inside the default 50-call limit — and killed the server from any
+  programmer account. Anything that recurses below a check must stay within the reserve.
 
   Where there is no *legitimate* depth to cut off, the answer is an explicit heap stack
   rather than another tuned constant — the descendant-tree walks
@@ -154,8 +169,13 @@ Two structural points that are easy to violate by accident:
   *suspended* tasks, and `scheduler_shutdown()` waits on the very thread that is spinning). A
   "tick" is one executed statement, charged in `exec_stmt`, plus one per loop iteration
   (`charge_iteration`) — the second is not redundant: `while (1) endwhile` runs no statements at
-  all. The limits are the original's defaults (30000 ticks / 5s) but are fixed constants, not
-  `$server_options`-driven. The abort is **uncatchable** (`Error_Info.uncatchable`, honored by
+  all. The limits come from `$server_options` exactly as the original's do, looked up every time
+  a task starts or resumes (`World.task_limits`, objdb's `world_task_limits`): `fg_ticks`/
+  `fg_seconds` (defaults 30000/5) for a task started by input or by the server, `bg_ticks`/
+  `bg_seconds` (15000/3) for a forked task or any task resuming from `suspend()`/`read()`;
+  `max_stack_depth` likewise (default 50, never below it, and capped at
+  `objdb.MAX_VERB_DEPTH_CEILING` = 400 because verb nesting is native stack here). Both bundled
+  cores set them (JHCore: 900000 ticks). The abort is **uncatchable** (`Error_Info.uncatchable`, honored by
   `exec_try_except`/`exec_try_finally`/`eval_catch` and by `call_to_expr`'s `d`-flag branch) —
   a catchable one would be swallowed by `try ... except (ANY)` and buy nothing. A task's budget
   is shared by every nested verb call (`call_verb_from` and `bf_eval` copy the pointer) and
@@ -282,6 +302,13 @@ Two structural points that are easy to violate by accident:
   leaving it open would hand every connected player a way around a trust decision the
   database had already made. Any new `.`-prefixed local command that can run code needs the
   same gate.
+- **Verb code is shown and stored the original's way.** `verb_code()`/`@list` decompile with
+  minimal parentheses and indentation by default (both flags honored, `compiler/unparse.odin`
+  ports unparse.c's precedence table); `set_verb_code()`/`.program` store the program the way
+  `dbio_write_program` does (fully parenthesized, unindented). Freshly typed code that calls a
+  function the server lacks fails to compile ("Unknown built-in function: foo"), while stored
+  verbs still load (`parse_program`'s `unknown_builtin_is_error`); a syntax error is reported
+  once ("syntax error") and stops the parse, as bison does with no error rules.
 - **`resume()` and `kill_task()` are owner-or-wizard**, checked in `objdb`'s
   `task_control_denied` rather than in `tasks` — that package has no database access by design
   (same split `task_stack()` already uses). Task ids are small sequential integers, so without
@@ -314,15 +341,41 @@ Two structural points that are easy to violate by accident:
   a missing property — becomes the value of the expression rather than raising (`call_to_expr`
   in `vm/eval_expr.odin`, porting `PUSH_ERROR`). Core code probes with it instead of try/except.
   An error unwinding out of a verb that already started running is not subject to it.
+- **`$server_options` is honored the way the original honors it** (`objdb/server_options.odin`):
+  the protect_* flags are cached by `load_server_options()` (called at startup and by the
+  built-in), everything else is read when it matters. `protect_<builtin>` sends a non-#0 caller's
+  call to `#0:bf_<builtin>` (no such verb: E_PERM for non-wizards) — LambdaCore's quota and
+  permission policy for `add_verb`/`add_property`/`recycle`/`chparent`/... lives in those
+  wrappers. Every built-in call first passes `objdb.check_builtin_args` against `bf_prototypes.odin`
+  (GENERATED from the C sources' `register_function` calls), so E_ARGS/E_TYPE match the original
+  everywhere, and a built-in's own error always carries the standard message (`standard_message`).
+- **Tasks end the way the original's do.** Every server-started task (`objdb.run_root_verb`:
+  commands, login lines, out-of-band lines, the `#0:user_*`/`server_started`/`checkpoint_*`
+  notifications) and every forked task, on an error nobody caught, goes to
+  `#0:handle_uncaught_error(code, msg, value, stack, traceback)` (`#0:handle_task_timeout` for
+  ticks/seconds) and, failing that, prints the traceback to its player. Line numbers are
+  positions in the decompiled listing (`compiler/lines.odin`, decompile.c's `find_hot_node`),
+  recorded per activation; the frames are captured where an error is created
+  (`vm/traceback.odin`), because the activations are gone by the time anyone handles it. A
+  killed task (`kill_task()`, including of itself) ends silently and uncatchably.
+- **The connection lifecycle calls into the database like the original's.** `#0:user_connected`
+  / `user_created` (player id above the pre-login max object) / `user_reconnected` (the player
+  was already connected: the old connection gets `redirect_from_msg` and is closed silently),
+  `#0:user_client_disconnected` when the client hangs up, `#0:user_disconnected` after
+  `boot_player()` or the `connect_timeout` (default 300s) sweep, and at startup for every
+  connection the loaded database recorded as open (each dump records the live ones). Messages
+  (`boot_msg`, `connect_msg`, ...) come from `$server_options`. Lines starting `#$#` go to
+  `#0:do_out_of_band_command` (never to `read()`), and the flush command (default `.flush`)
+  empties the input queue.
 - **A verb dispatched by a built-in gets a synthetic `callers()` frame** naming that built-in
   (`{#-1, "move", #-1, #-1, player}`) — set via `call_verb_from`'s `via_builtin`. `:enterfunc`
   and friends check for it to prove they were called by `move()` and not by a player.
 - Deliberate, documented gaps: outbound `open_network_connection()` is disabled (matching the
-  original's default non-`OUTBOUND_NETWORK` build); some `set_connection_option()` flags (`binary`,
-  `disable-oob`) are stored but inert, as is `decode_binary()` alongside them; `listen()`/
-  `unlisten()` are not implemented (`listeners()` reports the single command-line listening
-  point); `disassemble()` has no bytecode to report on. Those four are what `cmd/jhverify`
-  still reports against JHCore; LambdaCore calls none of them.
+  original's default non-`OUTBOUND_NETWORK` build); the `binary` connection option is stored but
+  inert (no binary-mode input/output); `listen()`/`unlisten()` are not implemented (`listeners()` reports the single command-line listening
+  point); `disassemble()` has no bytecode to report on. Those three are what `cmd/jhverify`
+  still reports against JHCore; LambdaCore calls none of them. Calling one raises `E_INVARG`
+  ("Unknown built-in function"), as calling any function the server lacks does in the original.
   Databases at format version 5+ (e.g. HellCore) are rejected cleanly at load — stock LambdaMOO's
   `DB_Version` stops at 4, and so does this.
 - **Three caches stand in for walks over the object DB, and each is only as correct as its

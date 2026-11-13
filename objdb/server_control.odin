@@ -45,13 +45,17 @@ bf_shutdown :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -
 	if !is_wizard(w.db, ctx.activation.programmer) {
 		return err_result_local(.E_PERM, "Permission denied")
 	}
-	message := ""
+	// The message every connection is sent ("*** Shutting down: <it> ***") and the log
+	// records: "shutdown() called by Wizard (#2)[: <message>]".
+	progr := ctx.activation.programmer
+	who := valid(w.db, progr) ? fmt.tprintf("%s (#%d)", w.db.objects[progr].name, progr) : fmt.tprintf("#%d", progr)
+	message := fmt.tprintf("shutdown() called by %s", who)
 	if n == 1 {
 		msg_v := values.list_get(args, 1)
 		if msg_v.type != .Str {
 			return err_result_local(.E_TYPE, "Type mismatch")
 		}
-		message = msg_v.data.str.s
+		message = fmt.tprintf("%s: %s", message, msg_v.data.str.s)
 	}
 	if w.server_ctl.request_shutdown != nil {
 		w.server_ctl.request_shutdown(w.server_ctl.user_data, message)
@@ -99,14 +103,9 @@ bf_db_disk_size :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 	return ok_result(values.int_val(i32(size)))
 }
 
-// bf_load_server_options ports functions.c's bf_load_server_options(): wizard-only,
-// refreshes the original's in-memory `$server_options`-derived caches (protect_* flags,
-// misc numeric options). This port doesn't maintain any such cache -- there's no per-builtin
-// "protected" table (see introspection_stats.odin's function_description note), and while the
-// tick/second budget IS enforced (vm/budget.odin), its limits are fixed constants rather than
-// values read out of $server_options, so nothing here is derived from the database and there
-// is genuinely nothing to refresh. A true, honest no-op: permission-checked, does nothing, matching what the original
-// itself would do if none of its cached options had changed.
+// bf_load_server_options ports functions.c's bf_load_server_options(): wizard-only, recomputes
+// the protect_* caches from $server_options (see server_options.odin). The original requires
+// this call after changing those properties; nothing re-reads them on its own.
 bf_load_server_options :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	defer values.free_var(args)
 	if values.list_len(args) != 0 {
@@ -115,5 +114,6 @@ bf_load_server_options :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval
 	if !is_wizard(w.db, ctx.activation.programmer) {
 		return err_result_local(.E_PERM, "Permission denied")
 	}
+	load_server_options(w)
 	return ok_result(values.int_val(0))
 }

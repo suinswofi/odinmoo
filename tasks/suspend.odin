@@ -26,7 +26,7 @@ scheduler_builtin :: proc(s: ^Scheduler, name: string, args: values.Var, ctx: ^v
 	case "resume":
 		return bf_resume(s, args), true
 	case "kill_task":
-		return bf_kill_task(s, args), true
+		return bf_kill_task(s, args, ctx), true
 	case "task_id":
 		return bf_task_id(args, ctx), true
 	}
@@ -63,6 +63,12 @@ bf_suspend :: proc(s: ^Scheduler, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	}
 	values.free_var(args)
 
+	// enqueue_suspended_task's check_user_task_limit: a programmer at their
+	// queued_task_limit can't park another task.
+	if over_task_limit(s, ctx.world, ctx.activation.programmer) {
+		return raise_err(.E_QUOTA, "Resource limit exceeded")
+	}
+
 	id := ctx.activation.task_id
 	info := register_task(s, id, ctx.activation)
 	resume_value, killed := park_wait(s, id, info, seconds)
@@ -70,12 +76,32 @@ bf_suspend :: proc(s: ^Scheduler, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 
 	if killed {
 		values.free_var(resume_value)
-		return raise_err(.E_INVARG, "Task killed")
+		return killed_result(ctx)
 	}
-	// resume_value's zero value is Var{type: .Int, data: 0} (Int is Var_Type's zero
-	// value) -- exactly the right default when nobody ever called resume() with a value
-	// (a timeout, or a bare `resume(id)`), so no separate "was it set" check is needed.
-	return vm.call_ok(resume_value)
+	return resumed_result(resume_value)
+}
+
+// killed_result is how a parked task that kill_task() (or shutdown) ended unwinds. In the
+// original a killed task's VM is simply freed: no handler runs, nothing is printed, and no
+// `except` or `finally` in it sees anything. The thread here has to unwind, so it does so
+// uncatchably, with the task's budget marked so its runner reports nothing.
+killed_result :: proc(ctx: ^vm.Eval_Context) -> vm.Call_Result {
+	if ctx.activation.budget != nil {
+		ctx.activation.budget.killed = true
+	}
+	return vm.Call_Result{raised = true, code = .E_INVARG, msg = strings.clone("Task killed"), rvalue = values.int_val(0), uncatchable = true}
+}
+
+// resumed_result ports resume_from_previous_vm(): a task resumed with an ERROR value has that
+// error RAISED at the point of its suspend() (or read()), rather than returned. Anything else
+// is suspend()'s value -- 0 when nobody supplied one (a timeout or a bare resume(id)), which
+// is resume_value's zero Var.
+resumed_result :: proc(v: values.Var) -> vm.Call_Result {
+	if v.type == .Err {
+		code := v.data.err
+		return vm.Call_Result{raised = true, code = code, msg = strings.clone(vm.error_message(code)), rvalue = values.int_val(0), unwinding = true}
+	}
+	return vm.call_ok(v)
 }
 
 // park_wait is the waiting half of suspend()/read()'s park: releases the big lock, blocks
@@ -89,6 +115,9 @@ park_wait :: proc(s: ^Scheduler, id: int, info: ^Task_Info, seconds: f64) -> (re
 	sync.mutex_lock(&s.meta_lock)
 	sync.mutex_unlock(&s.big_lock) // stop competing for the DB while parked
 	fork_worker_parked(s) // a forked task parking mustn't hold up the forks queued behind it
+	if s.shutting_down {
+		info.killed = true // see scheduler_begin_shutdown: nothing may park once shutdown starts
+	}
 	if seconds < 0 {
 		for !info.woken && !info.killed {
 			sync.cond_wait(&info.cond, &s.meta_lock)
@@ -179,7 +208,7 @@ bf_resume :: proc(s: ^Scheduler, args: values.Var) -> vm.Call_Result {
 // actively-running task on another thread isn't supported -- there's no safe preemption
 // point to interrupt it at, the same fundamental limitation the original has for tasks
 // blocked inside a built-in function, just with a different shape here.
-bf_kill_task :: proc(s: ^Scheduler, args: values.Var) -> vm.Call_Result {
+bf_kill_task :: proc(s: ^Scheduler, args: values.Var, ctx: ^vm.Eval_Context = nil) -> vm.Call_Result {
 	defer values.free_var(args)
 	if values.list_len(args) != 1 {
 		return raise_err(.E_ARGS, "Incorrect number of arguments")
@@ -189,6 +218,11 @@ bf_kill_task :: proc(s: ^Scheduler, args: values.Var) -> vm.Call_Result {
 		return raise_err(.E_TYPE, "Type mismatch")
 	}
 	id := int(id_v.data.num)
+	if ctx != nil && id == ctx.activation.task_id {
+		// kill_task(task_id()): the original aborts the calling task on the spot
+		// (make_abort_pack(ABORT_KILL)) -- silently, like any killed task.
+		return killed_result(ctx)
+	}
 
 	sync.mutex_lock(&s.meta_lock)
 	info, ok := s.tasks[id]

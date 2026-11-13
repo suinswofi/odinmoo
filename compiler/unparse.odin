@@ -1,35 +1,51 @@
 package compiler
 
-// Decompiler (AST -> MOO source text), ported from src/unparse.c/decompile.c. The original
-// supports two output modes: a "minimal parens" mode that only parenthesizes a sub-
-// expression when its precedence is actually lower than context requires, and a
-// `fully_parenthesize` mode that wraps every nested compound expression regardless. This
-// implements the latter: every position is unambiguous (parenthesized on entry) except the
-// single outermost expression of a statement, so correctness never depends on getting a
-// precedence-comparison table exactly right -- valuable here since this unparser's main job
-// right now is round-trip validation (parse -> unparse -> reparse -> compare) against 1727
-// real verb programs, not visual minimalism.
+// Decompiler (AST -> MOO source text), ported from unparse.c.
+//
+// Two independent options, exactly as the original's unparse_program() takes them:
+//
+//   fully_parenthesize -- every operator expression that is an operand of another expression
+//     is wrapped in parentheses (bracket_lt/bracket_le's `expr_prec[child] < expr_prec[PROP]`
+//     test). Without it, parentheses appear only where precedence and associativity require
+//     them, from the same table the original uses (prec_table).
+//   indent -- statement bodies are indented two spaces per level.
+//
+// verb_code() defaults to minimal parentheses with indentation (what @list shows); the database
+// stores verbs fully parenthesized and unindented (db_io.c's dbio_write_program).
 
 import "../values"
 import "core:fmt"
 import "core:strings"
 
-unparse_program :: proc(stmts: []Stmt, names: ^Name_Table) -> string {
+@(private = "file")
+Unparser :: struct {
+	b:      ^strings.Builder,
+	names:  ^Name_Table,
+	parens: bool, // fully_parenthesize
+	indent: bool,
+}
+
+unparse_program :: proc(stmts: []Stmt, names: ^Name_Table, fully_parenthesize := false, indent := true) -> string {
 	b := strings.builder_make()
-	unparse_stmts(&b, stmts, names, 0)
+	u := Unparser{b = &b, names = names, parens = fully_parenthesize, indent = indent}
+	unparse_stmts_u(&u, stmts, 0)
 	return strings.to_string(b)
 }
 
 @(private = "file")
-write_indent :: proc(b: ^strings.Builder, level: int) {
+write_indent :: proc(u: ^Unparser, level: int) {
+	if !u.indent {
+		return
+	}
 	for _ in 0 ..< level {
-		strings.write_string(b, "  ")
+		strings.write_string(u.b, "  ")
 	}
 }
 
-unparse_stmts :: proc(b: ^strings.Builder, stmts: []Stmt, names: ^Name_Table, level: int) {
+@(private = "file")
+unparse_stmts_u :: proc(u: ^Unparser, stmts: []Stmt, level: int) {
 	for s in stmts {
-		unparse_stmt(b, s, names, level)
+		unparse_stmt_u(u, s, level)
 	}
 }
 
@@ -41,115 +57,117 @@ var_name :: proc(names: ^Name_Table, id: int) -> string {
 	return names.names[id]
 }
 
-unparse_stmt :: proc(b: ^strings.Builder, s: Stmt, names: ^Name_Table, level: int) {
+@(private = "file")
+unparse_stmt_u :: proc(u: ^Unparser, s: Stmt, level: int) {
+	b, names := u.b, u.names
 	switch v in s {
 	case ^Stmt_Cond:
 		for arm, i in v.arms {
-			write_indent(b, level)
+			write_indent(u, level)
 			strings.write_string(b, i == 0 ? "if (" : "elseif (")
-			unparse_expr_top(b, arm.condition, names)
+			unparse_expr(u, arm.condition)
 			strings.write_string(b, ")\n")
-			unparse_stmts(b, arm.body, names, level + 1)
+			unparse_stmts_u(u, arm.body, level + 1)
 		}
 		if v.otherwise != nil {
-			write_indent(b, level)
+			write_indent(u, level)
 			strings.write_string(b, "else\n")
-			unparse_stmts(b, v.otherwise, names, level + 1)
+			unparse_stmts_u(u, v.otherwise, level + 1)
 		}
-		write_indent(b, level)
+		write_indent(u, level)
 		strings.write_string(b, "endif\n")
 
 	case ^Stmt_List_Loop:
-		write_indent(b, level)
+		write_indent(u, level)
 		fmt.sbprintf(b, "for %s in (", var_name(names, v.var_id))
-		unparse_expr_top(b, v.list, names)
+		unparse_expr(u, v.list)
 		strings.write_string(b, ")\n")
-		unparse_stmts(b, v.body, names, level + 1)
-		write_indent(b, level)
+		unparse_stmts_u(u, v.body, level + 1)
+		write_indent(u, level)
 		strings.write_string(b, "endfor\n")
 
 	case ^Stmt_Range_Loop:
-		write_indent(b, level)
+		write_indent(u, level)
 		fmt.sbprintf(b, "for %s in [", var_name(names, v.var_id))
-		unparse_expr_top(b, v.from, names)
+		unparse_expr(u, v.from)
 		strings.write_string(b, "..")
-		unparse_expr_top(b, v.to, names)
+		unparse_expr(u, v.to)
 		strings.write_string(b, "]\n")
-		unparse_stmts(b, v.body, names, level + 1)
-		write_indent(b, level)
+		unparse_stmts_u(u, v.body, level + 1)
+		write_indent(u, level)
 		strings.write_string(b, "endfor\n")
 
 	case ^Stmt_While:
-		write_indent(b, level)
+		write_indent(u, level)
 		if v.var_id >= 0 {
 			fmt.sbprintf(b, "while %s (", var_name(names, v.var_id))
 		} else {
 			strings.write_string(b, "while (")
 		}
-		unparse_expr_top(b, v.condition, names)
+		unparse_expr(u, v.condition)
 		strings.write_string(b, ")\n")
-		unparse_stmts(b, v.body, names, level + 1)
-		write_indent(b, level)
+		unparse_stmts_u(u, v.body, level + 1)
+		write_indent(u, level)
 		strings.write_string(b, "endwhile\n")
 
 	case ^Stmt_Fork:
-		write_indent(b, level)
+		write_indent(u, level)
 		if v.var_id >= 0 {
 			fmt.sbprintf(b, "fork %s (", var_name(names, v.var_id))
 		} else {
 			strings.write_string(b, "fork (")
 		}
-		unparse_expr_top(b, v.time, names)
+		unparse_expr(u, v.time)
 		strings.write_string(b, ")\n")
-		unparse_stmts(b, v.body, names, level + 1)
-		write_indent(b, level)
+		unparse_stmts_u(u, v.body, level + 1)
+		write_indent(u, level)
 		strings.write_string(b, "endfork\n")
 
 	case ^Stmt_Expr:
-		write_indent(b, level)
-		unparse_expr_top(b, v.expr, names)
+		write_indent(u, level)
+		unparse_expr(u, v.expr)
 		strings.write_string(b, ";\n")
 
 	case ^Stmt_Return:
-		write_indent(b, level)
+		write_indent(u, level)
 		if v.expr != nil {
 			strings.write_string(b, "return ")
-			unparse_expr_top(b, v.expr, names)
+			unparse_expr(u, v.expr)
 			strings.write_string(b, ";\n")
 		} else {
 			strings.write_string(b, "return;\n")
 		}
 
 	case ^Stmt_Try_Except:
-		write_indent(b, level)
+		write_indent(u, level)
 		strings.write_string(b, "try\n")
-		unparse_stmts(b, v.body, names, level + 1)
+		unparse_stmts_u(u, v.body, level + 1)
 		for arm in v.excepts {
-			write_indent(b, level)
+			write_indent(u, level)
 			strings.write_string(b, "except ")
 			if arm.var_id >= 0 {
 				fmt.sbprintf(b, "%s ", var_name(names, arm.var_id))
 			}
 			strings.write_string(b, "(")
-			unparse_codes(b, arm.codes, names)
+			unparse_codes(u, arm.codes)
 			strings.write_string(b, ")\n")
-			unparse_stmts(b, arm.body, names, level + 1)
+			unparse_stmts_u(u, arm.body, level + 1)
 		}
-		write_indent(b, level)
+		write_indent(u, level)
 		strings.write_string(b, "endtry\n")
 
 	case ^Stmt_Try_Finally:
-		write_indent(b, level)
+		write_indent(u, level)
 		strings.write_string(b, "try\n")
-		unparse_stmts(b, v.body, names, level + 1)
-		write_indent(b, level)
+		unparse_stmts_u(u, v.body, level + 1)
+		write_indent(u, level)
 		strings.write_string(b, "finally\n")
-		unparse_stmts(b, v.handler, names, level + 1)
-		write_indent(b, level)
+		unparse_stmts_u(u, v.handler, level + 1)
+		write_indent(u, level)
 		strings.write_string(b, "endtry\n")
 
 	case ^Stmt_Break:
-		write_indent(b, level)
+		write_indent(u, level)
 		if v.var_id >= 0 {
 			fmt.sbprintf(b, "break %s;\n", var_name(names, v.var_id))
 		} else {
@@ -157,7 +175,7 @@ unparse_stmt :: proc(b: ^strings.Builder, s: Stmt, names: ^Name_Table, level: in
 		}
 
 	case ^Stmt_Continue:
-		write_indent(b, level)
+		write_indent(u, level)
 		if v.var_id >= 0 {
 			fmt.sbprintf(b, "continue %s;\n", var_name(names, v.var_id))
 		} else {
@@ -166,134 +184,189 @@ unparse_stmt :: proc(b: ^strings.Builder, s: Stmt, names: ^Name_Table, level: in
 	}
 }
 
-// unparse_expr_top prints e without an enclosing paren -- used only for the single
-// outermost expression of a statement (an if-condition, a return value, etc.).
-unparse_expr_top :: proc(b: ^strings.Builder, e: Expr, names: ^Name_Table) {
-	unparse_expr(b, e, names, false)
-}
-
-// unparse_expr_nested prints e as an operand of something else: compound expressions get
-// wrapped in parens (see the file header -- this is deliberately conservative).
+// PROP_PREC is prec_table's level for `.`/`:`/`[]` -- the boundary fully_parenthesize tests
+// against.
 @(private = "file")
-unparse_expr_nested :: proc(b: ^strings.Builder, e: Expr, names: ^Name_Table) {
-	unparse_expr(b, e, names, true)
-}
+PROP_PREC :: 9
 
+// expr_prec ports unparse.c's prec_table. (A scattering target isn't in the table -- 0 -- and
+// only ever appears as an assignment's left side, which is never bracketed.)
 @(private = "file")
-is_compound :: proc(e: Expr) -> bool {
-	#partial switch _ in e {
-	case ^Expr_Binary, ^Expr_Unary, ^Expr_Cond, ^Expr_Assign:
-		return true
+expr_prec :: proc(e: Expr) -> int {
+	switch v in e {
+	case ^Expr_Assign:
+		return 1
+	case ^Expr_Cond:
+		return 2
+	case ^Expr_Binary:
+		switch v.op {
+		case .Or, .And:
+			return 3
+		case .Eq, .Ne, .Lt, .Le, .Gt, .Ge, .In:
+			return 4
+		case .Plus, .Minus:
+			return 5
+		case .Times, .Divide, .Mod:
+			return 6
+		case .Exp:
+			return 7
+		}
+	case ^Expr_Unary:
+		return 8
+	case ^Expr_Prop, ^Expr_Verb_Call, ^Expr_Index, ^Expr_Range:
+		return 9
+	case ^Expr_Var, ^Expr_Id, ^Expr_List, ^Expr_Call, ^Expr_Length, ^Expr_Catch:
+		return 10
+	case ^Expr_Scatter:
+		return 0
 	}
-	return false
+	return 10
+}
+
+// bracket_lt/bracket_le port unparse.c's: parenthesize `child` when fully parenthesizing an
+// operator expression, or when its precedence is lower than (lt) / no higher than (le) the
+// parent's.
+@(private = "file")
+bracket_lt :: proc(u: ^Unparser, parent_prec: int, child: Expr) {
+	cp := expr_prec(child)
+	bracket(u, (u.parens && cp < PROP_PREC) || parent_prec > cp, child)
 }
 
 @(private = "file")
-unparse_expr :: proc(b: ^strings.Builder, e: Expr, names: ^Name_Table, paren_if_compound: bool) {
-	wrap := paren_if_compound && is_compound(e)
+bracket_le :: proc(u: ^Unparser, parent_prec: int, child: Expr) {
+	cp := expr_prec(child)
+	bracket(u, (u.parens && cp < PROP_PREC) || parent_prec >= cp, child)
+}
+
+@(private = "file")
+bracket :: proc(u: ^Unparser, wrap: bool, child: Expr) {
 	if wrap {
-		strings.write_byte(b, '(')
+		strings.write_byte(u.b, '(')
 	}
+	unparse_expr(u, child)
+	if wrap {
+		strings.write_byte(u.b, ')')
+	}
+}
+
+// unparse_name_expr ports unparse_name_expr(): the name part of `.name`/`:name` is written bare
+// when it's a string literal shaped like an identifier, else as `(expr)`.
+@(private = "file")
+unparse_name_expr :: proc(u: ^Unparser, e: Expr) {
+	if lit, ok := e.(^Expr_Var); ok && lit.value.type == .Str && is_identifier_like(lit.value.data.str.s) {
+		strings.write_string(u.b, lit.value.data.str.s)
+		return
+	}
+	strings.write_byte(u.b, '(')
+	unparse_expr(u, e)
+	strings.write_byte(u.b, ')')
+}
+
+@(private = "file")
+unparse_expr :: proc(u: ^Unparser, e: Expr) {
+	b, names := u.b, u.names
 	switch v in e {
 	case ^Expr_Var:
 		unparse_literal(b, v.value)
 	case ^Expr_Id:
 		strings.write_string(b, var_name(names, v.var_id))
 	case ^Expr_Prop:
-		// `#0.foo` prints as `$foo`, undoing the parser's desugaring exactly as unparse.c's
-		// EXPR_PROP case does -- otherwise every corified reference in a core (`$string_utils`,
-		// `$recycler`) comes back from verb_code()/@list as `#0.string_utils`, and an @edit
-		// round trip through set_verb_code() would bake that form into the database source.
+		// `#0.foo` prints as `$foo`, undoing the parser's desugaring.
 		if name, ok := dollar_name(v.obj, v.prop); ok {
 			strings.write_byte(b, '$')
 			strings.write_string(b, name)
 		} else {
-			unparse_expr_nested(b, v.obj, names)
-			if lit, ok := v.prop.(^Expr_Var); ok && lit.value.type == .Str && is_identifier_like(lit.value.data.str.s) {
-				strings.write_byte(b, '.')
-				strings.write_string(b, lit.value.data.str.s)
-			} else {
-				strings.write_string(b, ".(")
-				unparse_expr_top(b, v.prop, names)
-				strings.write_byte(b, ')')
+			bracket_lt(u, 9, v.obj)
+			if lit, ok := v.obj.(^Expr_Var); ok && lit.value.type == .Int {
+				strings.write_byte(b, ' ') // so `1 .foo` doesn't lex as the float `1.`
 			}
+			strings.write_byte(b, '.')
+			unparse_name_expr(u, v.prop)
 		}
 	case ^Expr_Verb_Call:
-		// Likewise `#0:foo(args)` prints as `$foo(args)` (unparse.c's EXPR_VERB case).
 		if name, ok := dollar_name(v.obj, v.verb); ok {
 			strings.write_byte(b, '$')
 			strings.write_string(b, name)
 		} else {
-			unparse_expr_nested(b, v.obj, names)
-			if lit, ok := v.verb.(^Expr_Var); ok && lit.value.type == .Str && is_identifier_like(lit.value.data.str.s) {
-				strings.write_byte(b, ':')
-				strings.write_string(b, lit.value.data.str.s)
-			} else {
-				strings.write_string(b, ":(")
-				unparse_expr_top(b, v.verb, names)
-				strings.write_byte(b, ')')
-			}
+			bracket_lt(u, 9, v.obj)
+			strings.write_byte(b, ':')
+			unparse_name_expr(u, v.verb)
 		}
 		strings.write_byte(b, '(')
-		unparse_args(b, v.args, names)
+		unparse_args(u, v.args)
 		strings.write_byte(b, ')')
 	case ^Expr_Index:
-		unparse_expr_nested(b, v.base, names)
+		bracket_lt(u, 9, v.base)
 		strings.write_byte(b, '[')
-		unparse_expr_top(b, v.index, names)
+		unparse_expr(u, v.index)
 		strings.write_byte(b, ']')
 	case ^Expr_Range:
-		unparse_expr_nested(b, v.base, names)
+		bracket_lt(u, 9, v.base)
 		strings.write_byte(b, '[')
-		unparse_expr_top(b, v.from, names)
+		unparse_expr(u, v.from)
 		strings.write_string(b, "..")
-		unparse_expr_top(b, v.to, names)
+		unparse_expr(u, v.to)
 		strings.write_byte(b, ']')
 	case ^Expr_Assign:
-		unparse_expr_nested(b, v.target, names)
+		unparse_expr(u, v.target)
 		strings.write_string(b, " = ")
-		unparse_expr_nested(b, v.value, names)
+		unparse_expr(u, v.value)
 	case ^Expr_Call:
-		strings.write_string(b, v.name)
-		strings.write_byte(b, '(')
-		unparse_args(b, v.args, names)
+		if v.is_known {
+			strings.write_string(b, v.name)
+			strings.write_byte(b, '(')
+			unparse_args(u, v.args)
+		} else {
+			// The parser compiled an unknown `foo(...)` to call_function("foo", ...), and
+			// that is what the original's decompiler shows.
+			strings.write_string(b, "call_function(")
+			unparse_string_literal(b, v.name)
+			if len(v.args) > 0 {
+				strings.write_string(b, ", ")
+				unparse_args(u, v.args)
+			}
+		}
 		strings.write_byte(b, ')')
 	case ^Expr_Binary:
-		unparse_expr_nested(b, v.lhs, names)
-		strings.write_string(b, binop_text(v.op))
-		unparse_expr_nested(b, v.rhs, names)
+		prec := expr_prec(e)
+		if v.op == .Exp { // right-associative
+			bracket_le(u, prec, v.lhs)
+			strings.write_string(b, binop_text(v.op))
+			bracket_lt(u, prec, v.rhs)
+		} else {
+			bracket_lt(u, prec, v.lhs)
+			strings.write_string(b, binop_text(v.op))
+			bracket_le(u, prec, v.rhs)
+		}
 	case ^Expr_Unary:
 		strings.write_string(b, v.op == .Not ? "!" : "-")
-		unparse_expr_nested(b, v.operand, names)
+		bracket_lt(u, 8, v.operand)
 	case ^Expr_List:
 		strings.write_byte(b, '{')
-		unparse_args(b, v.items, names)
+		unparse_args(u, v.items)
 		strings.write_byte(b, '}')
 	case ^Expr_Cond:
-		unparse_expr_nested(b, v.condition, names)
+		bracket_le(u, 2, v.condition)
 		strings.write_string(b, " ? ")
-		unparse_expr_nested(b, v.consequent, names)
+		unparse_expr(u, v.consequent)
 		strings.write_string(b, " | ")
-		unparse_expr_nested(b, v.alternate, names)
+		bracket_le(u, 2, v.alternate)
 	case ^Expr_Catch:
 		strings.write_byte(b, '`')
-		unparse_expr_top(b, v.try, names)
+		unparse_expr(u, v.try)
 		strings.write_string(b, " ! ")
-		unparse_codes(b, v.codes, names)
+		unparse_codes(u, v.codes)
 		if v.handler != nil {
 			strings.write_string(b, " => ")
-			unparse_expr_top(b, v.handler, names)
+			unparse_expr(u, v.handler)
 		}
 		strings.write_byte(b, '\'')
 	case ^Expr_Length:
 		strings.write_byte(b, '$')
 	case ^Expr_Scatter:
 		strings.write_byte(b, '{')
-		unparse_scatter(b, v.items, names)
+		unparse_scatter(u, v.items)
 		strings.write_byte(b, '}')
-	}
-	if wrap {
-		strings.write_byte(b, ')')
 	}
 }
 
@@ -320,29 +393,30 @@ binop_text :: proc(op: Binary_Op) -> string {
 }
 
 @(private = "file")
-unparse_args :: proc(b: ^strings.Builder, args: []Arg, names: ^Name_Table) {
+unparse_args :: proc(u: ^Unparser, args: []Arg) {
 	for a, i in args {
 		if i > 0 {
-			strings.write_string(b, ", ")
+			strings.write_string(u.b, ", ")
 		}
 		if a.splice {
-			strings.write_byte(b, '@')
+			strings.write_byte(u.b, '@')
 		}
-		unparse_expr_nested(b, a.expr, names)
+		unparse_expr(u, a.expr)
 	}
 }
 
 @(private = "file")
-unparse_codes :: proc(b: ^strings.Builder, codes: []Arg, names: ^Name_Table) {
+unparse_codes :: proc(u: ^Unparser, codes: []Arg) {
 	if codes == nil {
-		strings.write_string(b, "ANY")
+		strings.write_string(u.b, "ANY")
 		return
 	}
-	unparse_args(b, codes, names)
+	unparse_args(u, codes)
 }
 
 @(private = "file")
-unparse_scatter :: proc(b: ^strings.Builder, items: []Scatter_Item, names: ^Name_Table) {
+unparse_scatter :: proc(u: ^Unparser, items: []Scatter_Item) {
+	b, names := u.b, u.names
 	for it, i in items {
 		if i > 0 {
 			strings.write_string(b, ", ")
@@ -358,7 +432,7 @@ unparse_scatter :: proc(b: ^strings.Builder, items: []Scatter_Item, names: ^Name
 			strings.write_string(b, var_name(names, it.var_id))
 			if it.default != nil {
 				strings.write_string(b, " = ")
-				unparse_expr_nested(b, it.default, names)
+				unparse_expr(u, it.default)
 			}
 		}
 	}
@@ -431,21 +505,9 @@ unparse_literal :: proc(b: ^strings.Builder, v: values.Var) {
 
 @(private = "file")
 unparse_float :: proc(b: ^strings.Builder, f: f64) {
-	// MOO float literals always contain a `.` or exponent so they don't get lexed back as
-	// integers on reparse; Odin's %g can omit both for whole numbers (e.g. "5"), so force one.
-	s := fmt.tprintf("%g", f)
-	defer delete(s, context.temp_allocator)
-	has_marker := false
-	for c in s {
-		if c == '.' || c == 'e' || c == 'E' || c == 'n' || c == 'i' { // 'n'/'i' catch nan/inf
-			has_marker = true
-			break
-		}
-	}
-	strings.write_string(b, s)
-	if !has_marker {
-		strings.write_string(b, ".0")
-	}
+	// The decompiler prints a float literal exactly as tostr() would (unparse_value's "%g"
+	// through stream_printf), which always includes a `.` or an exponent.
+	strings.write_string(b, values.format_float(f, context.temp_allocator))
 }
 
 @(private = "file")

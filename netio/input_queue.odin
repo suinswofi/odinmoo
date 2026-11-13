@@ -37,53 +37,169 @@ import "core:container/queue"
 import "core:net"
 import "core:strings"
 import "core:sync"
+import "core:time"
 
-@(private = "file")
-option_types := map[string]values.Var_Type {
-	"binary"             = .Int,
-	"hold-input"         = .Int,
-	"disable-oob"        = .Int,
-	"intrinsic-commands" = .List,
-	"flush-command"      = .Str,
-	"client-echo"        = .Int,
+// Intrinsic commands, in ICMD_FOR_EACH's order (which is the order the "intrinsic-commands"
+// option lists them in).
+Icmd :: enum {
+	Program,
+	Prefix,
+	Suffix,
+	Outputprefix,
+	Outputsuffix,
 }
 
-init_option_defaults :: proc() -> map[string]values.Var {
-	m := make(map[string]values.Var)
-	m["binary"] = values.int_val(0)
-	m["hold-input"] = values.int_val(0)
-	m["disable-oob"] = values.int_val(0)
-	m["intrinsic-commands"] = values.empty_list()
-	m["flush-command"] = values.str_val(strings.clone(""))
-	m["client-echo"] = values.int_val(1)
-	return m
+ALL_ICMDS :: bit_set[Icmd]{.Program, .Prefix, .Suffix, .Outputprefix, .Outputsuffix}
+
+@(private = "file")
+icmd_names := [Icmd]string {
+	.Program      = ".program",
+	.Prefix       = "PREFIX",
+	.Suffix       = "SUFFIX",
+	.Outputprefix = "OUTPUTPREFIX",
+	.Outputsuffix = "OUTPUTSUFFIX",
+}
+
+// icmd_index ports tasks.c's icmd_index(): `.program` matches as the verb pattern ".pr*ogram"
+// does (any case, abbreviable to ".pr"); the four delimiter commands match exactly, case
+// included.
+icmd_index :: proc(verb: string) -> (Icmd, bool) {
+	switch verb {
+	case "PREFIX":
+		return .Prefix, true
+	case "SUFFIX":
+		return .Suffix, true
+	case "OUTPUTPREFIX":
+		return .Outputprefix, true
+	case "OUTPUTSUFFIX":
+		return .Outputsuffix, true
+	}
+	full := ".program"
+	if len(verb) >= 3 && len(verb) <= len(full) && values.strings_equal_fold(verb, full[:len(verb)]) {
+		return .Program, true
+	}
+	return .Program, false
+}
+
+// Conn_Options is a connection's option set -- the union of the original's SERVER_CO_TABLE
+// (binary), TASK_CO_TABLE (flush-command, hold-input, disable-oob, intrinsic-commands) and
+// NETWORK_CO_TABLE (client-echo). Guarded by Connection.io_lock.
+Conn_Options :: struct {
+	binary:      bool, // stored, inert -- see CLAUDE.md
+	flush_cmd:   string, // owned; "" = no flush command
+	hold_input:  bool,
+	disable_oob: bool,
+	icmds:       bit_set[Icmd],
+	client_echo: bool,
+}
+
+@(private = "file")
+option_names := [?]string{"binary", "flush-command", "hold-input", "disable-oob", "intrinsic-commands", "client-echo"}
+
+// init_option_defaults is find_tqueue()'s and new_nhandle()'s initial state. flush_cmd is
+// default_flush_command(): $server_options.default_flush_command, or ".flush" -- worked out
+// by the caller, which holds big_lock.
+init_option_defaults :: proc(flush_cmd: string) -> Conn_Options {
+	return Conn_Options{flush_cmd = strings.clone(flush_cmd), icmds = ALL_ICMDS, client_echo = true}
+}
+
+// option_value is an option's current value as a MOO value (CONNECTION_OPTION_GET). Caller
+// holds io_lock.
+@(private = "file")
+option_value :: proc(o: ^Conn_Options, name: string) -> (values.Var, bool) {
+	switch {
+	case values.strings_equal_fold(name, "binary"):
+		return values.int_val(o.binary ? 1 : 0), true
+	case values.strings_equal_fold(name, "flush-command"):
+		return values.str_val(strings.clone(o.flush_cmd)), true
+	case values.strings_equal_fold(name, "hold-input"):
+		return values.int_val(o.hold_input ? 1 : 0), true
+	case values.strings_equal_fold(name, "disable-oob"):
+		return values.int_val(o.disable_oob ? 1 : 0), true
+	case values.strings_equal_fold(name, "intrinsic-commands"):
+		items: [dynamic]values.Var
+		for c in Icmd {
+			if c in o.icmds {
+				append(&items, values.str_val(strings.clone(icmd_names[c])))
+			}
+		}
+		shrink(&items)
+		return values.list_val(items[:]), true
+	case values.strings_equal_fold(name, "client-echo"):
+		return values.int_val(o.client_echo ? 1 : 0), true
+	}
+	return {}, false
 }
 
 connection_io_destroy :: proc(conn: ^Connection) {
 	sync.mutex_lock(&conn.io_lock)
 	tid := conn.reader_task_id
 	conn.reader_task_id = 0
-	for _, v in conn.options {
-		values.free_var(v)
-	}
-	delete(conn.options)
+	delete(conn.options.flush_cmd)
+	conn.options.flush_cmd = ""
 	clear_pending_locked(conn)
+	for queue.len(conn.oob_lines) > 0 {
+		delete(queue.pop_front(&conn.oob_lines))
+	}
+	queue.destroy(&conn.oob_lines)
 	queue.destroy(&conn.pending_lines)
 	sync.mutex_unlock(&conn.io_lock)
 	if tid != 0 {
-		// The connection is gone while a task was parked in read() on it -- wake it with an
-		// empty string rather than leaving it blocked forever. A real, if degraded, default:
+		// The connection is gone while a task was parked in read() on it: it is resumed with
+		// E_INVARG, as run_ready_tasks does for a reading task that is out of input.
 		// the original doesn't have a clean answer for this case either (a reading_vm just
 		// gets abandoned/freed on connection close).
-		wake_reader(conn.server.scheduler, tid, strings.clone(""))
+		wake_reader_closed(conn.server.scheduler, tid)
 	}
 }
 
 // on_incoming_line handles a line read directly off conn's own socket -- see header for why
 // it queues rather than dispatching on the recv thread.
 on_incoming_line :: proc(conn: ^Connection, line: string) {
-	deliver(conn, strings.clone(line), false, true)
+	sync.mutex_lock(&conn.io_lock)
+	conn.last_activity = time.now() // server_receive_line: what idle_seconds() and connect_timeout measure
+	flush := conn.options.flush_cmd != "" && values.strings_equal_fold(line, conn.options.flush_cmd)
+	oob := !conn.options.disable_oob && strings.has_prefix(line, OUT_OF_BAND_PREFIX)
+	quoted := !conn.options.disable_oob && strings.has_prefix(line, OUT_OF_BAND_QUOTE_PREFIX)
+	sync.mutex_unlock(&conn.io_lock)
+	switch {
+	case flush:
+		// new_input_task: the flush command is never queued, it empties the queue.
+		flush_pending(conn, true)
+	case oob:
+		// Out-of-band lines skip the in-band queue entirely: they go to
+		// #0:do_out_of_band_command even while hold-input is set or a read() is waiting, and
+		// read() never sees them (dequeue_input_task's DQ_OOB/DQ_INBAND split).
+		//
+		// Bounded exactly like the in-band queue (MAX_QUEUED_INPUT, in bytes and in lines): this
+		// is reachable before login, and a client sending these faster than
+		// do_out_of_band_command runs would otherwise grow it without limit.
+		sync.mutex_lock(&conn.io_lock)
+		overflow := conn.oob_bytes + len(line) > MAX_QUEUED_INPUT || queue.len(conn.oob_lines) >= MAX_QUEUED_INPUT
+		if overflow {
+			for queue.len(conn.oob_lines) > 0 {
+				delete(queue.pop_front(&conn.oob_lines))
+			}
+			conn.oob_bytes = 0
+		}
+		queue.push_back(&conn.oob_lines, strings.clone(line))
+		conn.oob_bytes += len(line)
+		sync.mutex_unlock(&conn.io_lock)
+		if overflow {
+			send_line(conn, ">> Input buffer overflow: previous input from you has been lost <<")
+		}
+		spawn_drain(conn)
+	case quoted:
+		// OUT_OF_BAND_QUOTE_PREFIX: an in-band line that would otherwise look out-of-band.
+		deliver(conn, strings.clone(line[len(OUT_OF_BAND_QUOTE_PREFIX):]), false, true)
+	case:
+		deliver(conn, strings.clone(line), false, true)
+	}
 }
+
+// OUT_OF_BAND_PREFIX/OUT_OF_BAND_QUOTE_PREFIX are options.h's (LambdaMOO's MCP convention).
+OUT_OF_BAND_PREFIX :: "#$#"
+OUT_OF_BAND_QUOTE_PREFIX :: "#$\""
 
 // on_forced_line handles a force_input()'d line -- see header for why it must never
 // synchronously dispatch.
@@ -110,7 +226,7 @@ deliver :: proc(conn: ^Connection, line: string, at_front: bool, from_other_thre
 		// reader_task_id because a NEW read() may legitimately have parked meanwhile.
 		sync.mutex_lock(&conn.io_lock)
 	}
-	hold := values.is_true(conn.options["hold-input"])
+	hold := conn.options.hold_input
 	if hold || from_other_thread {
 		if len(line) > MAX_QUEUED_INPUT {
 			// One line bigger than the whole queue's budget. The socket path cannot produce this
@@ -161,6 +277,22 @@ deliver :: proc(conn: ^Connection, line: string, at_front: bool, from_other_thre
 // of `line` either way (bf_resume consumes its args even on failure); returns whether the
 // task actually received it, so deliver() can fall back with its own copy instead of
 // letting the line vanish when the reader died racing the delivery.
+// wake_reader_closed ends a read() whose connection has gone away: run_ready_tasks resumes a
+// reading task that is out of input with E_INVARG, which read() then RAISES (an error resume
+// value is raised, not returned -- see tasks.resumed_result).
+wake_reader_closed :: proc(s: ^tasks.Scheduler, task_id: int) {
+	args := make([]values.Var, 2)
+	args[0] = values.int_val(i32(task_id))
+	args[1] = values.err_val(.E_INVARG)
+	rr := tasks.bf_resume(s, values.list_val(args))
+	if rr.raised {
+		delete(rr.msg)
+		values.free_var(rr.rvalue)
+	} else {
+		values.free_var(rr.value)
+	}
+}
+
 wake_reader :: proc(s: ^tasks.Scheduler, task_id: int, line: string) -> (delivered: bool) {
 	args := make([]values.Var, 2)
 	args[0] = values.int_val(i32(task_id))
@@ -222,7 +354,14 @@ drain_thread_proc :: proc(data: rawptr) {
 	defer free_all(context.temp_allocator)
 	for {
 		sync.mutex_lock(&conn.io_lock)
-		if values.is_true(conn.options["hold-input"]) || queue.len(conn.pending_lines) == 0 || conn.reader_task_id != 0 {
+		if queue.len(conn.oob_lines) > 0 {
+			oob := queue.pop_front(&conn.oob_lines)
+			conn.oob_bytes -= len(oob)
+			sync.mutex_unlock(&conn.io_lock)
+			dispatch_oob(conn, oob)
+			continue
+		}
+		if conn.options.hold_input || queue.len(conn.pending_lines) == 0 || conn.reader_task_id != 0 {
 			conn.drain_running = false
 			sync.mutex_unlock(&conn.io_lock)
 			return
@@ -324,7 +463,7 @@ hook_unregister_reader :: proc(user_data: rawptr, player: values.Objid, task_id:
 	// The drain worker stands down while a reader is parked; if lines queued up in the
 	// meantime (or the read consumed only some of them), restart it now that the reader is
 	// gone, or they'd sit until the next line happened to arrive.
-	kick := queue.len(conn.pending_lines) > 0 && !values.is_true(conn.options["hold-input"])
+	kick := queue.len(conn.pending_lines) > 0 && !conn.options.hold_input
 	sync.mutex_unlock(&conn.io_lock)
 	if kick {
 		spawn_drain(conn)
@@ -351,15 +490,46 @@ hook_flush_input :: proc(user_data: rawptr, player: values.Objid, show_messages:
 	if !found {
 		return false
 	}
-	sync.mutex_lock(&conn.io_lock)
-	clear_pending_locked(conn)
-	sync.mutex_unlock(&conn.io_lock)
-	if show_messages {
-		send_line(conn, "*** Flushed ***")
-	}
+	flush_pending(conn, show_messages)
 	return true
 }
 
+// flush_pending ports tasks.c's flush_input(): discard the queued in-band input, listing it if
+// asked to.
+flush_pending :: proc(conn: ^Connection, show_messages: bool) {
+	sync.mutex_lock(&conn.io_lock)
+	lines: [dynamic]string
+	for queue.len(conn.pending_lines) > 0 {
+		append(&lines, queue.pop_front(&conn.pending_lines))
+	}
+	conn.pending_bytes = 0
+	sync.mutex_unlock(&conn.io_lock)
+	defer {
+		for l in lines {
+			delete(l)
+		}
+		delete(lines)
+	}
+	if !show_messages {
+		return
+	}
+	if len(lines) == 0 {
+		send_line_raw(conn, ">> No pending input to flush...")
+		return
+	}
+	send_line_raw(conn, ">> Flushing the following pending input:")
+	for l in lines {
+		msg := strings.concatenate({">>     ", l})
+		send_line_raw(conn, msg)
+		delete(msg)
+	}
+	send_line_raw(conn, ">> (Done flushing)")
+}
+
+// hook_set_connection_option ports the CONNECTION_OPTION_SET tables: names match in any case,
+// and values are coerced the way the original coerces them -- a flag option takes the truth of
+// any value, flush-command takes a non-empty string (anything else removes it), and
+// intrinsic-commands takes a truth value (all or none) or a list of command names.
 hook_set_connection_option :: proc(user_data: rawptr, player: values.Objid, option: string, value: values.Var) -> bool {
 	s := (^Server)(user_data)
 	sync.mutex_lock(&s.players_lock)
@@ -368,20 +538,56 @@ hook_set_connection_option :: proc(user_data: rawptr, player: values.Objid, opti
 	if !found {
 		return false
 	}
-	want_type, known := option_types[option]
-	if !known || value.type != want_type {
+	sync.mutex_lock(&conn.io_lock)
+	o := &conn.options
+	hold_input_cleared, echo_changed := false, false
+	switch {
+	case values.strings_equal_fold(option, "binary"):
+		o.binary = values.is_true(value)
+	case values.strings_equal_fold(option, "flush-command"):
+		delete(o.flush_cmd)
+		o.flush_cmd = value.type == .Str ? strings.clone(value.data.str.s) : ""
+	case values.strings_equal_fold(option, "hold-input"):
+		o.hold_input = values.is_true(value)
+		hold_input_cleared = !o.hold_input
+	case values.strings_equal_fold(option, "disable-oob"):
+		o.disable_oob = values.is_true(value)
+	case values.strings_equal_fold(option, "intrinsic-commands"):
+		flags: bit_set[Icmd]
+		#partial switch value.type {
+		case .Int:
+			flags = values.is_true(value) ? ALL_ICMDS : {}
+		case .List:
+			for i in 1 ..= values.list_len(value) {
+				item := values.list_get(value, i)
+				if item.type != .Str {
+					sync.mutex_unlock(&conn.io_lock)
+					return false
+				}
+				c, ok := icmd_index(item.data.str.s)
+				if !ok {
+					sync.mutex_unlock(&conn.io_lock)
+					return false
+				}
+				flags += {c}
+			}
+		case:
+			sync.mutex_unlock(&conn.io_lock)
+			return false
+		}
+		o.icmds = flags
+	case values.strings_equal_fold(option, "client-echo"):
+		o.client_echo = values.is_true(value)
+		echo_changed = true
+	case:
+		sync.mutex_unlock(&conn.io_lock)
 		return false
 	}
-	sync.mutex_lock(&conn.io_lock)
-	if old, ok := conn.options[option]; ok {
-		values.free_var(old)
-	}
-	conn.options[option] = values.var_ref(value)
-	hold_input_cleared := option == "hold-input" && !values.is_true(value)
+	echo := o.client_echo
 	sync.mutex_unlock(&conn.io_lock)
 
-	if option == "client-echo" {
-		send_telnet_echo_negotiation(conn, values.is_true(value))
+	if echo_changed {
+		send_telnet_echo_negotiation(conn, echo)
 	}
 	if hold_input_cleared {
 		spawn_drain(conn)
@@ -399,11 +605,7 @@ hook_connection_option :: proc(user_data: rawptr, player: values.Objid, option: 
 	}
 	sync.mutex_lock(&conn.io_lock)
 	defer sync.mutex_unlock(&conn.io_lock)
-	v, exists := conn.options[option]
-	if !exists {
-		return {}, false
-	}
-	return values.var_ref(v), true
+	return option_value(&conn.options, option)
 }
 
 hook_connection_options :: proc(user_data: rawptr, player: values.Objid) -> (list: values.Var, found: bool) {
@@ -416,14 +618,12 @@ hook_connection_options :: proc(user_data: rawptr, player: values.Objid) -> (lis
 	}
 	sync.mutex_lock(&conn.io_lock)
 	defer sync.mutex_unlock(&conn.io_lock)
-	pairs := make([]values.Var, len(conn.options))
-	i := 0
-	for name, v in conn.options {
+	pairs := make([]values.Var, len(option_names))
+	for name, i in option_names {
 		entry := make([]values.Var, 2)
 		entry[0] = values.str_val(strings.clone(name))
-		entry[1] = values.var_ref(v)
+		entry[1], _ = option_value(&conn.options, name)
 		pairs[i] = values.list_val(entry)
-		i += 1
 	}
 	return values.list_val(pairs), true
 }

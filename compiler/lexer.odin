@@ -63,7 +63,7 @@ lower :: proc(b: byte) -> byte {return b >= 'A' && b <= 'Z' ? b + 32 : b}
 
 @(private = "file")
 lex_error :: proc(l: ^Lexer, msg: string) {
-	append(&l.errors, fmt.aprintfln("Line %d:  %s", l.line, msg))
+	append(&l.errors, fmt.aprintf("Line %d:  %s", l.line, msg))
 }
 
 // next_token ports yylex() body-for-body: skip whitespace/comments, then dispatch on the

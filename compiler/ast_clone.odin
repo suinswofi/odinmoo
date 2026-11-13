@@ -27,21 +27,24 @@ clone_stmt :: proc(s: Stmt) -> Stmt {
 	switch v in s {
 	case ^Stmt_Cond:
 		c := new(Stmt_Cond)
+		c.line = v.line
 		arms := make([]Cond_Arm, len(v.arms))
 		for arm, i in v.arms {
-			arms[i] = Cond_Arm{condition = clone_expr(arm.condition), body = clone_stmts(arm.body)}
+			arms[i] = Cond_Arm{line = arm.line, condition = clone_expr(arm.condition), body = clone_stmts(arm.body)}
 		}
 		c.arms = arms
 		c.otherwise = clone_stmts(v.otherwise)
 		return c
 	case ^Stmt_List_Loop:
 		c := new(Stmt_List_Loop)
+		c.line = v.line
 		c.var_id = v.var_id
 		c.list = clone_expr(v.list)
 		c.body = clone_stmts(v.body)
 		return c
 	case ^Stmt_Range_Loop:
 		c := new(Stmt_Range_Loop)
+		c.line = v.line
 		c.var_id = v.var_id
 		c.from = clone_expr(v.from)
 		c.to = clone_expr(v.to)
@@ -49,44 +52,52 @@ clone_stmt :: proc(s: Stmt) -> Stmt {
 		return c
 	case ^Stmt_While:
 		c := new(Stmt_While)
+		c.line = v.line
 		c.var_id = v.var_id
 		c.condition = clone_expr(v.condition)
 		c.body = clone_stmts(v.body)
 		return c
 	case ^Stmt_Fork:
 		c := new(Stmt_Fork)
+		c.line = v.line
 		c.var_id = v.var_id
 		c.time = clone_expr(v.time)
 		c.body = clone_stmts(v.body)
 		return c
 	case ^Stmt_Expr:
 		c := new(Stmt_Expr)
+		c.line = v.line
 		c.expr = clone_expr(v.expr)
 		return c
 	case ^Stmt_Return:
 		c := new(Stmt_Return)
+		c.line = v.line
 		c.expr = clone_expr(v.expr)
 		return c
 	case ^Stmt_Try_Except:
 		c := new(Stmt_Try_Except)
+		c.line = v.line
 		c.body = clone_stmts(v.body)
 		excepts := make([]Except_Arm, len(v.excepts))
 		for arm, i in v.excepts {
-			excepts[i] = Except_Arm{var_id = arm.var_id, codes = clone_args(arm.codes), body = clone_stmts(arm.body)}
+			excepts[i] = Except_Arm{line = arm.line, var_id = arm.var_id, codes = clone_args(arm.codes), body = clone_stmts(arm.body)}
 		}
 		c.excepts = excepts
 		return c
 	case ^Stmt_Try_Finally:
 		c := new(Stmt_Try_Finally)
+		c.line = v.line
 		c.body = clone_stmts(v.body)
 		c.handler = clone_stmts(v.handler)
 		return c
 	case ^Stmt_Break:
 		c := new(Stmt_Break)
+		c.line = v.line
 		c.var_id = v.var_id
 		return c
 	case ^Stmt_Continue:
 		c := new(Stmt_Continue)
+		c.line = v.line
 		c.var_id = v.var_id
 		return c
 	}

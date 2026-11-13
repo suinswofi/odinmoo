@@ -73,7 +73,10 @@ test_shutdown_and_dump_database_invoke_hooks :: proc(t: ^testing.T) {
 	testing.expect(t, !sr.raised)
 	values.free_var(sr.value)
 	testing.expect(t, rec.shutdown_called)
-	testing.expect(t, rec.shutdown_message == "going down")
+	// bf_shutdown's message: "shutdown() called by <name> (#N): <arg>", the text every
+	// connection is then sent as "*** Shutting down: ... ***".
+	testing.expect(t, strings.has_prefix(rec.shutdown_message, "shutdown() called by "))
+	testing.expect(t, strings.has_suffix(rec.shutdown_message, ": going down"))
 
 	dr := bf_dump_database(&ow, values.empty_list(), &ctx)
 	testing.expect(t, !dr.raised)

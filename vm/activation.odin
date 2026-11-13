@@ -29,6 +29,13 @@ Activation :: struct {
 	programmer: values.Objid, // permissions the running code executes as
 	verb_loc:   values.Objid, // object the verb is defined on
 	verb_name:  string, // borrowed
+	// verb_names is the verbdef's full name string ("l*ook examine"), borrowed -- what a
+	// traceback prints (the original's RUN_ACTIV.verbname, as opposed to RUN_ACTIV.verb,
+	// which is verb_name). "" means "same as verb_name".
+	verb_names: string,
+	// line is the listing line of the statement this activation is executing (see
+	// compiler/lines.odin) -- the original's find_line_number(prog, error_pc).
+	line:       int,
 	debug:      bool, // controls whether operator errors raise (catchable) or become inline ERR values
 	// bi_func_name is set when a BUILT-IN dispatched this verb (move() calling :enterfunc,
 	// create() calling :initialize, ...), naming that built-in. It exists so callers()
@@ -38,6 +45,10 @@ Activation :: struct {
 	// $perm_utils:invoked_by_function("move") is how a room's :enterfunc verifies it was
 	// called by move() and not by a player, so an absent frame turns every move into E_PERM.
 	bi_func_name: string, // "" for an ordinary verb-to-verb call; never owned (static name)
+	// bi_func_pc is the built-in's own resumption point when it made this call (move()'s
+	// :accept is 2, :exitfunc 3, :enterfunc 4, ...) -- what make_stack_list reports as the
+	// synthetic frame's "line".
+	bi_func_pc: int,
 	task_id:    int, // identifies the enclosing task (Phase 6); shared by every nested verb call within it
 	depth:      int, // 0 = this activation is a task's root call (invoked directly by the
 	// server, not by another verb); N = N verb calls deep. Lets callers() (see
@@ -130,6 +141,9 @@ Error_Info :: struct {
 	// would be useless), mirroring the fact that the original kills an out-of-ticks task
 	// outright rather than raising anything MOO code could handle.
 	uncatchable: bool,
+	// serial names this error's entry in the task's frame record (traceback.odin). 0 means
+	// no frames were recorded for it.
+	serial: int,
 }
 
 error_info_destroy :: proc(e: ^Error_Info) {
@@ -164,6 +178,7 @@ Call_Result :: struct {
 	// there). Only the latter is subject to the caller's `d` flag -- see call_to_expr.
 	unwinding: bool,
 	uncatchable: bool, // see Error_Info.uncatchable; carried across the verb-call boundary
+	serial: int, // see Error_Info.serial; carried across the verb-call boundary
 }
 
 call_ok :: proc(v: values.Var) -> Call_Result {return Call_Result{value = v}}
@@ -187,7 +202,8 @@ World :: struct {
 	// implementation must bind the new task's id there in the CALLING activation's locals
 	// before snapshotting them, so both the parent and the forked task see it (tasks.c's
 	// enqueue_forked_task2 mutates the shared rt_env before copy_rt_env).
-	do_fork:      proc(w: ^World, delay: values.Var, body: []compiler.Stmt, names: ^compiler.Name_Table, var_id: int, ctx: ^Eval_Context),
+	// Returns E_QUOTA when the forking verb's owner is at its queued_task_limit, else E_NONE.
+	do_fork:      proc(w: ^World, delay: values.Var, body: []compiler.Stmt, names: ^compiler.Name_Table, var_id: int, ctx: ^Eval_Context) -> values.Error,
 	// fork_data is do_fork's own opaque state, kept separate from user_data because the two
 	// hooks belong to different layers: user_data is the object-DB implementation (objdb's
 	// Object_World), while do_fork is supplied by the scheduler (tasks), which the DB layer
@@ -198,4 +214,17 @@ World :: struct {
 	// in one process, or just two tests running in parallel: the fork then locks the WRONG
 	// big_lock and runs MOO code on a database nobody is serializing access to).
 	fork_data:    rawptr,
+	// task_limits answers the tick/second/depth allowance for a task about to run (or resume):
+	// the original's run_interpreter reads $server_options.fg_*/bg_* every time. nil means the
+	// options.h defaults.
+	task_limits:  proc(w: ^World, background: bool) -> Task_Limits,
+	// task_aborted is called by a task's outermost runner when the task ends with an error
+	// nobody caught (or a timeout): the original's run_interpreter hands it to
+	// #0:handle_uncaught_error / #0:handle_task_timeout and otherwise prints the traceback to
+	// the task's player. nil means drop it.
+	task_aborted: proc(w: ^World, err: ^Error_Info, root: ^Activation),
+	// queued_task_limit reports how many forked/suspended tasks `programmer` may have queued
+	// at once (tasks.c's check_user_task_limit: the programmer's own .queued_task_limit, else
+	// $server_options.queued_task_limit), or -1 for no limit. nil means no limit.
+	queued_task_limit: proc(w: ^World, programmer: values.Objid) -> int,
 }

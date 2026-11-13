@@ -38,9 +38,14 @@ checkpoint_pending: sync.Wait_Group
 // background thread. Returns true if the snapshot was taken; the write itself is
 // asynchronous, matching the original's fire-and-forget dump_database() -- write failures
 // are logged by the writer thread, not reported back.
-checkpoint :: proc(db: ^dbfile.Database, scheduler: ^tasks.Scheduler, path: string) -> bool {
+checkpoint :: proc(db: ^dbfile.Database, scheduler: ^tasks.Scheduler, path: string, connections: []dbfile.Connection_Record) -> bool {
 	sync.mutex_lock(&scheduler.big_lock)
+	// write_active_connections records the connections open NOW, not the ones the database
+	// was loaded with.
+	clear(&db.connections)
+	append(&db.connections, ..connections)
 	data := dbfile.save_database_bytes(db)
+	clear(&db.connections)
 	sync.mutex_unlock(&scheduler.big_lock)
 
 	job := new(Checkpoint_Job)
@@ -57,6 +62,44 @@ checkpoint :: proc(db: ^dbfile.Database, scheduler: ^tasks.Scheduler, path: stri
 		checkpoint_writer_proc(job)
 	}
 	return true
+}
+
+@(private = "file")
+checkpoint_generation: int
+
+// write_db_file writes a serialized database the way dump_database() does: to
+// "<path>.#<generation>#" first, renamed over <path> only once complete, so a crash mid-write
+// can't leave a truncated file where the last good one was.
+write_db_file :: proc(path: string, data: []byte) -> os.Error {
+	gen := sync.atomic_add(&checkpoint_generation, 1) + 1
+	temp := fmt.aprintf("%s.#%d#", path, gen)
+	defer delete(temp)
+	if err := os.write_entire_file(temp, data); err != nil {
+		os.remove(temp)
+		return err
+	}
+	if err := os.rename(temp, path); err != nil {
+		os.remove(temp)
+		return err
+	}
+	return nil
+}
+
+// The outcome of the most recent background write, for the main loop to pass on to
+// #0:checkpoint_finished: 0 = nothing new, 1 = failed, 2 = succeeded (server.c's
+// checkpoint_finished).
+@(private = "file")
+checkpoint_outcome: int
+
+@(private = "file")
+checkpoint_report :: proc(ok: bool) {
+	sync.atomic_store(&checkpoint_outcome, ok ? 2 : 1)
+}
+
+// checkpoint_take_result reports (and clears) a finished background write.
+checkpoint_take_result :: proc() -> (ok: bool, finished: bool) {
+	r := sync.atomic_exchange(&checkpoint_outcome, 0)
+	return r == 2, r != 0
 }
 
 // checkpoint_wait blocks until every background checkpoint write has finished -- called by
@@ -77,10 +120,15 @@ checkpoint_writer_proc :: proc(data: rawptr) {
 	defer delete(job.data)
 	defer delete(job.path)
 
-	werr := os.write_entire_file(job.path, job.data)
+	// dump_database(): write "<name>.#<generation>#", and only once that has fully succeeded
+	// rename it over <name> -- so a crash mid-write never leaves a truncated checkpoint where
+	// the last good one was.
+	werr := write_db_file(job.path, job.data)
 	if werr != nil {
 		fmt.eprintfln("CHECKPOINT: writing %s FAILED: %v", job.path, werr)
+		checkpoint_report(false)
 	} else {
+		checkpoint_report(true)
 		fmt.printfln("CHECKPOINT: finished writing %s", job.path)
 		// Only now does the checkpoint become the database's on-disk representation, which is
 		// what db_disk_size() reports on (main.odin's g_db_disk_size). The byte count is just

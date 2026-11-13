@@ -111,6 +111,9 @@ build_login_db :: proc() -> dbfile.Database {
 		extra := mkobj(&db, values.Objid(9 + i), values.NOTHING, 1, "Extra")
 		extra.flags = 1 << uint(objdb.Object_Flag.User) | 1 << uint(objdb.Object_Flag.Wizard) | 1 << uint(objdb.Object_Flag.Programmer)
 	}
+	// Like any real database: max_object() is the highest id. Login compares the player it
+	// gets against this to decide "*** Connected ***" vs "*** Created ***".
+	db.max_oid = 17
 
 	return db
 }
@@ -409,12 +412,9 @@ test_program_intrinsic_command_edits_a_real_verb :: proc(t: ^testing.T) {
 	send_cmd(&client, ".program #2:look")
 	confirm := recv_line(t, &client)
 	defer delete(confirm)
-	testing.expect(t, confirm == `Now programming widget (#2):look.  Use "." to end.`)
-
-	// The verb's EXISTING source is echoed back next (raw, uncolored) before capture starts.
-	existing := recv_line(t, &client)
-	defer delete(existing)
-	testing.expect(t, strings.contains(existing, "before"))
+	// find_verb_for_programming's message: the object's name and the verb's names, and
+	// nothing else -- capture starts straight away.
+	testing.expect(t, confirm == `Now programming widget:look.  Use "." to end.`)
 
 	send_cmd(&client, `return "|15after|07";`)
 	send_cmd(&client, ".")

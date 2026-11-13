@@ -31,7 +31,8 @@ write_objid :: proc(w: ^Writer, o: values.Objid) {
 }
 
 write_float :: proc(w: ^Writer, f: f64) {
-	fmt.sbprintfln(&w.b, "%v", f)
+	strings.write_string(&w.b, values.format_float_db(f, context.temp_allocator))
+	strings.write_byte(&w.b, '\n')
 }
 
 // write_string ports dbio_write_string(): one line of text, as-is (embedded newlines would

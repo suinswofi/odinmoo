@@ -20,10 +20,13 @@ run :: proc(body: []compiler.Stmt, names: ^compiler.Name_Table, world: ^World, a
 	local_budget: Task_Budget
 	opened_budget := act.budget == nil
 	if opened_budget {
-		budget_init(&local_budget)
+		budget_open(&local_budget, world, false)
 		act.budget = &local_budget
 	}
-	defer if opened_budget {act.budget = nil}
+	defer if opened_budget {
+		budget_close(&local_budget)
+		act.budget = nil
+	}
 
 	ctx := Eval_Context{activation = act, world = world, names = names}
 	defer delete(ctx.dollar_stack)

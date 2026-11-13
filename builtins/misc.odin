@@ -2,7 +2,8 @@ package builtins
 
 import "../values"
 import "../vm"
-import "core:fmt"
+import "core:c/libc"
+import "core:sys/posix"
 import "core:strings"
 import "core:time"
 
@@ -14,41 +15,36 @@ bf_time :: proc(args: values.Var) -> vm.Call_Result {
 	return vm.call_ok(values.int_val(i32(time.now()._nsec / 1_000_000_000)))
 }
 
-@(private = "file")
-weekday_names := [7]string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
-@(private = "file")
-month_names := [13]string{"", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
-
-// bf_ctime ports ctime([timestamp]): formats a UNIX timestamp (default: now) as
-// "Www Mon DD HH:MM:SS YYYY ZZZ", matching the original's `strftime(..., "%a %b %d %H:%M:%S
-// %Y %Z", localtime(&c))`. Simplified to always report UTC (%Z becomes the literal "UTC")
-// rather than the server host's local timezone -- core:time has no timezone database to
-// consult, and MOO code almost never depends on the specific zone name, just the format.
+// bf_ctime ports bf_ctime(): strftime("%a %b %d %H:%M:%S %Y %Z") of localtime(timestamp)
+// (default: now), with a leading zero in the day of the month turned into a space -- "Thu Jan
+// 1 00:00:00 1970 PST" with two spaces, ctime(3)'s layout. Done through the C library so the
+// time zone (and its name) is the server host's, exactly as the original's is.
 bf_ctime :: proc(args: values.Var) -> vm.Call_Result {
 	defer values.free_var(args)
 	n := nargs(args)
 	if n > 1 {
 		return arg_count_error()
 	}
-	ts: i64
+	ts: libc.time_t
 	if n == 1 {
 		v := nth(args, 1)
 		if v.type != .Int {
 			return arg_type_error()
 		}
-		ts = i64(v.data.num)
+		ts = libc.time_t(v.data.num)
 	} else {
-		ts = time.now()._nsec / 1_000_000_000
+		ts = libc.time(nil)
 	}
-	t := time.unix(ts, 0)
-	year, mon, day := time.date(t)
-	hour, minute, sec := time.clock(t)
-	wd := time.weekday(t)
-	s := fmt.tprintf(
-		"%s %s %02d %02d:%02d:%02d %d UTC",
-		weekday_names[int(wd)], month_names[int(mon)], day, hour, minute, sec, year,
-	)
-	return vm.call_ok(values.str_val(strings.clone(s)))
+	tm: libc.tm
+	buf: [64]byte
+	if posix.localtime_r(&ts, &tm) == nil {
+		return raise_err(.E_INVARG, "Invalid argument")
+	}
+	length := libc.strftime(raw_data(buf[:]), len(buf), "%a %b %d %H:%M:%S %Y %Z", &tm)
+	if length > 8 && buf[8] == '0' {
+		buf[8] = ' '
+	}
+	return vm.call_ok(values.str_val(strings.clone(string(buf[:length]))))
 }
 
 // bf_raise ports raise(code [, message [, value]]): explicitly triggers the same catchable-

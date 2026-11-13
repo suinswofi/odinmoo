@@ -58,13 +58,31 @@ Connection :: struct {
 	// registry, and it has to be tested and acted on inside the same hold that touches it.
 	closing: bool,
 
+	// close_reason says why the connection is going away, which decides which notification
+	// the database gets once it has (server.c's main loop / server_close / player_connected):
+	// .Client (the client hung up) -> #0:user_client_disconnected; .Booted (boot_player) and
+	// .Timeout (connect_timeout) -> #0:user_disconnected; .Redirected (the player logged in
+	// again elsewhere), .Recycled (its player object is gone) and .Shutdown -> nothing.
+	// Guarded by Server.players_lock.
+	close_reason: Close_Reason,
+
+	// seq orders connections by age (Server.next_seq at accept), for connected_players().
+	seq: u64,
+
+	// name is network_connection_name(): "port 7777 from host.example.com, port 41230".
+	// Set once by accept_loop, read-only afterwards.
+	name: string,
+
 	// Input-queue state backing read()/force_input()/flush_input()/set_connection_option()
 	// (see input_queue.odin's header for the full design). Protected by io_lock throughout.
 	io_lock:        sync.Mutex,
 	reader_task_id: int, // 0 = no task currently parked in read() on this connection
 	pending_lines:  queue.Queue(string), // queued while "hold-input" is set, or awaiting a non-blocking read(); a ring buffer, so taking the head is O(1)
 	pending_bytes:  int, // total length of pending_lines, kept incrementally so the MAX_QUEUED_INPUT check stays O(1)
-	options:        map[string]values.Var, // connection-option store, see input_queue.odin's option_defaults
+	options:        Conn_Options, // see input_queue.odin
+	oob_lines:      queue.Queue(string), // out-of-band lines awaiting #0:do_out_of_band_command
+	oob_bytes:      int, // total length of oob_lines, for its MAX_QUEUED_INPUT bound
+	last_activity:  time.Time, // when the last line arrived (idle_seconds, connect_timeout)
 	drains:         sync.Wait_Group, // outstanding drain threads (input_queue.odin's spawn_drain)
 	drain_running:  bool, // guards against spawning a second drain thread while one is working
 
@@ -107,6 +125,15 @@ Connection :: struct {
 	out_in_flight: int,
 	out_closing: bool, // writer flushes what it has and exits; enqueues become no-ops
 	out_done:    sync.Wait_Group, // signaled when the writer thread has exited
+}
+
+Close_Reason :: enum {
+	Client,
+	Booted,
+	Timeout,
+	Redirected,
+	Recycled,
+	Shutdown,
 }
 
 // MAX_QUEUED_OUTPUT matches options.h's default (65536): the most outbound bytes a
@@ -285,12 +312,15 @@ connection_handler :: proc(data: rawptr) {
 connection_teardown :: proc(conn: ^Connection) {
 	s := conn.server
 
-	unregister_conn(s, conn)
+	reason, player := unregister_conn(s, conn)
 	sync.wait_group_wait(&conn.drains)
+	// Tell the database, now that nothing can reach this connection any more -- so, as with the
+	// original's disconnect_me, nothing the notifier says is sent to it.
+	notify_disconnect(s, reason, player)
 	connection_io_destroy(conn)
 	program_state_destroy(conn)
 
-	// Give the writer a bounded chance to flush whatever is still buffered (a "*** Booted
+	// Give the writer a bounded chance to flush whatever is still buffered (a boot_msg
 	// ***", a last :tell from a disconnect verb) before the socket goes away. The timeout is
 	// the bound: the writer sends with a blocking socket, and a client that has stopped
 	// reading but not closed can otherwise stall that send indefinitely -- which would hang
@@ -309,12 +339,14 @@ connection_teardown :: proc(conn: ^Connection) {
 	// free first, THEN announce. conns_done is what server_stop waits on before letting its
 	// caller tear down the World -- and, under the test runner, the allocator this thread has
 	// been using. Nothing this thread allocated may still be outstanding once it is signalled.
+	delete(conn.name)
 	free(conn)
 	sync.wait_group_done(&s.conns_done)
 }
 
 @(private = "file")
 connection_read_loop :: proc(conn: ^Connection) {
+	lookup_peer_name(conn)
 	// Mirrors server_new_connection() dispatching an empty command through do_login_task():
 	// this is what makes $login:welcome's notify()-based banner appear, rather than netio
 	// hardcoding any welcome text of its own.
@@ -362,44 +394,6 @@ connection_read_loop :: proc(conn: ^Connection) {
 				}
 			}
 		}
-	}
-}
-
-// login_dispatch ports do_login_task(): word-split the line, call #0:do_login_command(words)
-// as a fresh root task, and -- if it returns a valid player object -- complete the login via
-// finish_login(). Any other return (an error, an int, an invalid object) just means "stay in
-// login mode," exactly like the original: do_login_command is expected to notify() its own
-// prompts/errors, not netio.
-//
-// Not file-private: input_queue.odin's dispatch_now() calls this too, for a queued/forced
-// line arriving on a still-logging-in connection.
-login_dispatch :: proc(conn: ^Connection, line: string) {
-	s := conn.server
-	words := split_command_words(line)
-	args := words_to_list(words)
-	task_id := tasks.new_task_id(s.scheduler)
-
-	sync.mutex_lock(&s.scheduler.big_lock)
-	result := call_root_verb(s.world, SYSTEM_OBJECT, "do_login_command", args, conn.player, task_id)
-	sync.mutex_unlock(&s.scheduler.big_lock)
-
-	if result.raised {
-		// "simulate an empty verb" (run_server_task_setting_id's fallback when the verb is
-		// missing) or any other uncaught error -- either way, not a login, stay in login mode.
-		delete(result.msg)
-		values.free_var(result.rvalue)
-		return
-	}
-	defer values.free_var(result.value)
-
-	// is_player_object reads db.objects (validity + the User flag) -- that's a DB access
-	// like any other, and a forked task from another connection's login can be mutating the
-	// object map concurrently, so it needs the lock exactly as the verb call above did.
-	sync.mutex_lock(&s.scheduler.big_lock)
-	is_player := result.value.type == .Obj && is_player_object(s.world, result.value.data.obj)
-	sync.mutex_unlock(&s.scheduler.big_lock)
-	if is_player {
-		finish_login(s, conn, result.value.data.obj)
 	}
 }
 

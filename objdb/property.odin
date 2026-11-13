@@ -37,6 +37,10 @@ Builtin_Prop :: enum {
 	Contents,
 }
 
+builtin_prop_name :: proc(bp: Builtin_Prop) -> string {
+	return builtin_prop_names[bp]
+}
+
 @(private = "file")
 builtin_prop_names := [Builtin_Prop]string {
 	.None       = "",

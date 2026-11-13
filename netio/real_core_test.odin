@@ -36,6 +36,10 @@ test_real_lambdacore_login :: proc(t: ^testing.T) {
 	ow := objdb.object_world_init(&db, &sched)
 	defer objdb.object_world_destroy(&ow)
 	world := objdb.make_world(&ow)
+	// Runs after server_stop (defers are LIFO): the disconnect notification LambdaCore gets
+	// when the test's client goes away schedules delayed forks, which shutdown drops -- as
+	// the real server's shutdown sequence does -- rather than waiting them out.
+	defer tasks.scheduler_shutdown(&sched)
 
 	s: Server
 	wire_connection_hooks(&ow, &s)
@@ -77,6 +81,10 @@ test_real_lambdacore_unknown_command_reaches_db_huh :: proc(t: ^testing.T) {
 	ow := objdb.object_world_init(&db, &sched)
 	defer objdb.object_world_destroy(&ow)
 	world := objdb.make_world(&ow)
+	// Runs after server_stop (defers are LIFO): the disconnect notification LambdaCore gets
+	// when the test's client goes away schedules delayed forks, which shutdown drops -- as
+	// the real server's shutdown sequence does -- rather than waiting them out.
+	defer tasks.scheduler_shutdown(&sched)
 
 	s: Server
 	wire_connection_hooks(&ow, &s)

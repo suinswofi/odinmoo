@@ -7,7 +7,6 @@ package server
 //
 // CLI stays compatible with the original: `moo [-e] <initial-db> <checkpoint-db> [port]`.
 
-import "../ansi"
 import "../builtins"
 import "../compiler"
 import "../dbfile"
@@ -20,6 +19,7 @@ import "core:bufio"
 import "core:fmt"
 import "core:os"
 import "core:strconv"
+import "core:strings"
 import "core:sync"
 import "core:sys/posix"
 import "core:time"
@@ -40,6 +40,13 @@ DEFAULT_PORT :: 7777
 g_checkpoint_requested: bool
 @(private = "file")
 g_shutdown_requested: bool
+
+// g_shutdown_message is the text broadcast as "*** Shutting down: <it> ***" (the original's
+// shutdown_message): "shutdown signal received" for a signal, shutdown()'s own text otherwise.
+// Written by the shutdown() hook (under big_lock) before the flag is raised; read by the main
+// loop after it sees the flag.
+@(private = "file")
+g_shutdown_message: string
 
 // The size db_disk_size() reports: the byte count of the database's most recent full on-disk
 // representation. This ports db_file.c's db_disk_size(), which stats input_db_name while
@@ -80,8 +87,8 @@ on_shutdown_signal :: proc "c" (sig: posix.Signal) {
 // below.
 @(private = "file")
 hook_request_shutdown :: proc(user_data: rawptr, message: string) {
-	if len(message) > 0 {
-		fmt.printfln("SHUTDOWN: requested from within the database: %s", message)
+	if g_shutdown_message == "" {
+		g_shutdown_message = strings.clone(message)
 	}
 	sync.atomic_store(&g_shutdown_requested, true)
 }
@@ -151,8 +158,22 @@ main :: proc() {
 	world := objdb.make_world(&ow)
 
 	if emergency {
-		run_emergency_mode(&db, &world)
-		return
+		// server.c's main(): `if (!emergency || emergency_mode())` start the server; either
+		// way db_shutdown() then writes the database out.
+		sync.mutex_lock(&sched.big_lock)
+		objdb.load_server_options(&ow)
+		start := run_emergency_mode(&db, &ow, &world)
+		sync.mutex_unlock(&sched.big_lock)
+		if !start {
+			tasks.scheduler_shutdown(&sched)
+			sync.mutex_lock(&sched.big_lock)
+			data := dbfile.save_database_bytes(&db)
+			sync.mutex_unlock(&sched.big_lock)
+			ok := write_db_file(checkpoint_db_path, data) == nil
+			delete(data)
+			fmt.printfln("DUMPING: %s", ok ? "done" : "FAILED")
+			return
+		}
 	}
 
 	posix.signal(.SIGINT, on_shutdown_signal)
@@ -170,24 +191,84 @@ main :: proc() {
 		request_checkpoint = hook_request_checkpoint,
 		db_disk_size       = hook_db_disk_size,
 	}
+
+	// server.c's main(): load_server_options() before anything runs.
+	sync.mutex_lock(&sched.big_lock)
+	objdb.load_server_options(&ow)
+	sync.mutex_unlock(&sched.big_lock)
+
 	if err := netio.server_start(&s, port, &sched, &world); err != nil {
 		fmt.eprintfln("LISTENING: failed to start on port %d: %v", port, err)
 		os.exit(1)
 	}
 	fmt.printfln("LISTENING on port %d (SIGINT/SIGTERM to shut down cleanly, SIGUSR2 to checkpoint now)", port)
 
+	// main_loop()'s preamble: the connections the database recorded as open when it was last
+	// dumped are gone now, so #0:user_disconnected hears about each of them; then
+	// #0:server_started runs.
+	sync.mutex_lock(&sched.big_lock)
+	for c in db.connections {
+		args := make([]values.Var, 1)
+		args[0] = values.obj_val(c.who)
+		v, _ := objdb.run_root_verb(&ow, &world, objdb.Root_Call{
+			player = c.who, this = c.listener, verb = "user_disconnected", args = values.list_val(args),
+		})
+		values.free_var(v)
+	}
+	clear(&db.connections)
+	{
+		v, _ := objdb.run_root_verb(&ow, &world, objdb.Root_Call{
+			player = values.NOTHING, this = values.SYSTEM_OBJECT, verb = "server_started", args = values.empty_list(),
+		})
+		values.free_var(v)
+	}
+	sync.mutex_unlock(&sched.big_lock)
+
+	next_checkpoint := time.time_add(time.now(), dump_interval(&ow, &sched))
+	last_sweep := time.now()
 	for !sync.atomic_load(&g_shutdown_requested) {
+		if time.diff(next_checkpoint, time.now()) >= 0 {
+			fmt.println("CHECKPOINTING on schedule ($dump_interval)")
+			sync.atomic_store(&g_checkpoint_requested, true)
+		}
 		if sync.atomic_exchange(&g_checkpoint_requested, false) {
-			checkpoint(&db, &sched, checkpoint_db_path)
+			run_checkpoint(&db, &ow, &world, &sched, &s, checkpoint_db_path)
+			next_checkpoint = time.time_add(time.now(), dump_interval(&ow, &sched))
 			// Scratch memory used while writing a checkpoint isn't needed afterwards, and
 			// context.temp_allocator is a growing arena that's only ever reclaimed explicitly
 			// (see netio/connection.odin's per-line reset for the same reasoning).
 			free_all(context.temp_allocator)
 		}
+		if result, finished := checkpoint_take_result(); finished {
+			// call_checkpoint_notifier: #0:checkpoint_finished(success) once the write is done.
+			args := make([]values.Var, 1)
+			args[0] = values.int_val(result ? 1 : 0)
+			sync.mutex_lock(&sched.big_lock)
+			v, _ := objdb.run_root_verb(&ow, &world, objdb.Root_Call{
+				player = values.NOTHING, this = values.SYSTEM_OBJECT, verb = "checkpoint_finished", args = values.list_val(args),
+			})
+			sync.mutex_unlock(&sched.big_lock)
+			values.free_var(v)
+		}
+		if time.diff(last_sweep, time.now()) >= time.Second {
+			netio.sweep_connections(&s)
+			last_sweep = time.now()
+		}
 		time.sleep(200 * time.Millisecond)
 	}
 
-	fmt.println("SHUTTING DOWN: signal received")
+	message := g_shutdown_message != "" ? g_shutdown_message : "shutdown signal received"
+	fmt.printfln("SHUTDOWN: %s", message)
+	// send_shutdown_message, to every connection, before they're closed.
+	broadcast := fmt.tprintf("*** Shutting down: %s ***", message)
+	netio.broadcast_raw(&s, broadcast)
+	// The final dump records the connections that are open right now, as the original's does,
+	// so that the next startup can tell the database they were dropped.
+	final_connections := netio.live_connections(&s)
+	defer delete(final_connections)
+	// Before server_stop: a disconnect notifier parked in suspend() would otherwise hold up its
+	// connection's teardown, which server_stop waits for. See scheduler_begin_shutdown.
+	tasks.scheduler_begin_shutdown(&sched)
 	netio.server_stop(&s)
 	// Stop the network first (no new commands), THEN quiesce the tasks already running, and
 	// only then dump. Forked tasks are ordinary threads executing verb code against the
@@ -198,48 +279,390 @@ main :: proc() {
 	fmt.println("DUMPING: final checkpoint before exit")
 	checkpoint_wait() // let any in-flight background checkpoint write finish first
 	sync.mutex_lock(&sched.big_lock)
-	ok := dbfile.save_database(&db, checkpoint_db_path)
+	clear(&db.connections)
+	append(&db.connections, ..final_connections)
+	final_data := dbfile.save_database_bytes(&db)
 	sync.mutex_unlock(&sched.big_lock)
+	ok := write_db_file(checkpoint_db_path, final_data) == nil
+	delete(final_data)
 	fmt.printfln("DUMPING: %s", ok ? "done" : "FAILED")
 	fmt.println("DONE")
 }
 
-// run_emergency_mode ports the `-e` emergency wizard mode: a stdin/stdout REPL for
-// recovering a database broken by bad verb code, bypassing the network layer entirely.
-// Scope note: the original's emergency mode also supports listing/resetting individual verb
-// programs (`list`, `program`, etc.) -- that needs Phase 5 builtins (verb_code/
-// set_verb_code) this port doesn't have yet. What's here covers the other half: directly
-// evaluating MOO expressions/statements against the loaded DB, which is the actual recovery
-// tool (e.g. `#0.some_prop = fixed_value;`) most emergencies need.
+// dump_interval ports set_checkpoint_timer(): #0.dump_interval seconds between checkpoints if
+// it is an integer of at least 60, otherwise an hour.
 @(private = "file")
-run_emergency_mode :: proc(db: ^dbfile.Database, world: ^vm.World) {
-	print_colored("\n%h%rLambdaMOO Emergency Wizard Mode%n %h%w(Odin port)%n\n")
-	print_colored("%rType a MOO expression or statement, or `.quit` to exit and save nothing.%n\n\n")
+dump_interval :: proc(ow: ^objdb.Object_World, sched: ^tasks.Scheduler) -> time.Duration {
+	sync.mutex_lock(&sched.big_lock)
+	defer sync.mutex_unlock(&sched.big_lock)
+	interval := 3600
+	if h := objdb.find_property(ow.db, values.SYSTEM_OBJECT, "dump_interval"); objdb.valid(ow.db, values.SYSTEM_OBJECT) && h.found {
+		v := objdb.property_value(ow.db, values.SYSTEM_OBJECT, h)
+		if v.type == .Int && v.data.num >= 60 {
+			interval = int(v.data.num)
+		}
+		values.free_var(v)
+	}
+	return time.Duration(interval) * time.Second
+}
+
+// run_checkpoint is main_loop's checkpoint step: #0:checkpoint_started, then the dump (the
+// live connections recorded in it), whose completion is reported to #0:checkpoint_finished by
+// the main loop once the background write is done.
+@(private = "file")
+run_checkpoint :: proc(db: ^dbfile.Database, ow: ^objdb.Object_World, world: ^vm.World, sched: ^tasks.Scheduler, s: ^netio.Server, path: string) {
+	sync.mutex_lock(&sched.big_lock)
+	v, _ := objdb.run_root_verb(ow, world, objdb.Root_Call{
+		player = values.NOTHING, this = values.SYSTEM_OBJECT, verb = "checkpoint_started", args = values.empty_list(),
+	})
+	values.free_var(v)
+	sync.mutex_unlock(&sched.big_lock)
+
+	conns := netio.live_connections(s)
+	defer delete(conns)
+	checkpoint(db, sched, path, conns)
+}
+
+// run_emergency_mode ports server.c's emergency_mode(): a stdin/stdout console, before the
+// network starts, for repairing a database that verb code has broken. Commands:
+//
+//	;EXPR              evaluate a MOO expression and print the result
+//	;;CODE             run MOO statements and print the result
+//	                   (with nothing after the `;`/`;;`, read lines up to a lone `.`)
+//	program OBJ:VERB   replace a verb's code with the following lines, up to a lone `.`
+//	list OBJ:VERB      print a verb's code
+//	debug              toggle evaluating with the `d` flag
+//	wizard #N          run future commands as wizard #N
+//	continue           leave emergency mode and start the server
+//	quit               leave and exit, saving the database
+//	abort              exit WITHOUT saving
+//	help, ?            this list
+//
+// Everything runs as a wizard (the first one in the database, unless `wizard` picks another);
+// notify() output is printed as `#N <- text`. End of input counts as `quit`. The return value
+// says whether to continue starting the server.
+@(private = "file")
+run_emergency_mode :: proc(db: ^dbfile.Database, ow: ^objdb.Object_World, world: ^vm.World) -> (start_server: bool) {
+	fmt.println("\nLambdaMOO Emergency Holographic Wizard Mode")
+	fmt.println("-------------------------------------------")
+	fmt.println("\"Please state the nature of the wizardly emergency...\"")
+	fmt.println("(Type `help' for assistance.)\n")
+
+	// notify() has nowhere to go but this console.
+	ow.conn = objdb.Connection_Hooks{
+		notify = proc(user_data: rawptr, player: values.Objid, text: string) -> bool {
+			fmt.printfln("#%d <- %s", player, text)
+			return true
+		},
+	}
+	defer ow.conn = {}
 
 	reader: bufio.Reader
 	buf: [4096]byte
 	bufio.reader_init_with_buf(&reader, os.to_reader(os.stdin), buf[:])
 	defer bufio.reader_destroy(&reader)
 
-	task_id := 0
+	read_line :: proc(r: ^bufio.Reader) -> (line: string, ok: bool) {
+		l, err := bufio.reader_read_string(r, '\n', context.temp_allocator)
+		if err != nil && len(l) == 0 {
+			return "", false
+		}
+		return strings.trim_left(strings.trim_right(l, "\r\n"), " "), true
+	}
+
+	wizard := values.NOTHING
+	debug := true
 	for {
-		print_colored("%h%cMOO>%n ")
-		line, err := bufio.reader_read_string(&reader, '\n')
-		if err != nil {
-			break
+		if !objdb.is_wizard(db, wizard) {
+			if wizard >= 0 {
+				fmt.printfln("** Object #%d is not a wizard...", wizard)
+			}
+			wizard = find_any_wizard(db)
+			if !objdb.is_wizard(db, wizard) {
+				first_valid := values.NOTHING
+				for oid := values.Objid(0); oid <= db.max_oid; oid += 1 {
+					if objdb.valid(db, oid) {
+						first_valid = oid
+						break
+					}
+				}
+				if first_valid == values.NOTHING {
+					fmt.println("** No objects in database; nothing to run commands as.")
+					return false
+				}
+				wizard = first_valid
+				db.objects[wizard].flags |= 1 << uint(objdb.Object_Flag.Wizard)
+				fmt.printfln("** No wizards in database; wizzed #%d.", wizard)
+			}
+			fmt.printfln("** Now running emergency commands as #%d ...", wizard)
 		}
-		defer delete(line)
-		trimmed := trim_line(line)
-		if trimmed == ".quit" {
-			break
+		fmt.printf("\nMOO (#%d)%s: ", wizard, debug ? "" : "[!d]")
+		line, ok := read_line(&reader)
+		if !ok {
+			fmt.println("Bye.  (saving database)\n")
+			return false // EOF is `quit`
 		}
-		if len(trimmed) == 0 {
+		if strings.has_prefix(line, ";") {
+			rest := line[1:]
+			lines: [dynamic]string
+			defer delete(lines)
+			if strings.has_prefix(rest, ";") {
+				rest = rest[1:]
+			} else {
+				append(&lines, "return")
+			}
+			rest = strings.trim_left(rest, " ")
+			if rest == "" {
+				fmt.println("Type one or more lines of code, ending with `.' alone on a line.")
+				for {
+					l, lok := read_line(&reader)
+					if !lok || l == "." {
+						break
+					}
+					append(&lines, l)
+				}
+			} else {
+				append(&lines, rest)
+			}
+			append(&lines, ";")
+			emergency_eval(ow, world, strings.join(lines[:], "\n", context.temp_allocator), wizard, debug)
+			free_all(context.temp_allocator)
 			continue
 		}
-		task_id += 1
-		eval_and_print(db, world, trimmed, task_id)
+		words := strings.fields(line, context.temp_allocator)
+		if len(words) == 0 {
+			continue
+		}
+		command := words[0]
+		nargs := len(words) - 1
+		switch {
+		case (values.strings_equal_fold(command, "program") || values.strings_equal_fold(command, ".program")) && nargs == 1:
+			definer, index, ok := emergency_find_verb(ow, wizard, words[1])
+			if !ok {
+				continue
+			}
+			code: [dynamic]string
+			defer delete(code)
+			for {
+				l, lok := read_line(&reader)
+				if !lok || l == "." {
+					break
+				}
+				append(&code, l)
+			}
+			emergency_program(ow, world, wizard, definer, index, code[:])
+		case values.strings_equal_fold(command, "list") && nargs == 1:
+			definer, index, ok := emergency_find_verb(ow, wizard, words[1], quiet = true)
+			if ok {
+				emergency_list(ow, world, wizard, definer, index)
+			}
+		case values.strings_equal_fold(command, "disassemble") && nargs == 1:
+			fmt.println("** This server has no bytecode to disassemble (see `list').")
+		case values.strings_equal_fold(command, "abort") && nargs == 0:
+			fmt.println("Bye.  (NOT saving database)\n")
+			os.exit(1)
+		case values.strings_equal_fold(command, "quit") && nargs == 0:
+			fmt.println("Bye.  (saving database)\n")
+			return false
+		case values.strings_equal_fold(command, "continue") && nargs == 0:
+			fmt.println("Bye.  (continuing)\n")
+			return true
+		case values.strings_equal_fold(command, "debug") && nargs == 0:
+			debug = !debug
+		case values.strings_equal_fold(command, "wizard") && nargs == 1 && strings.has_prefix(words[1], "#"):
+			n, nok := strconv.parse_int(words[1][1:], 10)
+			if nok {
+				wizard = values.Objid(n)
+				fmt.printfln("** Switching to wizard #%d...", wizard)
+			}
+		case:
+			if !values.strings_equal_fold(command, "help") && command != "?" {
+				fmt.println("** Unknown or malformed command.")
+			}
+			fmt.println(";EXPR                 Evaluate MOO expression, print result.")
+			fmt.println(";;CODE                Execute whole MOO verb, print result.")
+			fmt.println("    (For above, omitting EXPR or CODE lets you enter several lines")
+			fmt.println("     of input at once; type a period alone on a line to finish.)")
+			fmt.println("program OBJ:VERB      Set the MOO code of an existing verb.")
+			fmt.println("list OBJ:VERB         List the MOO code of an existing verb.")
+			fmt.println("debug                 Toggle evaluation with(out) `d' bit.")
+			fmt.println("wizard #XX            Execute future commands as wizard #XX.")
+			fmt.println("continue              End emergency mode, continue start-up.")
+			fmt.println("quit                  Exit server normally, saving database.")
+			fmt.println("abort                 Exit server *without* saving database.")
+			fmt.println("help, ?               Print this text.\n")
+			fmt.println("NOTE: *NO* forked or suspended tasks will run until you exit this mode.\n")
+			fmt.println("\"Please remember to turn me off when you go...\"")
+		}
+		free_all(context.temp_allocator)
 	}
-	fmt.println("EMERGENCY_MODE: leaving.")
+}
+
+// emergency_eval compiles and runs `src` as the emergency wizard (run_server_program_task with
+// tracebacks), printing "=> value" -- or the compiler's errors.
+@(private = "file")
+emergency_eval :: proc(ow: ^objdb.Object_World, world: ^vm.World, src: string, wizard: values.Objid, debug: bool) {
+	r := compiler.parse_program(src, ow.db.version)
+	defer {
+		compiler.free_stmts(r.body)
+		compiler.name_table_destroy(&r.names)
+		for e in r.errors {
+			delete(e)
+		}
+		delete(r.errors)
+	}
+	if len(r.errors) > 0 {
+		fmt.printfln("** %d errors during parsing:", len(r.errors))
+		for e in r.errors {
+			fmt.printfln("  %s", e)
+		}
+		return
+	}
+
+	act := vm.activation_make(len(r.names.names), &r.names)
+	defer vm.activation_destroy(&act)
+	act.this = values.NOTHING
+	act.player = wizard
+	act.caller = values.NOTHING
+	act.programmer = wizard
+	act.verb_loc = values.NOTHING
+	act.verb_name = "emergency_mode"
+	act.debug = debug
+	if slot := compiler.find(&r.names, "player"); slot >= 0 {
+		act.locals[slot] = values.obj_val(wizard)
+	}
+	if slot := compiler.find(&r.names, "this"); slot >= 0 {
+		act.locals[slot] = values.obj_val(values.NOTHING)
+	}
+	if slot := compiler.find(&r.names, "caller"); slot >= 0 {
+		act.locals[slot] = values.obj_val(values.NOTHING)
+	}
+	budget: vm.Task_Budget
+	vm.budget_open(&budget, world, false)
+	defer vm.budget_close(&budget)
+	act.budget = &budget
+
+	result := vm.run(r.body, &r.names, world, &act)
+	switch result.signal {
+	case .Return:
+		defer values.free_var(result.value)
+		lit_args := make([]values.Var, 1)
+		lit_args[0] = values.var_ref(result.value)
+		lit_result, _ := builtins.call("toliteral", values.list_val(lit_args))
+		// toliteral() can raise (values.MAX_STR_LEN), and a raised Call_Result's `value` is
+		// the zero Var, whose data.str is nil -- emergency mode is the LAST place that should
+		// die on a value it was asked to inspect.
+		if lit_result.raised {
+			fmt.printfln("=> (cannot print value: %s)", lit_result.msg)
+			delete(lit_result.msg)
+			values.free_var(lit_result.rvalue)
+			return
+		}
+		defer values.free_var(lit_result.value)
+		fmt.printfln("=> %s", lit_result.value.data.str.s)
+	case .Raised:
+		objdb.task_aborted(ow, world, &result.err, &act) // its traceback, via notify above
+		fmt.println("=> *Aborted*")
+		delete(result.err.msg)
+		values.free_var(result.err.value)
+	case .Normal, .Break, .Continue:
+		fmt.println("=> 0")
+	}
+}
+
+// emergency_find_verb ports find_verb_for_programming() for the console: OBJ is `$name` or
+// anything match_object understands for the wizard. Prints the original's messages.
+@(private = "file")
+emergency_find_verb :: proc(ow: ^objdb.Object_World, wizard: values.Objid, verbref: string, quiet := false) -> (definer: values.Objid, index: int, ok: bool) {
+	colon := strings.index_byte(verbref, ':')
+	if colon < 0 || colon == len(verbref) - 1 {
+		fmt.println("You must specify a verb; use the format object:verb.")
+		return
+	}
+	obj, vname := verbref[:colon], verbref[colon + 1:]
+	oid := values.NOTHING
+	if strings.has_prefix(obj, "$") {
+		if h := objdb.find_property(ow.db, values.SYSTEM_OBJECT, obj[1:]); h.found {
+			v := objdb.property_value(ow.db, values.SYSTEM_OBJECT, h)
+			if v.type == .Obj {
+				oid = v.data.obj
+			}
+			values.free_var(v)
+		}
+	} else {
+		oid = objdb.match_object(ow.db, wizard, obj)
+	}
+	if !objdb.valid(ow.db, oid) {
+		switch oid {
+		case objdb.FAILED_MATCH:
+			fmt.printfln("I don't see \"%s\" here.", obj)
+		case objdb.AMBIGUOUS:
+			fmt.printfln("I don't know which \"%s\" you mean.", obj)
+		case:
+			fmt.printfln("\"%s\" is not a valid object.", obj)
+		}
+		return
+	}
+	h := objdb.find_defined_verb(ow.db, oid, vname, objdb.server_flag_option(ow, "support_numeric_verbname_strings", false))
+	if !h.found {
+		fmt.println("That object does not have that verb definition.")
+		return
+	}
+	if !quiet {
+		fmt.printfln("Now programming %s:%s.  Use \".\" to end.", ow.db.objects[oid].name, ow.db.objects[oid].verbdefs[h.index].name)
+	}
+	return h.definer, h.index, true
+}
+
+@(private = "file")
+emergency_program :: proc(ow: ^objdb.Object_World, world: ^vm.World, wizard: values.Objid, definer: values.Objid, index: int, code: []string) {
+	items := make([]values.Var, len(code))
+	for l, i in code {
+		items[i] = values.str_val(strings.clone(l))
+	}
+	args := make([]values.Var, 3)
+	args[0] = values.obj_val(definer)
+	args[1] = values.int_val(i32(index + 1))
+	args[2] = values.list_val(items)
+	act := vm.Activation{this = values.NOTHING, player = wizard, programmer = wizard, depth = -1}
+	ctx := vm.Eval_Context{activation = &act, world = world}
+	r := objdb.bf_set_verb_code(ow, values.list_val(args), &ctx)
+	if r.raised {
+		fmt.printfln("** %s", r.msg)
+		delete(r.msg)
+		values.free_var(r.rvalue)
+		return
+	}
+	defer values.free_var(r.value)
+	if n := values.list_len(r.value); n > 0 {
+		fmt.printfln("** %d errors during parsing:", n)
+		for i in 1 ..= n {
+			fmt.printfln("  %s", values.list_get(r.value, i).data.str.s)
+		}
+		fmt.println("Verb not programmed.")
+		return
+	}
+	fmt.println("Verb programmed.")
+}
+
+@(private = "file")
+emergency_list :: proc(ow: ^objdb.Object_World, world: ^vm.World, wizard: values.Objid, definer: values.Objid, index: int) {
+	args := make([]values.Var, 2)
+	args[0] = values.obj_val(definer)
+	args[1] = values.int_val(i32(index + 1))
+	act := vm.Activation{this = values.NOTHING, player = wizard, programmer = wizard, depth = -1}
+	ctx := vm.Eval_Context{activation = &act, world = world}
+	r := objdb.bf_verb_code(ow, values.list_val(args), &ctx)
+	if r.raised {
+		fmt.printfln("** %s", r.msg)
+		delete(r.msg)
+		values.free_var(r.rvalue)
+		return
+	}
+	defer values.free_var(r.value)
+	for i in 1 ..= values.list_len(r.value) {
+		fmt.println(values.list_get(r.value, i).data.str.s)
+	}
 }
 
 // find_any_wizard returns the lowest-numbered object with the wizard bit set (in stock
@@ -254,83 +677,3 @@ find_any_wizard :: proc(db: ^dbfile.Database) -> values.Objid {
 	return values.SYSTEM_OBJECT
 }
 
-@(private = "file")
-trim_line :: proc(s: string) -> string {
-	i := len(s)
-	for i > 0 && (s[i - 1] == '\n' || s[i - 1] == '\r' || s[i - 1] == ' ' || s[i - 1] == '\t') {
-		i -= 1
-	}
-	return s[:i]
-}
-
-@(private = "file")
-eval_and_print :: proc(db: ^dbfile.Database, world: ^vm.World, line: string, task_id: int) {
-	src := fmt.tprintf("return (%s);", line)
-	r := compiler.parse_program(src, db.version)
-	defer {
-		compiler.free_stmts(r.body)
-		compiler.name_table_destroy(&r.names)
-		for e in r.errors {
-			delete(e)
-		}
-		delete(r.errors)
-	}
-	if len(r.errors) > 0 {
-		print_colored("%rParse error:%n ")
-		fmt.println(r.errors[0])
-		return
-	}
-
-	act := vm.activation_make(len(r.names.names), &r.names)
-	defer vm.activation_destroy(&act)
-	act.task_id = task_id
-	act.debug = true
-	// Emergency mode runs with WIZARD permissions (the original's emergency_mode() picks a
-	// wizard to execute as) -- without this, `programmer` would default to #0, which isn't a
-	// wizard in stock LambdaCore, and the property permission checks would turn the recovery
-	// tool into a spectator (E_PERM on exactly the fix-broken-things writes it exists for).
-	wiz := find_any_wizard(db)
-	act.programmer = wiz
-	act.player = wiz
-
-	result := vm.run(r.body, &r.names, world, &act)
-	switch result.signal {
-	case .Return:
-		defer values.free_var(result.value)
-		lit_args := make([]values.Var, 1)
-		lit_args[0] = values.var_ref(result.value)
-		lit_result, _ := builtins.call("toliteral", values.list_val(lit_args))
-		// toliteral() can raise (values.MAX_STR_LEN), and a raised Call_Result's `value` is
-		// the zero Var, whose data.str is nil -- see netio/connection.odin's eval_expr for
-		// the same check and the crash it prevents. Emergency mode is the LAST place that
-		// should die on a value it was asked to inspect.
-		if lit_result.raised {
-			print_colored("%r**%n ")
-			fmt.printfln("cannot print value: %s (%s)", compiler.error_name(lit_result.code), lit_result.msg)
-			delete(lit_result.msg)
-			values.free_var(lit_result.rvalue)
-			return
-		}
-		defer values.free_var(lit_result.value)
-		print_colored("%h%g=>%n ")
-		fmt.println(lit_result.value.data.str.s)
-	case .Raised:
-		print_colored("%r**%n ")
-		fmt.printfln("%s (%s)", compiler.error_name(result.err.code), result.err.msg)
-		delete(result.err.msg)
-		values.free_var(result.err.value)
-	case .Normal, .Break, .Continue:
-		print_colored("%h%g=>%n (no value)\n")
-	}
-}
-
-// print_colored translates %-code markup and writes it directly to stdout -- the emergency
-// console is a local terminal, assumed to support ANSI (unlike a network client, which
-// might not, hence netio's per-connection toggle instead of an unconditional assumption
-// there).
-@(private = "file")
-print_colored :: proc(s: string) {
-	colored := ansi.translate(s, true)
-	defer delete(colored)
-	fmt.print(colored)
-}

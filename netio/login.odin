@@ -10,6 +10,7 @@ import "../values"
 import "../vm"
 import "core:fmt"
 import "core:net"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 import "core:time"
@@ -68,31 +69,71 @@ words_to_list :: proc(words: []string) -> values.Var {
 	return values.list_val(items)
 }
 
-// call_root_verb invokes obj:name(args) as a fresh, server-initiated task rather than a
-// nested verb call -- the same thing run_server_task_setting_id() does in tasks.c. depth=-1
-// on the synthetic root activation means the callee's own activation ends up at depth=0 (see
-// world_call_verb's `act.depth = ctx.activation.depth + 1`), so callers() inside it correctly
-// reports "not called from another verb" -- what #0:do_login_command's `if (callers()) return
-// E_PERM;` guard checks for.
-call_root_verb :: proc(world: ^vm.World, obj: values.Objid, name: string, args: values.Var, player: values.Objid, task_id: int) -> vm.Call_Result {
-	root_act := vm.Activation {
-		this       = values.NOTHING,
-		player     = player,
-		caller     = values.NOTHING,
-		programmer = values.NOTHING,
-		verb_loc   = values.NOTHING,
-		task_id    = task_id,
-		depth      = -1,
-	}
-	ctx := vm.Eval_Context{activation = &root_act, world = world}
-	return world.call_verb(world, obj, name, args, &ctx)
+// world_of returns the Object_World behind this server's World.
+world_of :: proc(s: ^Server) -> ^objdb.Object_World {
+	return (^objdb.Object_World)(s.world.user_data)
 }
 
-// is_player_object ports the is_user() check do_login_task uses on the value
-// #0:do_login_command returns, to decide whether login succeeded.
-is_player_object :: proc(world: ^vm.World, obj: values.Objid) -> bool {
-	ow := (^objdb.Object_World)(world.user_data)
-	return objdb.valid(ow.db, obj) && objdb.object_has_flag(ow.db, obj, .User)
+// server_message ports server.c's send_message(): the listener's (here always #0's)
+// $server_options.<name> -- a string, or a list whose string elements are each a line --
+// replacing the default lines; an option that exists but is neither means "say nothing".
+// The caller holds big_lock (this reads the DB). Returned lines are owned.
+server_message :: proc(s: ^Server, name: string, defaults: ..string) -> [dynamic]string {
+	out: [dynamic]string
+	v, found := objdb.get_server_option(world_of(s), SYSTEM_OBJECT, name)
+	if !found {
+		for d in defaults {
+			append(&out, strings.clone(d))
+		}
+		return out
+	}
+	defer values.free_var(v)
+	#partial switch v.type {
+	case .Str:
+		append(&out, strings.clone(v.data.str.s))
+	case .List:
+		for i in 1 ..= values.list_len(v) {
+			if item := values.list_get(v, i); item.type == .Str {
+				append(&out, strings.clone(item.data.str.s))
+			}
+		}
+	}
+	return out
+}
+
+// send_lines sends each line raw (the original's network_send_line -- these are server
+// messages, not MOO output) and frees them.
+send_lines :: proc(conn: ^Connection, lines: [dynamic]string) {
+	for l in lines {
+		send_line_raw(conn, l)
+		delete(l)
+	}
+	delete(lines)
+}
+
+// run_notifier ports server.c's call_notifier(): #0:<verb>(player) as a server task, with
+// player bound to `player`. Takes big_lock itself.
+run_notifier :: proc(s: ^Server, verb: string, player: values.Objid) {
+	args := make([]values.Var, 1)
+	args[0] = values.obj_val(player)
+	sync.mutex_lock(&s.scheduler.big_lock)
+	v, _ := objdb.run_root_verb(world_of(s), s.world, objdb.Root_Call{
+		player = player, this = SYSTEM_OBJECT, verb = verb, args = values.list_val(args),
+	})
+	sync.mutex_unlock(&s.scheduler.big_lock)
+	values.free_var(v)
+}
+
+// notify_disconnect tells the database a connection is gone, per its close reason (see
+// Connection.close_reason).
+notify_disconnect :: proc(s: ^Server, reason: Close_Reason, player: values.Objid) {
+	switch reason {
+	case .Client:
+		run_notifier(s, "user_client_disconnected", player) // server_close()
+	case .Booted, .Timeout:
+		run_notifier(s, "user_disconnected", player) // main_loop's disconnect_me / timeout sweep
+	case .Redirected, .Recycled, .Shutdown:
+	}
 }
 
 // ---- Connection_Hooks implementations, wired into an objdb.Object_World by
@@ -135,23 +176,28 @@ hook_notify_raw :: proc(user_data: rawptr, player: values.Objid, text: string) -
 @(private = "file")
 hook_connection_name :: proc(user_data: rawptr, player: values.Objid) -> (name: string, found: bool) {
 	s := (^Server)(user_data)
-	sync.mutex_lock(&s.players_lock) // held across the peer lookup -- see hook_notify
+	sync.mutex_lock(&s.players_lock) // held across the read -- see hook_notify
 	defer sync.mutex_unlock(&s.players_lock)
 	conn, ok := s.players[player]
 	if !ok {
 		return "", false
 	}
-	ep, err := net.peer_endpoint(conn.socket)
-	if err != nil {
-		return "", false
+	return strings.clone(conn.name), true
+}
+
+// hook_idle_seconds backs idle_seconds(): time since the connection's last line of input.
+@(private = "file")
+hook_idle_seconds :: proc(user_data: rawptr, player: values.Objid) -> (secs: i64, found: bool) {
+	s := (^Server)(user_data)
+	sync.mutex_lock(&s.players_lock)
+	defer sync.mutex_unlock(&s.players_lock)
+	conn, ok := s.players[player]
+	if !ok {
+		return 0, false
 	}
-	// Explicit allocator: endpoint_to_string's default is context.temp_allocator, but
-	// Connection_Hooks.connection_name's contract (see world.odin) is "owned if found" --
-	// the caller eventually runs this through values.str_val() -> values.free_var(), which
-	// frees via context.allocator. A temp-arena string freed through the heap allocator is
-	// exactly the kind of allocator mismatch that corrupts the heap instead of erroring
-	// cleanly -- this is what a real telnet session against LambdaCore.db actually hit.
-	return net.endpoint_to_string(ep, context.allocator), true
+	sync.mutex_lock(&conn.io_lock)
+	defer sync.mutex_unlock(&conn.io_lock)
+	return i64(time.duration_seconds(time.since(conn.last_activity))), true
 }
 
 @(private = "file")
@@ -163,8 +209,13 @@ hook_boot_player :: proc(user_data: rawptr, player: values.Objid) {
 	if !ok {
 		return
 	}
+	// boot_player only marks the connection in the original (disconnect_me); the main loop
+	// then runs #0:user_disconnected and sends boot_msg. Here the hook runs inside the MOO task
+	// that called boot_player(), which holds big_lock, so the message is read now and the
+	// notifier runs from the connection's own teardown.
 	delete_key(&s.players, player)
-	disconnect_conn(s, conn, "%r*** Booted ***%n")
+	conn.close_reason = .Booted
+	disconnect_conn(s, conn, server_message(s, "boot_msg", "*** Disconnected ***"))
 }
 
 // disconnect_conn forcibly ends a connection that has ALREADY been removed from `players`
@@ -181,13 +232,13 @@ hook_boot_player :: proc(user_data: rawptr, player: values.Objid) {
 // Shutting down only the RECEIVE half leaves the write half open, so the final line above
 // actually reaches the client: the writer thread drains what is buffered and the connection
 // thread's own teardown does the final shutdown(Both) once that drain is done. Shutting both
-// halves here (which is what this used to do) discarded the buffered "*** Booted ***" almost
+// halves here (which is what this used to do) discarded the buffered boot message almost
 // every time -- the message was enqueued a few microseconds earlier and the writer thread had
 // not been scheduled yet. Receive alone is still enough to unblock the connection thread's
 // recv_tcp, which is what makes it tear down at all.
 @(private = "file")
-disconnect_conn :: proc(s: ^Server, conn: ^Connection, final_line: string) {
-	send_line(conn, final_line)
+disconnect_conn :: proc(s: ^Server, conn: ^Connection, final_lines: [dynamic]string) {
+	send_lines(conn, final_lines)
 	// A task parked in read() on this connection can't be woken by closing its socket
 	// (it's blocked on a condition variable, not a socket call) -- same issue and same
 	// fix as server.odin's server_stop; without this, boot_player()ing a player mid-read()
@@ -197,10 +248,57 @@ disconnect_conn :: proc(s: ^Server, conn: ^Connection, final_line: string) {
 	conn.reader_task_id = 0
 	sync.mutex_unlock(&conn.io_lock)
 	if tid != 0 {
-		wake_reader(s.scheduler, tid, strings.clone(""))
+		wake_reader_closed(s.scheduler, tid)
 	}
 	net.shutdown(conn.socket, .Receive)
 }
+
+// sweep_connections ports the end of server.c's main loop: an un-logged-in connection idle for
+// longer than connect_timeout (default 300 seconds; $server_options.connect_timeout, where a
+// non-positive or non-integer value disables it) is closed with timeout_msg and
+// #0:user_disconnected, and a logged-in connection whose player object no longer exists is
+// closed with recycle_msg. Called periodically by the server's main loop.
+sweep_connections :: proc(s: ^Server) {
+	ow := world_of(s)
+	sync.mutex_lock(&s.scheduler.big_lock)
+	defer sync.mutex_unlock(&s.scheduler.big_lock)
+	timeout := f64(DEFAULT_CONNECT_TIMEOUT)
+	if v, found := objdb.get_server_option(ow, SYSTEM_OBJECT, "connect_timeout"); found {
+		timeout = v.type == .Int && v.data.num > 0 ? f64(v.data.num) : -1
+		values.free_var(v)
+	}
+	sync.mutex_lock(&s.players_lock)
+	defer sync.mutex_unlock(&s.players_lock)
+	doomed: [dynamic]^Connection
+	defer delete(doomed)
+	for player, conn in s.players {
+		if player < 0 {
+			sync.mutex_lock(&conn.io_lock)
+			idle := time.duration_seconds(time.since(conn.last_activity))
+			sync.mutex_unlock(&conn.io_lock)
+			if timeout > 0 && idle > timeout {
+				conn.close_reason = .Timeout
+				append(&doomed, conn)
+			}
+		} else if !objdb.valid(ow.db, player) {
+			conn.close_reason = .Recycled
+			append(&doomed, conn)
+		}
+	}
+	for conn in doomed {
+		delete_key(&s.players, conn.player)
+		if conn.close_reason == .Timeout {
+			fmt.printfln("TIMEOUT: #%d on %s", conn.player, conn.name)
+			disconnect_conn(s, conn, server_message(s, "timeout_msg", "*** Timed-out waiting for login. ***"))
+		} else {
+			fmt.printfln("RECYCLED: #%d on %s", conn.player, conn.name)
+			disconnect_conn(s, conn, server_message(s, "recycle_msg", "*** Recycled ***"))
+		}
+	}
+}
+
+// DEFAULT_CONNECT_TIMEOUT is options.h's.
+DEFAULT_CONNECT_TIMEOUT :: 300
 
 // hook_connected_players ports the shandle-list scan behind connected_players(): every
 // registered connection whose player ID is >= 0 is past login (negative IDs are the
@@ -212,15 +310,21 @@ hook_connected_players :: proc(user_data: rawptr, include_all: bool) -> []values
 	s := (^Server)(user_data)
 	sync.mutex_lock(&s.players_lock)
 	defer sync.mutex_unlock(&s.players_lock)
-	ids := make([dynamic]values.Objid, 0, len(s.players))
-	for player in s.players {
+	conns := make([dynamic]^Connection, 0, len(s.players))
+	defer delete(conns)
+	for player, conn in s.players {
 		if include_all || player >= 0 {
-			append(&ids, player)
+			append(&conns, conn)
 		}
 	}
-	// Exact-length allocation: the receiver frees this with delete(). See vm/eval_expr.odin.
-	shrink(&ids)
-	return ids[:]
+	// The original walks all_shandles, which new connections are pushed onto the front of:
+	// newest connection first. (The map's own order is arbitrary, and differs run to run.)
+	slice.sort_by(conns[:], proc(a, b: ^Connection) -> bool {return a.seq > b.seq})
+	ids := make([]values.Objid, len(conns))
+	for c, i in conns {
+		ids[i] = c.player
+	}
+	return ids
 }
 
 // hook_connected_seconds ports the shandle.connection_time check behind connected_seconds():
@@ -330,76 +434,109 @@ wire_connection_hooks :: proc(ow: ^objdb.Object_World, s: ^Server) {
 		connection_option  = hook_connection_option,
 		connection_options = hook_connection_options,
 		output_delimiters  = hook_output_delimiters,
+		idle_seconds       = hook_idle_seconds,
 		listening_points   = hook_listening_points,
 		buffered_output_length = hook_buffered_output_length,
 		max_queued_output  = hook_max_queued_output,
 	}
 }
 
-// finish_login ports player_connected()'s non-redirect branch (server.c:1080-1097): register
-// the connection, send the literal "*** Connected ***" banner, then call #0:user_connected as
-// a fresh server task (call_notifier()). Reconnection redirects (an already-connected player
-// logging in again on a second connection, server.c:1049-1079) and "*** Created ***"/
-// user_created (which needs create()-based player creation to ever trigger, not implemented
-// yet -- see object_builtins.odin's header note on scope) are both out of scope for the same
-// reason: this port's do_login_command support only covers the `connect` path against
-// existing players.
-finish_login :: proc(s: ^Server, conn: ^Connection, player: values.Objid) {
-	sync.mutex_lock(&s.players_lock)
-	if conn.closing {
-		// This connection's own thread has already started tearing it down -- the client hung
-		// up while its `connect ...` line was still being processed on a drain worker, which is
-		// routine. Registering it now would put a Connection that is about to be freed back
-		// into the map for every hook and for server_stop to find; worse, the teardown that
-		// is already under way will not remove it again, so the entry outlives the memory. The
-		// observable symptom was a shutdown that never completed. Abandon the login instead:
-		// there is nobody on the other end of it any more.
-		sync.mutex_unlock(&s.players_lock)
+// login_dispatch ports do_login_task(): #0:do_login_command(@words) runs as a server task with
+// argstr = the line; if it returns a player object (is_user) and this connection is still open,
+// the connection becomes that player's (player_connected, below). Anything else -- an error, an
+// int, an invalid object -- means "still logging in"; do_login_command does its own talking.
+//
+// Not file-private: input_queue.odin's dispatch_now() calls this for queued lines too.
+login_dispatch :: proc(conn: ^Connection, line: string) {
+	s := conn.server
+	ow := world_of(s)
+	args := words_to_list(split_command_words(line))
+
+	sync.mutex_lock(&s.scheduler.big_lock)
+	old_max := ow.db.max_oid
+	value, outcome := objdb.run_root_verb(ow, s.world, objdb.Root_Call{
+		player = conn.player, this = SYSTEM_OBJECT, verb = "do_login_command", args = args, argstr = line,
+	})
+	new_player := values.NOTHING
+	if outcome == .Done && value.type == .Obj && objdb.valid(ow.db, value.data.obj) && objdb.object_has_flag(ow.db, value.data.obj, .User) {
+		new_player = value.data.obj
+	}
+	values.free_var(value)
+	if new_player == values.NOTHING {
+		sync.mutex_unlock(&s.scheduler.big_lock)
 		return
 	}
-	delete_key(&s.players, conn.player) // drop the pre-login negative placeholder ID
-	// An already-connected player logging in again on a second connection: the registry is
-	// keyed by player id, so the two connections would otherwise share one key -- only the
-	// newer reachable by notify(), and the older one's eventual teardown deleting the key
-	// out from under the live connection, silently cutting the player off from all output
-	// while they were still typing. Full reconnect redirection (server.c:1049-1079's
-	// "*** Redirected ***" handover, complete with $login:redirected_task) is out of scope
-	// here, but a stale connection MUST not be left sharing the key: disconnect it.
+	// player_connected decides created-vs-connected by `new_player > old_max_object`.
+	player_connected(s, conn, new_player, new_player > old_max)
+	sync.mutex_unlock(&s.scheduler.big_lock)
+}
+
+// player_connected ports server.c's player_connected(). Called with big_lock held.
+//
+// If the player is already connected elsewhere, that older connection is told
+// redirect_from_msg and closed (no disconnect notification for it), this one is told
+// redirect_to_msg, and #0:user_reconnected runs. Otherwise this connection is told create_msg
+// or connect_msg and #0:user_created or #0:user_connected runs.
+@(private = "file")
+player_connected :: proc(s: ^Server, conn: ^Connection, player: values.Objid, created: bool) {
+	from_lines := server_message(s, "redirect_from_msg", "*** Redirecting connection to new port ***")
+	to_lines := server_message(s, "redirect_to_msg", "*** Redirecting old connection to this port ***")
+	new_lines := created \
+		? server_message(s, "create_msg", "*** Created ***") \
+		: server_message(s, "connect_msg", "*** Connected ***")
+
+	sync.mutex_lock(&s.players_lock)
+	if conn.closing {
+		// The client hung up while its login line was being processed: nobody is there to
+		// log in, and registering a connection that is already tearing down would leave a
+		// dangling entry (see Connection.closing).
+		sync.mutex_unlock(&s.players_lock)
+		delete_lines(from_lines)
+		delete_lines(to_lines)
+		delete_lines(new_lines)
+		return
+	}
+	old_id := conn.player
+	delete_key(&s.players, old_id) // drop the pre-login placeholder
+	redirected := false
 	if old_conn, ok := s.players[player]; ok && old_conn != conn {
 		delete_key(&s.players, player)
-		disconnect_conn(s, old_conn, "*** Redirected ***")
+		old_conn.close_reason = .Redirected
+		fmt.printfln("REDIRECTED: #%d, was %s, now %s", player, old_conn.name, conn.name)
+		disconnect_conn(s, old_conn, from_lines)
+		redirected = true
+	} else {
+		delete_lines(from_lines)
+		fmt.printfln("%s: #%d on %s", created ? "CREATED" : "CONNECTED", player, conn.name)
 	}
 	conn.player = player
 	conn.connect_time = time.now()
 	s.players[player] = conn
 	sync.mutex_unlock(&s.players_lock)
 
-	send_line(conn, "*** Connected ***")
-
-	args_items := make([]values.Var, 1)
-	args_items[0] = values.obj_val(player)
-	args := values.list_val(args_items)
-	task_id := tasks.new_task_id(s.scheduler)
-	// big_lock is NOT optional here, even though this call site "owns" the connection: MOO
-	// execution anywhere means holding it. #0:user_connected's own fork(0) bodies start
-	// immediately on their own threads and take the lock -- run this call without it and
-	// the connect chain races its own forks over shared refcounted values, which surfaces
-	// as one-in-N random E_VERBNF/E_TYPE/E_RANGE around login and anything typed just
-	// after it. (Found exactly that way.)
-	sync.mutex_lock(&s.scheduler.big_lock)
-	result := call_root_verb(s.world, SYSTEM_OBJECT, "user_connected", args, player, task_id)
-	sync.mutex_unlock(&s.scheduler.big_lock)
-	if result.raised {
-		// An uncaught error here is not cosmetic: #0:user_connected is what moves a
-		// connecting player into the world, so a raise leaves them wherever the DB left
-		// them with no working commands. The original logs a full traceback for a failed
-		// server task; log at least the error rather than swallowing it silently.
-		fmt.printfln("ERROR: #0:user_connected raised %v: %s", result.code, result.msg)
-		delete(result.msg)
-		values.free_var(result.rvalue)
+	if redirected {
+		delete_lines(new_lines)
+		send_lines(conn, to_lines)
 	} else {
-		values.free_var(result.value)
+		delete_lines(to_lines)
+		send_lines(conn, new_lines)
 	}
+
+	verb := redirected ? "user_reconnected" : (created ? "user_created" : "user_connected")
+	args := make([]values.Var, 1)
+	args[0] = values.obj_val(player)
+	v, _ := objdb.run_root_verb(world_of(s), s.world, objdb.Root_Call{
+		player = player, this = SYSTEM_OBJECT, verb = verb, args = values.list_val(args),
+	})
+	values.free_var(v)
+}
+
+@(private = "file")
+delete_lines :: proc(lines: [dynamic]string) {
+	for l in lines {
+		delete(l)
+	}
+	delete(lines)
 }
 
 // unregister_conn removes a connection from the registry the hooks above read, called from
@@ -415,9 +552,10 @@ finish_login :: proc(s: ^Server, conn: ^Connection, player: values.Objid) {
 // route to one goes through `players` under this lock), which is what makes the rest of
 // teardown -- freeing the connection's queues, options and buffers, and finally the
 // Connection itself -- safe to do at all. See the "Connection lifetime" note below.
-unregister_conn :: proc(s: ^Server, conn: ^Connection) {
+unregister_conn :: proc(s: ^Server, conn: ^Connection) -> (reason: Close_Reason, player: values.Objid) {
 	sync.mutex_lock(&s.players_lock)
 	defer sync.mutex_unlock(&s.players_lock)
+	reason, player = conn.close_reason, conn.player
 	// Set in the same hold as the removal, and this is the half that makes removal stick: a
 	// drain worker part-way through finish_login is about to re-register this connection under
 	// its new player id, and the only way to stop it is a mark it checks under this same lock.
@@ -426,6 +564,7 @@ unregister_conn :: proc(s: ^Server, conn: ^Connection) {
 	if current, ok := s.players[conn.player]; ok && current == conn {
 		delete_key(&s.players, conn.player)
 	}
+	return
 }
 
 // allocate_connection_id hands out the next negative placeholder ID (server.c's

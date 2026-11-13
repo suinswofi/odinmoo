@@ -17,7 +17,7 @@ import "core:strings"
 resolve_verb_desc_arg :: proc(w: ^Object_World, oid: values.Objid, desc: values.Var) -> (h: Verb_Handle, err: values.Error, has_err: bool) {
 	#partial switch desc.type {
 	case .Str:
-		return find_defined_verb(w.db, oid, desc.data.str.s), .E_NONE, false
+		return find_defined_verb(w.db, oid, desc.data.str.s, server_flag_option(w, "support_numeric_verbname_strings", false)), .E_NONE, false
 	case .Int:
 		if desc.data.num <= 0 {
 			return Verb_Handle{}, .E_INVARG, true
@@ -116,32 +116,41 @@ match_prep_spec :: proc(s: string) -> (spec: int, ok: bool) {
 	if values.strings_equal_fold(s, "any") {
 		return PREP_ANY, true
 	}
-	words := split_prep_words(s)
-	defer delete(words)
-	prep, _, _, found := find_prep(words)
-	if !found {
-		return 0, false
-	}
-	return prep, true
+	prep := db_match_prep(s)
+	return prep, prep != PREP_NONE
 }
 
-// split_prep_words is a tiny local word-splitter (space-separated, no quoting) for
-// match_prep_spec's free-text preposition argument -- e.g. "on top of" -- distinct from
-// command.odin's full parse_words (which handles quoting/escaping typed command lines, not
-// relevant to a single API argument string).
-@(private = "file")
-split_prep_words :: proc(s: string) -> []string {
-	words: [dynamic]string
-	rest := s
-	for w in strings.split_iterator(&rest, " ") {
-		if len(w) > 0 {
-			append(&words, w)
-		}
+// db_match_prep ports db_verbs.c's db_match_prep(): a preposition given as its number ("3",
+// or "#3"), or as words -- of which only the part before any `/` counts, so the "in/inside/
+// into" that verb_args() reports is accepted back -- naming exactly one alternative (the
+// words must be all of an alternative, not merely start with one). PREP_NONE if nothing
+// matches.
+db_match_prep :: proc(prepname: string) -> int {
+	s := prepname
+	if len(s) > 0 && s[0] == '#' {
+		s = s[1:]
 	}
-	// Exact-length allocation: the receiver frees this with delete(). See vm/eval_expr.odin.
-	shrink(&words)
-	return words[:]
+	if n, rest := c_strtol(s); rest == "" {
+		// The whole string was a number (or empty): only a plain run of digits naming a
+		// real preposition counts.
+		if len(s) == 0 || s[0] < '0' || s[0] > '9' || n >= NPREPS {
+			return PREP_NONE
+		}
+		return int(n)
+	}
+	if slash := strings.index_byte(s, '/'); slash >= 0 {
+		s = s[:slash]
+	}
+	words := parse_words(s)
+	defer {
+		for w in words {
+			delete(w)
+		}
+		delete(words)
+	}
+	return find_prep_exact(words)
 }
+
 
 // bf_add_verb ports verbs.c's bf_add_verb(): defines a new verbdef on `oid` with the given
 // {owner, perms, names} and {dobj, prep, iobj}, returning its 1-based position (matching
@@ -304,10 +313,9 @@ bf_set_verb_args :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Conte
 	return ok_result(values.int_val(0))
 }
 
-// bf_verb_code ports verbs.c's bf_verb_code(): the verb's source as a list of lines (this
-// port always stores/returns fully-parenthesized, indented text -- the `fully-paren`/
-// `indent` optional arguments are accepted for compatibility but don't change the output,
-// since unparse.odin's decompiler only implements that one mode -- see its own header note).
+// bf_verb_code ports verbs.c's bf_verb_code(): the verb's code decompiled as a list of lines --
+// by default with only the parentheses precedence requires, indented; `fully-paren` true adds
+// parentheses around every operator subexpression, `indent` false leaves the lines flush left.
 bf_verb_code :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	defer values.free_var(args)
 	n := values.list_len(args)
@@ -334,7 +342,7 @@ bf_verb_code :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) 
 		return err_result_local(.E_PERM, "Permission denied")
 	}
 
-	r := compiler.parse_program(vd.program_source, w.db.version)
+	r := compiler.parse_program(vd.program_source, w.db.version, unknown_builtin_is_error = false)
 	defer {
 		compiler.free_stmts(r.body)
 		compiler.name_table_destroy(&r.names)
@@ -348,8 +356,13 @@ bf_verb_code :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) 
 		// could for a hand-edited .db) -- report as no code rather than crashing.
 		return ok_result(values.list_val(make([]values.Var, 0)))
 	}
-	text := compiler.unparse_program(r.body, &r.names)
+	parens := n >= 3 && values.is_true(values.list_get(args, 3))
+	indent := n < 4 || values.is_true(values.list_get(args, 4))
+	text := compiler.unparse_program(r.body, &r.names, parens, indent)
 	defer delete(text)
+	if len(text) == 0 {
+		return ok_result(values.empty_list()) // a never-programmed verb is null_program(): no lines
+	}
 	lines := strings.split(strings.trim_right(text, "\n"), "\n")
 	defer delete(lines)
 	items := make([]values.Var, len(lines))
@@ -412,8 +425,10 @@ bf_set_verb_code :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Conte
 		compiler.name_table_destroy(&r.names)
 	}
 	if len(r.errors) == 0 {
+		// Stored the way the original's database writer records a program
+		// (dbio_write_program: fully parenthesized, not indented), not as typed.
 		delete(vd.program_source)
-		vd.program_source = strings.clone(source)
+		vd.program_source = compiler.unparse_program(r.body, &r.names, true, false)
 		vd.has_program = true
 		compile_cache_invalidate(&w.cache, h.definer, h.index)
 	}

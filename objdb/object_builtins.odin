@@ -1,13 +1,13 @@
 package objdb
 
-// The small set of built-in functions that need direct object-DB access (and so can't live
-// in the standalone `builtins` package without creating a package cycle -- see
-// builtins/dispatch.odin's header note), plus (as of the real login-protocol work) a few
-// that need the calling Activation (callers()) or a live network connection
-// (notify/connection_name/boot_player, via Connection_Hooks -- see world.odin). The much
-// larger create/recycle/chparent/move/add_property/add_verb/etc. surface is still future
-// work, same scope cut as builtins/dispatch.odin's.
+// The built-in functions that need direct object-DB access (and so can't live in the
+// standalone `builtins` package without creating a package cycle -- see builtins/dispatch.odin's
+// header note), the calling Activation (callers()), or a live network connection (via
+// Connection_Hooks -- see world.odin). Arguments arrive already checked against the original's
+// prototype table (world.odin's check_builtin_args); the checks repeated here only matter to
+// callers that bypass the dispatcher.
 
+import "../tasks"
 import "../values"
 import "../vm"
 import "core:strings"
@@ -27,6 +27,8 @@ object_builtin :: proc(w: ^Object_World, name: string, args: values.Var, ctx: ^v
 		return bf_is_player(w, args), true
 	case "server_version":
 		return bf_server_version(args), true
+	case "queue_info":
+		return bf_queue_info(w, args), true
 	case "callers":
 		return bf_callers(args, ctx), true
 	case "caller_perms":
@@ -248,10 +250,7 @@ bf_children :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 	return ok_result(values.list_val(items[:]))
 }
 
-// bf_is_player ports is_player() (checks the FLAG_USER bit). An invalid object returns
-// false rather than raising E_INVIND -- matches db.h's internal is_user(), the C-side check
-// do_login_task uses on an arbitrary (possibly invalid) verb-returned value, which is_player
-// mirrors for MOO code.
+// bf_is_player ports is_player() (checks the FLAG_USER bit); an invalid object is E_INVARG.
 @(private = "file")
 bf_is_player :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 	defer values.free_var(args)
@@ -263,26 +262,121 @@ bf_is_player :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 		return err_result_local(.E_TYPE, "Type mismatch")
 	}
 	if !valid(w.db, v.data.obj) {
-		return ok_result(values.int_val(0))
+		return err_result_local(.E_INVARG, "Invalid argument") // objects.c's bf_is_player
 	}
 	return ok_result(values.int_val(object_has_flag(w.db, v.data.obj, .User) ? 1 : 0))
 }
 
+// SERVER_VERSION is what server_version() reports: the LambdaMOO release this server
+// implements, with this port's own extension tag (version.c's VERSION_EXT slot).
+SERVER_VERSION :: "1.8.3+odin"
+
+// bf_server_version ports bf_server_version()/server_version_full(): the version string, or
+// with an argument the version structure -- {{"major", 1}, {"minor", 8}, {"release", 3},
+// {"ext", "+odin"}, {"string", ...}, {"features", {}}, {"options", {}}, {"source", {}}} -- or,
+// for a "name/name" path, the part of it that path names (E_INVARG if none).
 @(private = "file")
 bf_server_version :: proc(args: values.Var) -> vm.Call_Result {
 	defer values.free_var(args)
 	if values.list_len(args) > 1 {
 		return err_result_local(.E_ARGS, "Incorrect number of arguments")
 	}
-	return ok_result(values.str_val(strings.clone("1.8.0+odin")))
+	if values.list_len(args) == 0 {
+		return ok_result(values.str_val(strings.clone(SERVER_VERSION)))
+	}
+	pair :: proc(name: string, v: values.Var) -> values.Var {
+		items := make([]values.Var, 2)
+		items[0] = values.str_val(strings.clone(name))
+		items[1] = v
+		return values.list_val(items)
+	}
+	tree := make([]values.Var, 8)
+	tree[0] = pair("major", values.int_val(1))
+	tree[1] = pair("minor", values.int_val(8))
+	tree[2] = pair("release", values.int_val(3))
+	tree[3] = pair("ext", values.str_val(strings.clone("+odin")))
+	tree[4] = pair("string", values.str_val(strings.clone(SERVER_VERSION)))
+	tree[5] = pair("features", values.empty_list())
+	tree[6] = pair("options", values.empty_list())
+	tree[7] = pair("source", values.empty_list())
+	whole := values.list_val(tree)
+	arg := values.list_get(args, 1)
+	if arg.type != .Str || arg.data.str.s == "" {
+		return ok_result(whole)
+	}
+	defer values.free_var(whole)
+	node := whole
+	for part in strings.split(arg.data.str.s, "/", context.temp_allocator) {
+		found := false
+		if node.type == .List {
+			for i in 1 ..= values.list_len(node) {
+				item := values.list_get(node, i)
+				if item.type == .List && values.list_len(item) == 2 {
+					if k := values.list_get(item, 1); k.type == .Str && k.data.str.s == part {
+						node = values.list_get(item, 2)
+						found = true
+						break
+					}
+				} else if item.type == .Str && item.data.str.s == part {
+					node = values.int_val(1)
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			return err_result_local(.E_INVARG, "Invalid argument")
+		}
+	}
+	return ok_result(values.var_ref(node))
+}
+
+// bf_queue_info ports tasks.c's bf_queue_info(): with no argument, every player-or-programmer
+// the scheduler has a queue for -- here, every open connection plus every owner of a queued
+// task; with one, how many queued (forked or suspended) tasks that object owns.
+@(private = "file")
+bf_queue_info :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
+	defer values.free_var(args)
+	if values.list_len(args) == 1 {
+		who := values.list_get(args, 1)
+		if who.type != .Obj {
+			return err_result_local(.E_TYPE, "Type mismatch")
+		}
+		n := w.scheduler != nil ? tasks.tasks_owned_by(w.scheduler, who.data.obj) : 0
+		return ok_result(values.int_val(i32(n)))
+	}
+	seen := make(map[values.Objid]bool, context.temp_allocator)
+	items: [dynamic]values.Var
+	if w.conn.connected_players != nil {
+		ids := w.conn.connected_players(w.conn.user_data, true)
+		defer delete(ids)
+		for id in ids {
+			if !seen[id] {
+				seen[id] = true
+				append(&items, values.obj_val(id))
+			}
+		}
+	}
+	if w.scheduler != nil {
+		snaps := tasks.snapshot_tasks(w.scheduler)
+		defer delete(snaps)
+		for t in snaps {
+			if !seen[t.owner] {
+				seen[t.owner] = true
+				append(&items, values.obj_val(t.owner))
+			}
+		}
+	}
+	shrink(&items)
+	return ok_result(values.list_val(items[:]))
 }
 
 // bf_callers ports execute.c's bf_callers()/callers() over the REAL frame chain: each
 // Activation now records its caller (vm.Activation.parent), so every entry describes the
 // actual ancestor frame -- {this, verb-name, programmer, verb-loc, player}, most recent
 // caller first, down to the task's root verb; a 6th line-number element is appended only
-// when the include-line-numbers argument is truthy, matching the original's shape exactly
-// (though the number itself is always 0 here: a tree-walking VM has no PC to report).
+// when the include-line-numbers argument is truthy -- the decompiled-listing line each frame
+// is executing (compiler/lines.odin), or for a built-in's synthetic frame its resume point.
 // Synthetic server-root activations (depth < 0 -- the netio dispatch scaffolding, not a MOO
 // verb) are excluded, exactly as the original's activ_stack never contains them at all.
 @(private = "file")
@@ -310,7 +404,7 @@ bf_callers :: proc(args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 		frame[3] = values.obj_val(values.NOTHING)
 		frame[4] = values.obj_val(a.player)
 		if include_lines {
-			frame[5] = values.int_val(0)
+			frame[5] = values.int_val(i32(a.bi_func_pc))
 		}
 		append(items, values.list_val(frame))
 	}
@@ -325,7 +419,7 @@ bf_callers :: proc(args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 		frame[3] = values.obj_val(a.verb_loc)
 		frame[4] = values.obj_val(a.player)
 		if include_lines {
-			frame[5] = values.int_val(0) // line number: not tracked (tree-walking VM, no PC)
+			frame[5] = values.int_val(i32(a.line)) // the listing line that frame is executing
 		}
 		append(&items, values.list_val(frame))
 		append_builtin_frame(&items, a, include_lines)
@@ -366,10 +460,10 @@ bf_notify :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> 
 	if !is_wizard(w.db, progr) && progr != player.data.obj {
 		return err_result_local(.E_PERM, "Permission denied")
 	}
-	if w.conn.notify != nil {
-		w.conn.notify(w.conn.user_data, player.data.obj, text.data.str.s)
-	}
-	return ok_result(values.int_val(1))
+	// 1 if the line went to a connection, 0 if `player` isn't connected (network_send_line's
+	// answer, or the original's r.v.num = 0 for a missing shandle).
+	sent := w.conn.notify != nil && w.conn.notify(w.conn.user_data, player.data.obj, text.data.str.s)
+	return ok_result(values.int_val(sent ? 1 : 0))
 }
 
 // bf_notify_raw ports this port's own notify_raw() (not a real MOO builtin -- see
@@ -492,10 +586,8 @@ bf_connected_seconds :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Resu
 	return ok_result(values.int_val(i32(secs)))
 }
 
-// bf_idle_seconds ports idle_seconds(): real activity-tracking (last input time per
-// connection) isn't implemented, so a currently-connected player always reports 0 (never
-// idle) rather than raising -- callers like $login:maybe_limit_commands's idle-connection
-// sweep just never find anyone to evict, a safe direction to be wrong in.
+// bf_idle_seconds ports idle_seconds(): seconds since the connection last sent a line --
+// any connection, logged in or not, with no permission check; E_INVARG if there is none.
 @(private = "file")
 bf_idle_seconds :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 	defer values.free_var(args)
@@ -506,15 +598,14 @@ bf_idle_seconds :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 	if v.type != .Obj {
 		return err_result_local(.E_TYPE, "Type mismatch")
 	}
-	if w.conn.connection_name == nil {
-		return err_result_local(.E_INVARG, "Not a connected player")
+	if w.conn.idle_seconds == nil {
+		return err_result_local(.E_INVARG, "Invalid argument")
 	}
-	name, found := w.conn.connection_name(w.conn.user_data, v.data.obj)
+	secs, found := w.conn.idle_seconds(w.conn.user_data, v.data.obj)
 	if !found {
-		return err_result_local(.E_INVARG, "Not a connected player")
+		return err_result_local(.E_INVARG, "Invalid argument")
 	}
-	delete(name)
-	return ok_result(values.int_val(0))
+	return ok_result(values.int_val(i32(secs)))
 }
 
 // resolve_verb_desc ports find_described_verb(): a verb-desc arg is either a STRING (matched
@@ -524,7 +615,7 @@ bf_idle_seconds :: proc(w: ^Object_World, args: values.Var) -> vm.Call_Result {
 resolve_verb_desc :: proc(w: ^Object_World, oid: values.Objid, desc: values.Var) -> Verb_Handle {
 	switch desc.type {
 	case .Str:
-		return find_defined_verb(w.db, oid, desc.data.str.s)
+		return find_defined_verb(w.db, oid, desc.data.str.s, server_flag_option(w, "support_numeric_verbname_strings", false))
 	case .Int:
 		obj, ok := w.db.objects[oid]
 		if !ok {
@@ -617,6 +708,9 @@ bf_verb_args :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) 
 	if obj_v.type != .Obj || (desc_v.type != .Str && desc_v.type != .Int) {
 		return err_result_local(.E_TYPE, "Type mismatch")
 	}
+	if desc_v.type == .Int && desc_v.data.num <= 0 {
+		return err_result_local(.E_INVARG, "Invalid argument") // validate_verb_descriptor
+	}
 	// verbs.c checks valid(oid) BEFORE looking the verb up: an invalid object is E_INVARG,
 	// never E_VERBNF. Core code depends on the distinction -- JHCore's $object_utils:has_verb
 	// walks parent(obj) until verb_info() stops saying E_VERBNF, so E_VERBNF for #-1 would
@@ -652,6 +746,9 @@ bf_verb_info :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) 
 	obj_v, desc_v := values.list_get(args, 1), values.list_get(args, 2)
 	if obj_v.type != .Obj || (desc_v.type != .Str && desc_v.type != .Int) {
 		return err_result_local(.E_TYPE, "Type mismatch")
+	}
+	if desc_v.type == .Int && desc_v.data.num <= 0 {
+		return err_result_local(.E_INVARG, "Invalid argument") // validate_verb_descriptor
 	}
 	if !valid(w.db, obj_v.data.obj) { // E_INVARG before E_VERBNF, as verbs.c does (see bf_verb_args)
 		return err_result_local(.E_INVARG, "Invalid argument")
@@ -878,9 +975,12 @@ bf_move :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	if dest != values.NOTHING {
 		accept_args := make([]values.Var, 1)
 		accept_args[0] = values.obj_val(what)
-		result := call_verb_from(w, ctx.world, dest, dest, "accept", values.list_val(accept_args), ctx, via_builtin = "move")
+		result := call_verb_from(w, ctx.world, dest, dest, "accept", values.list_val(accept_args), ctx, via_builtin = "move", via_builtin_pc = 2)
 		if result.raised {
-			if result.code != .E_VERBNF {
+			// Only a dispatch failure means "no :accept verb" (call_verb's E_VERBNF); an error
+			// raised by an :accept that actually ran -- E_VERBNF included -- unwinds through
+			// move()'s caller like any other.
+			if result.unwinding || result.code != .E_VERBNF {
 				return result
 			}
 			accepts = false
@@ -922,7 +1022,7 @@ bf_move :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	if valid(w.db, oldloc) {
 		exit_args := make([]values.Var, 1)
 		exit_args[0] = values.obj_val(what)
-		result := call_verb_from(w, ctx.world, oldloc, oldloc, "exitfunc", values.list_val(exit_args), ctx, via_builtin = "move")
+		result := call_verb_from(w, ctx.world, oldloc, oldloc, "exitfunc", values.list_val(exit_args), ctx, via_builtin = "move", via_builtin_pc = 3)
 		if result.raised {
 			if result.unwinding || result.code == .E_MAXREC {
 				return result
@@ -937,7 +1037,7 @@ bf_move :: proc(w: ^Object_World, args: values.Var, ctx: ^vm.Eval_Context) -> vm
 	if valid(w.db, dest) && valid(w.db, what) && db_object_location(w, what) == dest {
 		enter_args := make([]values.Var, 1)
 		enter_args[0] = values.obj_val(what)
-		result := call_verb_from(w, ctx.world, dest, dest, "enterfunc", values.list_val(enter_args), ctx, via_builtin = "move")
+		result := call_verb_from(w, ctx.world, dest, dest, "enterfunc", values.list_val(enter_args), ctx, via_builtin = "move", via_builtin_pc = 4)
 		if result.raised {
 			if result.unwinding || result.code == .E_MAXREC {
 				return result

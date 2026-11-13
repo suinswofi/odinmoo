@@ -132,11 +132,21 @@ test_parse_catch_expr :: proc(t: ^testing.T) {
 
 @(test)
 test_parse_unknown_builtin_marked_unknown :: proc(t: ^testing.T) {
-	r := parse_ok(t, "this_is_not_a_real_builtin(1);")
+	// A stored verb (DB load) compiles, as a call_function() rewrite...
+	r := parse_program("this_is_not_a_real_builtin(1);", DBV_Float, unknown_builtin_is_error = false)
 	defer result_destroy(&r)
+	testing.expect_value(t, len(r.errors), 0)
 	s := r.body[0].(^Stmt_Expr)
 	call := s.expr.(^Expr_Call)
 	testing.expect(t, !call.is_known)
+
+	// ...but freshly typed code (eval/set_verb_code/.program) gets the original's diagnostic.
+	r3 := parse_program("this_is_not_a_real_builtin(1);", DBV_Float)
+	defer result_destroy(&r3)
+	testing.expect_value(t, len(r3.errors), 1)
+	if len(r3.errors) == 1 {
+		testing.expect_value(t, r3.errors[0], "Line 1:  Unknown built-in function: this_is_not_a_real_builtin")
+	}
 
 	r2 := parse_ok(t, "tostr(1);")
 	defer result_destroy(&r2)
@@ -379,4 +389,42 @@ test_name_table_index_keeps_scan_semantics :: proc(t: ^testing.T) {
 	testing.expect_value(t, find_or_add(&c, "var7"), base + 7)
 	testing.expect_value(t, find_or_add(&c, "brand_new"), base + 200)
 	testing.expect_value(t, find(&c, "BRAND_NEW"), base + 200)
+}
+
+// A syntax error is reported once, as bison reports it, and parsing stops: parser.y has no
+// error-recovery productions, so the original never produces a second one.
+@(test)
+test_syntax_error_reported_once :: proc(t: ^testing.T) {
+	r := parse_program("return try 1/0; except e (ANY) return e; endtry;", DBV_Float)
+	defer result_destroy(&r)
+	testing.expect_value(t, len(r.errors), 1)
+	if len(r.errors) == 1 {
+		testing.expect_value(t, r.errors[0], "Line 1:  syntax error")
+	}
+}
+
+// Line numbers are positions in the decompiled listing (decompile.c's find_hot_node), not in
+// the source text: every structural line (if/elseif/else/endif, for/endfor, try/except/endtry)
+// counts, and source formatting does not.
+@(test)
+test_line_numbers_follow_listing :: proc(t: ^testing.T) {
+	src := "x = 1; if (x) y = 2; elseif (x == 2) y = 3; else y = 4; endif try z = 1; except (ANY) z = 2; endtry return x;"
+	r := parse_ok(t, src)
+	defer result_destroy(&r)
+	// 1 x = 1;  2 if  3 y = 2;  4 elseif  5 y = 3;  6 else  7 y = 4;  8 endif
+	// 9 try  10 z = 1;  11 except  12 z = 2;  13 endtry  14 return x;
+	testing.expect_value(t, r.body[0].(^Stmt_Expr).line, 1)
+	cond := r.body[1].(^Stmt_Cond)
+	testing.expect_value(t, cond.line, 2)
+	testing.expect_value(t, cond.arms[0].line, 2)
+	testing.expect_value(t, cond.arms[0].body[0].(^Stmt_Expr).line, 3)
+	testing.expect_value(t, cond.arms[1].line, 4)
+	testing.expect_value(t, cond.arms[1].body[0].(^Stmt_Expr).line, 5)
+	testing.expect_value(t, cond.otherwise[0].(^Stmt_Expr).line, 7)
+	tr := r.body[2].(^Stmt_Try_Except)
+	testing.expect_value(t, tr.line, 9)
+	testing.expect_value(t, tr.body[0].(^Stmt_Expr).line, 10)
+	testing.expect_value(t, tr.excepts[0].line, 11)
+	testing.expect_value(t, tr.excepts[0].body[0].(^Stmt_Expr).line, 12)
+	testing.expect_value(t, r.body[3].(^Stmt_Return).line, 14)
 }

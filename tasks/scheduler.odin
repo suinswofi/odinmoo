@@ -20,11 +20,10 @@ package tasks
 // genuinely means "not competing for the DB," not just "not making progress."
 //
 // Scope cut, stated plainly: this does not reproduce the original's per-connection round-
-// robin fairness queues, nor the $server_options plumbing that lets a database override the
-// tick/second limits -- the fairness queues are entangled with Phase 7's networking layer
-// (which connection a task belongs to) and aren't meaningful without it. The limits
-// themselves ARE enforced, per task, with the original's default values: see vm/budget.odin,
-// which is what stops a runaway task holding big_lock forever. What's here is the
+// robin fairness queues -- with real threads, whichever task gets big_lock next runs. The
+// tick/second limits ARE enforced per task, from $server_options as in the original (fg for
+// a task started by input or the server, bg for a forked or resumed one): see vm/budget.odin,
+// which is what stops a runaway task holding big_lock forever, and World.task_limits. What's here is the
 // concurrency core: fork, suspend, resume, kill_task, task_id, all genuinely working and
 // tested under real concurrent load.
 
@@ -49,7 +48,7 @@ Scheduler :: struct {
 	pending_forks: [dynamic]Pending_Fork,
 	timer_cond:    sync.Cond, // signalled when the heap's head changes or shutdown begins
 	timer_running: bool,
-	shutting_down: bool, // set by scheduler_shutdown; queued forks are dropped from then on
+	shutting_down: bool, // set by scheduler_begin_shutdown/scheduler_shutdown; queued forks are dropped and parking tasks are killed from then on
 
 	// Forks that are due to run, drained in order by fork workers (fork.odin's header).
 	// Guarded by meta_lock. `runners` counts the workers not parked in suspend()/read().
@@ -115,6 +114,22 @@ scheduler_init :: proc() -> Scheduler {
 // Delayed forks that have not started yet are dropped, not waited for: waiting used to mean
 // waiting out the longest pending delay, because each one was a thread in an uninterruptible
 // sleep -- `fork (86400)` held up SIGTERM for a day.
+// scheduler_begin_shutdown kills every parked task now, and makes any task that parks from now
+// on wake up killed at once (park_wait checks `shutting_down`), without waiting for anything.
+// The server calls it BEFORE stopping the network: a connection's teardown runs
+// #0:user_client_disconnected, which runs the player's own :disfunc, and if that suspends, the
+// teardown thread is parked -- and server_stop waits for every teardown to finish. Without this
+// any programmer could make shutdown hang forever with a `suspend()` in their :disfunc.
+scheduler_begin_shutdown :: proc(s: ^Scheduler) {
+	sync.mutex_lock(&s.meta_lock)
+	defer sync.mutex_unlock(&s.meta_lock)
+	s.shutting_down = true
+	for _, info in s.tasks {
+		info.killed = true
+		sync.cond_signal(&info.cond)
+	}
+}
+
 scheduler_shutdown :: proc(s: ^Scheduler) {
 	sync.mutex_lock(&s.meta_lock)
 	for _, info in s.tasks {
@@ -174,6 +189,34 @@ register_task :: proc(s: ^Scheduler, id: int, act: ^vm.Activation) -> ^Task_Info
 	s.tasks[id] = info
 	sync.mutex_unlock(&s.meta_lock)
 	return info
+}
+
+// tasks_owned_by counts the queued (suspended, reading, or delayed-fork) tasks whose owner is
+// `owner` -- the original's tqueue.num_bg_tasks, which check_user_task_limit compares against
+// queued_task_limit.
+tasks_owned_by :: proc(s: ^Scheduler, owner: values.Objid) -> int {
+	sync.mutex_lock(&s.meta_lock)
+	defer sync.mutex_unlock(&s.meta_lock)
+	n := 0
+	for _, info in s.tasks {
+		if info.owner == owner {
+			n += 1
+		}
+	}
+	// Forks that are due but not yet running are queued tasks too (the original counts every
+	// forked task in its waiting/bg queues); without them `fork (0)` slips past the limit.
+	n += runnable_forks_owned_by_locked(s, owner)
+	return n
+}
+
+// over_task_limit ports check_user_task_limit(): true when `owner` may not queue another
+// task.
+over_task_limit :: proc(s: ^Scheduler, w: ^vm.World, owner: values.Objid) -> bool {
+	if w == nil || w.queued_task_limit == nil {
+		return false
+	}
+	limit := w.queued_task_limit(w, owner)
+	return limit >= 0 && tasks_owned_by(s, owner) >= limit
 }
 
 // task_exists reports whether a task is currently registered (i.e. suspended and waiting) --

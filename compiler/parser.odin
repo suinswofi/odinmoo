@@ -39,6 +39,14 @@ Parser :: struct {
 	// sticky flag set when it is exceeded.
 	depth:         int,
 	aborted:       bool,
+
+	// unknown_builtin_is_error mirrors which Parser_Client the original compiles with. Its
+	// `Unknown built-in function: foo` diagnostic is a warning(), and warning() is an error for
+	// a client with no warning callback -- which is every client that compiles code a programmer
+	// just typed (eval(), set_verb_code(), `.program`). Only the database loader supplies one,
+	// so a stored verb calling a function this server lacks still loads (as a
+	// call_function("foo", ...) that fails at run time).
+	unknown_builtin_is_error: bool,
 }
 
 parser_make :: proc(src: string, version: int) -> Parser {
@@ -65,7 +73,7 @@ parser_error :: proc(p: ^Parser, msg: string) {
 		// "unexpected EOF" per level on top of the one error that actually explains it.
 		return
 	}
-	append(&p.errors, fmt.aprintfln("Line %d:  %s", p.cur.line, msg))
+	append(&p.errors, fmt.aprintf("Line %d:  %s", p.cur.line, msg))
 }
 
 @(private = "file")
@@ -114,7 +122,9 @@ MAX_PARSE_DEPTH :: 200
 @(private = "file")
 enter_nesting :: proc(p: ^Parser) -> bool {
 	p.depth += 1
-	if p.depth > MAX_PARSE_DEPTH {
+	// The stack test matters when the parser itself runs deep in a task's stack -- eval() or
+	// set_verb_code() called from many verb calls down (values/stack_guard.odin).
+	if p.depth > MAX_PARSE_DEPTH || values.stack_exhausted() {
 		abort_parse(p)
 		return false
 	}
@@ -124,6 +134,24 @@ enter_nesting :: proc(p: ^Parser) -> bool {
 @(private = "file")
 leave_nesting :: proc(p: ^Parser) {
 	p.depth -= 1
+}
+
+// syntax_error ports what a bison parser with no `error` productions does on a token it can't
+// shift: report one "syntax error" (via yyerror, so "Line N:  syntax error") and give up on the
+// whole program. parser.y has no recovery rules, so the original never reports a second syntax
+// error, and code that counts errors (a programmer's `N error(s).`) sees exactly one.
+@(private = "file")
+syntax_error :: proc(p: ^Parser) {
+	if p.aborted {
+		return
+	}
+	parser_error(p, "syntax error")
+	p.aborted = true
+	#partial switch p.cur.kind {
+	case .String, .Id:
+		delete(p.cur.str_val)
+	}
+	p.cur = Token{kind = .EOF, line = p.cur.line}
 }
 
 // abort_parse records the error once and cuts the token stream off at EOF. The current
@@ -161,7 +189,7 @@ abort_parse :: proc(p: ^Parser) {
 @(private = "file")
 expect :: proc(p: ^Parser, kind: Token_Kind) -> Token {
 	if p.cur.kind != kind {
-		parser_errorf(p, "Unexpected token (wanted %v, got %v)", kind, p.cur.kind)
+		syntax_error(p)
 		return Token{kind = kind, line = p.cur.line}
 	}
 	return advance(p)
@@ -174,12 +202,17 @@ Parse_Result :: struct {
 }
 
 // parse_program ports parse_program()/the `program: statements` rule: a whole verb body.
-parse_program :: proc(src: string, version: int) -> Parse_Result {
+//
+// unknown_builtin_is_error: see Parser.unknown_builtin_is_error. Pass false only when compiling
+// a verb that is already stored in the database.
+parse_program :: proc(src: string, version: int, unknown_builtin_is_error := true) -> Parse_Result {
 	p := parser_make(src, version)
+	p.unknown_builtin_is_error = unknown_builtin_is_error
 	body := parse_statements(&p)
 	if p.cur.kind != .EOF {
-		parser_errorf(&p, "Unexpected token at end of program: %v", p.cur.kind)
+		syntax_error(&p)
 	}
+	assign_line_numbers(body)
 	// Collect the lexer's errors BEFORE destroying it. lexer_destroy frees the dynamic array
 	// itself (not the strings in it, which are handed over to p.errors here), so reading
 	// p.lexer.errors afterwards -- which is what this used to do -- walks freed memory. It
@@ -509,6 +542,14 @@ parse_expr :: proc(p: ^Parser, min_bp: int) -> Expr {
 			c.consequent = conseq
 			c.alternate = alt
 			lhs = c
+			// parser.y declares `%nonassoc '?' '|'`: a conditional can't be the condition of
+			// another one without parentheses, so `a ? b | c ? d | e` is a syntax error there,
+			// not a left-associated pair. (A conditional nested as the CONSEQUENT, `a ? b ? c |
+			// d | e`, is fine -- that `|` is the outer one's, matched by the expect above.)
+			if p.cur.kind == .Question {
+				syntax_error(p)
+				return lhs
+			}
 			continue
 		}
 
@@ -823,7 +864,7 @@ parse_primary :: proc(p: ^Parser) -> Expr {
 	case .Backtick:
 		return parse_catch(p)
 	}
-	parser_errorf(p, "Unexpected token: %v", p.cur.kind)
+	syntax_error(p)
 	advance(p)
 	e := new(Expr_Var)
 	e.value = values.int_val(0)
@@ -869,6 +910,9 @@ parse_id_or_call :: proc(p: ^Parser) -> Expr {
 		e.name = tok.str_val
 		e.is_known = is_known_builtin(tok.str_val)
 		e.args = args
+		if !e.is_known && p.unknown_builtin_is_error {
+			parser_errorf(p, "Unknown built-in function: %s", tok.str_val)
+		}
 		return e
 	}
 	id := new(Expr_Id)

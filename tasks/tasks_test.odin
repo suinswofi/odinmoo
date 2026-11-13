@@ -73,7 +73,7 @@ make_test_world :: proc(s: ^Scheduler) -> vm.World {
 
 @(private = "file")
 run_src :: proc(t: ^testing.T, world: ^vm.World, task_id: int, src: string) -> vm.Stmt_Result {
-	r := compiler.parse_program(src, compiler.DBV_Float)
+	r := compiler.parse_program(src, compiler.DBV_Float, unknown_builtin_is_error = false) // bump_counter is a test-only built-in
 	defer {
 		compiler.free_stmts(r.body)
 		compiler.name_table_destroy(&r.names)

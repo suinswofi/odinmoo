@@ -9,6 +9,7 @@ import "../compiler"
 import "../dbfile"
 import "../values"
 import "../vm"
+import "core:c/libc"
 import "core:fmt"
 import "core:strings"
 
@@ -29,12 +30,15 @@ bf_floatstr :: proc(args: values.Var) -> vm.Call_Result {
 	if prec < 0 {
 		return err_result_local(.E_INVARG, "Invalid argument")
 	}
-	if prec > 19 {
+	if prec > 19 { // DBL_DIG + 4
 		prec = 19
 	}
 	use_sci := n == 3 && values.is_true(values.list_get(args, 3))
-	text := fmt.tprintf("%.*e", prec, f_v.data.fnum) if use_sci else fmt.tprintf("%.*f", prec, f_v.data.fnum)
-	return ok_result(values.str_val(strings.clone(text)))
+	// sprintf("%.<prec>f" / "%.<prec>e"), through the C library so the rounding is the
+	// original's.
+	buf: [512]byte
+	length := libc.snprintf(raw_data(buf[:]), len(buf), use_sci ? "%.*e" : "%.*f", i32(prec), f_v.data.fnum)
+	return ok_result(values.str_val(strings.clone(string(buf[:clamp(int(length), 0, len(buf) - 1)]))))
 }
 
 // bf_value_bytes ports list.c's bf_value_bytes(), via utils.c's value_bytes(): an estimate of
@@ -127,20 +131,22 @@ bf_memory_usage :: proc(args: values.Var) -> vm.Call_Result {
 // only actually depends on function_info() to check *whether a name exists*
 // ($wiz_utils-style `function_info(name) ! E_INVARG => 0` existence probes), never on the
 // arg-count details, so this is a deliberate, narrow approximation, not a silent gap.
+// function_description ports functions.c's function_description(): {name, min-args,
+// max-args, {type, ...}} straight from the prototype table call_bi_func checks against.
 @(private = "file")
-function_description :: proc(name: string) -> values.Var {
+function_description :: proc(p: Bf_Proto) -> values.Var {
 	fields := make([]values.Var, 4)
-	fields[0] = values.str_val(strings.clone(name))
-	fields[1] = values.int_val(0)
-	fields[2] = values.int_val(-1)
-	fields[3] = values.empty_list()
+	fields[0] = values.str_val(strings.clone(p.name))
+	fields[1] = values.int_val(i32(p.min))
+	fields[2] = values.int_val(i32(p.max))
+	types := make([]values.Var, len(p.types))
+	for t, i in p.types {
+		types[i] = values.int_val(i32(t))
+	}
+	fields[3] = values.list_val(types)
 	return values.list_val(fields)
 }
 
-// bf_function_info ports functions.c's bf_function_info(): with no argument, every known
-// builtin's description; with a name, that one's -- or E_INVARG if it's not a recognized
-// builtin name (checked against compiler.known_builtin_functions, the single canonical name
-// list this whole port already uses for parsing).
 bf_function_info :: proc(args: values.Var) -> vm.Call_Result {
 	defer values.free_var(args)
 	n := values.list_len(args)
@@ -148,11 +154,9 @@ bf_function_info :: proc(args: values.Var) -> vm.Call_Result {
 		return err_result_local(.E_ARGS, "Incorrect number of arguments")
 	}
 	if n == 0 {
-		items := make([]values.Var, len(compiler.known_builtin_functions))
-		i := 0
-		for name in compiler.known_builtin_functions {
-			items[i] = function_description(name)
-			i += 1
+		items := make([]values.Var, len(bf_prototypes))
+		for p, i in bf_prototypes {
+			items[i] = function_description(p)
 		}
 		return ok_result(values.list_val(items))
 	}
@@ -160,16 +164,13 @@ bf_function_info :: proc(args: values.Var) -> vm.Call_Result {
 	if name_v.type != .Str {
 		return err_result_local(.E_TYPE, "Type mismatch")
 	}
-	if !compiler.is_known_builtin(name_v.data.str.s) {
+	p, ok := bf_proto(name_v.data.str.s)
+	if !ok {
 		return err_result_local(.E_INVARG, "Invalid argument")
 	}
-	return ok_result(function_description(name_v.data.str.s))
+	return ok_result(function_description(p))
 }
 
-// bf_call_function ports execute.c's bf_call_function(): call_function(name, @args) dispatches
-// to the named builtin exactly as if it had been called directly (name(@args)) -- reuses the
-// same dispatch chain (builtins' pure table, then this package's own object-aware set, then
-// the scheduler's) that an ordinary Expr_Call already goes through, via ctx.world.call_builtin.
 bf_call_function :: proc(args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Result {
 	n := values.list_len(args)
 	// call_function("call_function", ..., "real_name", @real_args) is legal, and means exactly

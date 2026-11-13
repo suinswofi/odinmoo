@@ -167,18 +167,21 @@ Stmt :: union {
 }
 
 Cond_Arm :: struct {
+	line: int, // first line of this construct in the decompiled listing -- see assign_line_numbers
 	condition: Expr,
 	body:      []Stmt,
 }
 
 // if/elseif*/else/endif. `otherwise` is nil when there's no `else` clause.
 Stmt_Cond :: struct {
+	line: int, // first line of this construct in the decompiled listing -- see assign_line_numbers
 	arms:      []Cond_Arm,
 	otherwise: []Stmt,
 }
 
 // for VAR in (list_expr) ... endfor
 Stmt_List_Loop :: struct {
+	line: int, // first line of this construct in the decompiled listing -- see assign_line_numbers
 	var_id: int,
 	list:   Expr,
 	body:   []Stmt,
@@ -186,6 +189,7 @@ Stmt_List_Loop :: struct {
 
 // for VAR in [from..to] ... endfor
 Stmt_Range_Loop :: struct {
+	line: int, // first line of this construct in the decompiled listing -- see assign_line_numbers
 	var_id:    int,
 	from, to:  Expr,
 	body:      []Stmt,
@@ -194,6 +198,7 @@ Stmt_Range_Loop :: struct {
 // while (cond) ... endwhile, and the named form `while VAR (cond) ... endwhile`.
 // var_id == -1 for the unnamed form.
 Stmt_While :: struct {
+	line: int, // first line of this construct in the decompiled listing -- see assign_line_numbers
 	var_id:    int,
 	condition: Expr,
 	body:      []Stmt,
@@ -201,41 +206,49 @@ Stmt_While :: struct {
 
 // fork (time) ... endfork, and the named form `fork VAR (time) ... endfork`.
 Stmt_Fork :: struct {
+	line: int, // first line of this construct in the decompiled listing -- see assign_line_numbers
 	var_id: int,
 	time:   Expr,
 	body:   []Stmt,
 }
 
 Stmt_Expr :: struct {
+	line: int, // first line of this construct in the decompiled listing -- see assign_line_numbers
 	expr: Expr,
 }
 
 // return [expr];  -- expr is nil for a bare `return;`.
 Stmt_Return :: struct {
+	line: int, // first line of this construct in the decompiled listing -- see assign_line_numbers
 	expr: Expr,
 }
 
 Except_Arm :: struct {
+	line: int, // first line of this construct in the decompiled listing -- see assign_line_numbers
 	var_id: int,   // -1 if the exception value isn't bound to a name
 	codes:  []Arg, // nil means ANY
 	body:   []Stmt,
 }
 
 Stmt_Try_Except :: struct {
+	line: int, // first line of this construct in the decompiled listing -- see assign_line_numbers
 	body:    []Stmt,
 	excepts: []Except_Arm,
 }
 
 Stmt_Try_Finally :: struct {
+	line: int, // first line of this construct in the decompiled listing -- see assign_line_numbers
 	body:    []Stmt,
 	handler: []Stmt,
 }
 
 // break [VAR];  -- var_id == -1 for the unnamed form.
 Stmt_Break :: struct {
+	line: int, // first line of this construct in the decompiled listing -- see assign_line_numbers
 	var_id: int,
 }
 
 Stmt_Continue :: struct {
+	line: int, // first line of this construct in the decompiled listing -- see assign_line_numbers
 	var_id: int,
 }

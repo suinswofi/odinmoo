@@ -20,6 +20,7 @@ package objdb
 
 import "../dbfile"
 import "../values"
+import "core:strconv"
 import "core:strings"
 
 // VERB_CACHE_MAX bounds the cache: a loop calling o:("v" + tostr(i))() would otherwise add an
@@ -94,13 +95,24 @@ find_callable_verb_uncached :: proc(db: ^dbfile.Database, oid: values.Objid, nam
 // find_defined_verb ports db_find_defined_verb(): looks only at oid's OWN verbdefs (no
 // inheritance walk, no VF_EXEC requirement) -- used for editing/introspection builtins like
 // verb_code()/set_verb_code(), not for `obj:verb(...)` dispatch.
-find_defined_verb :: proc(db: ^dbfile.Database, oid: values.Objid, name: string) -> Verb_Handle {
+//
+// allow_numbers is $server_options.support_numeric_verbname_strings: a name that is entirely a
+// decimal number (no leading space) then also matches the verb at that 0-BASED position --
+// db_find_defined_verb's `i == num`, against a counter that starts at 0, unlike the 1-based
+// index an INT verb descriptor gives.
+find_defined_verb :: proc(db: ^dbfile.Database, oid: values.Objid, name: string, allow_numbers := false) -> Verb_Handle {
 	obj, ok := db.objects[oid]
 	if !ok {
 		return Verb_Handle{}
 	}
+	num := -1
+	if allow_numbers && len(name) > 0 && name[0] != ' ' {
+		if n, nok := strconv.parse_int(name, 10); nok {
+			num = n
+		}
+	}
 	for vd, i in obj.verbdefs {
-		if verb_name_matches(vd.name, name) {
+		if i == num || verb_name_matches(vd.name, name) {
 			return Verb_Handle{definer = oid, index = i, found = true}
 		}
 	}

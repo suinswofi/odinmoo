@@ -11,23 +11,29 @@ package netio
 // connection.odin's header note on what's left of that as a `.eval` debugging escape hatch).
 
 import "../objdb"
-import "../tasks"
 import "../values"
-import "../vm"
 import "core:strings"
 import "core:sync"
 
-// handle_intrinsic_command ports do_intrinsic_command(): checks the parsed command's verb
-// against the small, fixed set of server-level (not database) commands, matching
-// case-insensitively rather than the original's verbcasecmp-with-wildcard-abbreviation
-// (".pr*ogram" etc.) -- a documented simplification; ".program"/"PREFIX"/etc. typed in full
-// is the overwhelmingly common case. Returns true iff handled (caller does nothing further
-// for this line); `.program` specifically falls through (returns false) for a non-programmer,
-// exactly like the original -- PREFIX/SUFFIX have no such restriction.
+// handle_intrinsic_command ports do_intrinsic_command(): the parsed verb is checked against
+// the server's own commands -- `.program` (matched like the verb name ".pr*ogram") and the
+// exact-case PREFIX/SUFFIX/OUTPUTPREFIX/OUTPUTSUFFIX -- each only if the connection's
+// "intrinsic-commands" option still enables it. Returns true iff handled. `.program` falls
+// through for a non-programmer, exactly like the original.
 @(private = "file")
 handle_intrinsic_command :: proc(conn: ^Connection, ow: ^objdb.Object_World, pc: ^objdb.Parsed_Command) -> bool {
-	switch {
-	case values.strings_equal_fold(pc.verb, ".program"):
+	icmd, ok := icmd_index(pc.verb)
+	if !ok {
+		return false
+	}
+	sync.mutex_lock(&conn.io_lock)
+	enabled := icmd in conn.options.icmds
+	sync.mutex_unlock(&conn.io_lock)
+	if !enabled {
+		return false
+	}
+	switch icmd {
+	case .Program:
 		sync.mutex_lock(&conn.server.scheduler.big_lock)
 		is_programmer := objdb.is_programmer(ow.db, conn.player)
 		sync.mutex_unlock(&conn.server.scheduler.big_lock)
@@ -39,29 +45,26 @@ handle_intrinsic_command :: proc(conn: ^Connection, ow: ^objdb.Object_World, pc:
 		} else {
 			start_programming(conn, ow, pc.args[0])
 		}
-		return true
-	case values.strings_equal_fold(pc.verb, "PREFIX"), values.strings_equal_fold(pc.verb, "OUTPUTPREFIX"):
+	case .Prefix, .Outputprefix:
 		set_output_delimiter(conn, &conn.output_prefix, pc.argstr)
-		return true
-	case values.strings_equal_fold(pc.verb, "SUFFIX"), values.strings_equal_fold(pc.verb, "OUTPUTSUFFIX"):
+	case .Suffix, .Outputsuffix:
 		set_output_delimiter(conn, &conn.output_suffix, pc.argstr)
-		return true
 	}
-	return false
+	return true
 }
 
-// dispatch_command parses `line` and runs the real command dispatch algorithm against
-// `conn.player`. All visible output happens via the dispatched verb's own notify() calls
-// (matching the original -- typed commands don't have a meaningful "return value" the client
-// sees); this only speaks up directly for the "nothing matched" / uncaught-error cases.
+// dispatch_command ports do_command_task(): parse the line; an intrinsic command is handled
+// here; otherwise, bracketed by the PREFIX/SUFFIX lines, #0:do_command(@words) gets first
+// refusal (it runs as a server task with argstr = the whole line, and a true result -- or the
+// task not completing -- means it handled the line), then the parsed verb is looked for on
+// the player, their location, the direct object and the indirect object, then `huh` on the
+// location, and failing all of those the player is told "I couldn't understand that.". The
+// matched verb runs as a new task (do_input_task); an error it doesn't catch is reported the
+// way every task's is (objdb.task_aborted: #0:handle_uncaught_error, or a traceback).
 dispatch_command :: proc(conn: ^Connection, line: string) {
 	s := conn.server
 	ow := (^objdb.Object_World)(s.world.user_data)
 
-	// parse_command is a DB read like any other -- dobj/iobj matching walks the player's and
-	// the room's contents chains -- so it can't run unlocked on this connection thread while
-	// other tasks mutate the object graph. Locked separately from the dispatch block below
-	// because handle_intrinsic_command takes the (non-reentrant) lock itself.
 	sync.mutex_lock(&s.scheduler.big_lock)
 	pc := objdb.parse_command(ow.db, line, conn.player)
 	sync.mutex_unlock(&s.scheduler.big_lock)
@@ -74,11 +77,6 @@ dispatch_command :: proc(conn: ^Connection, line: string) {
 		return
 	}
 
-	// PREFIX/OUTPUTPREFIX and SUFFIX/OUTPUTSUFFIX bracket every ORDINARY command's output
-	// (not an intrinsic command's own reply, which already returned above) -- matches
-	// do_command_task() sending output_prefix before and output_suffix after everything
-	// else, unconditionally, regardless of which of #0:do_command/verb-dispatch/"I couldn't
-	// understand that" ends up handling the line below.
 	// Snapshot both under io_lock rather than reading conn.output_prefix/suffix directly at
 	// each use: output_delimiters() reads them from another thread (login.odin's
 	// hook_output_delimiters) and a PREFIX command frees the old string as it installs a new
@@ -95,13 +93,16 @@ dispatch_command :: proc(conn: ^Connection, line: string) {
 		}
 	}
 
-	task_id := tasks.new_task_id(s.scheduler)
-
 	sync.mutex_lock(&s.scheduler.big_lock)
 	defer sync.mutex_unlock(&s.scheduler.big_lock)
 
-	if call_do_command_hook(ow, s.world, conn.player, line, pc.args, task_id) {
-		// #0:do_command returned true -- assume it handled everything itself.
+	handled, outcome := objdb.run_root_verb(ow, s.world, objdb.Root_Call{
+		player = conn.player, this = SYSTEM_OBJECT, verb = "do_command",
+		args = words_to_list(split_command_words(line)), argstr = line,
+	})
+	is_handled := outcome != .Done || values.is_true(handled)
+	values.free_var(handled)
+	if is_handled {
 		return
 	}
 
@@ -140,78 +141,28 @@ dispatch_command :: proc(conn: ^Connection, line: string) {
 		return
 	}
 
-	result := call_command_verb(ow, s.world, this_obj, &pc, conn.player, task_id, vh)
-	if result.raised {
-		msg := strings.concatenate({"%r** ", result.msg, " **%n"})
-		defer delete(msg)
-		send_line(conn, msg)
-		delete(result.msg)
-		values.free_var(result.rvalue)
-	} else {
-		values.free_var(result.value)
-	}
+	// do_input_task: `verb` is what was typed (even for a `huh` fallback), `caller` is the
+	// player, and the parsed command's dobj/iobj/...str are bound.
+	result, _ := objdb.run_root_verb(ow, s.world, objdb.Root_Call{
+		player = conn.player, this = this_obj, verb = pc.verb, args = words_to_owned_list(pc.args),
+		argstr = pc.argstr, cmd = &pc, vh = vh,
+	})
+	values.free_var(result)
 }
 
-// call_do_command_hook ports the #0:do_command probe in do_command_task(): a fresh root task
-// (run_server_task_setting_id's generic environment -- argstr is the raw line, dobj/iobj/etc
-// default to NOTHING/"", NOT the parsed pc values; do_input_task is the one that binds those,
-// only for the actual matched command verb below). Returns whether it was truthy (verb
-// existing and returning a true value means "handled, do nothing more"); a missing verb or
-// any raised error both mean "not handled," matching run_server_task_setting_id's "simulate
-// an empty verb" fallback.
-@(private = "file")
-call_do_command_hook :: proc(ow: ^objdb.Object_World, world: ^vm.World, player: values.Objid, line: string, words: []string, task_id: int) -> bool {
-	args := words_to_owned_list(words)
-	root_act := vm.Activation{
-		this       = values.NOTHING,
-		player     = player,
-		caller     = values.NOTHING,
-		programmer = values.NOTHING,
-		verb_loc   = values.NOTHING,
-		task_id    = task_id,
-		depth      = -1,
-		dobj       = values.NOTHING,
-		iobj       = values.NOTHING,
-		argstr     = line,
-	}
-	ctx := vm.Eval_Context{activation = &root_act, world = world}
-	result := objdb.call_verb_from(ow, world, SYSTEM_OBJECT, SYSTEM_OBJECT, "do_command", args, &ctx)
-	if result.raised {
-		delete(result.msg)
-		values.free_var(result.rvalue)
-		return false
-	}
-	defer values.free_var(result.value)
-	return values.is_true(result.value)
-}
-
-// call_command_verb ports do_input_task(): a fresh root task whose `this` is whichever
-// candidate object find_verb_on matched on, with the parsed command's dobj/iobj/dobjstr/
-// iobjstr/prepstr/argstr bound into the callee's locals (call_verb_from's `cmd` override --
-// see world.odin). Root depth=-1 so the callee lands at depth=0, a true top-level command,
-// not a nested call.
-//
-// `vh` is the Verb_Handle dispatch_command already resolved via find_verb_on -- passed
-// straight through as call_verb_from's vh_hint rather than searched for again by name, since
-// a second search (find_callable_verb) would wrongly require VF_EXEC on a verb that command
-// dispatch never needed it on (see world.odin's call_verb_from comment). `name` stays
-// pc.verb (what the player actually typed) even when `vh` is a `huh` fallback -- do_input_task
-// binds RUN_ACTIV.verb/SLOT_VERB from pc->verb unconditionally, so a `huh` handler sees what
-// was really typed, not the literal word "huh".
-@(private = "file")
-call_command_verb :: proc(ow: ^objdb.Object_World, world: ^vm.World, this_obj: values.Objid, pc: ^objdb.Parsed_Command, player: values.Objid, task_id: int, vh: objdb.Verb_Handle) -> vm.Call_Result {
-	args := words_to_owned_list(pc.args)
-	root_act := vm.Activation{
-		this       = player,
-		player     = player,
-		caller     = values.NOTHING,
-		programmer = values.NOTHING,
-		verb_loc   = values.NOTHING,
-		task_id    = task_id,
-		depth      = -1,
-	}
-	ctx := vm.Eval_Context{activation = &root_act, world = world}
-	return objdb.call_verb_from(ow, world, this_obj, this_obj, pc.verb, args, &ctx, pc, vh)
+// dispatch_oob ports do_out_of_band_command(): #0:do_out_of_band_command(@words), argstr =
+// the line, as a server task for this connection's player (logged in or not). Not
+// file-private: input_queue.odin's drain worker calls it. Consumes `line`.
+dispatch_oob :: proc(conn: ^Connection, line: string) {
+	defer delete(line)
+	s := conn.server
+	sync.mutex_lock(&s.scheduler.big_lock)
+	v, _ := objdb.run_root_verb(world_of(s), s.world, objdb.Root_Call{
+		player = conn.player, this = SYSTEM_OBJECT, verb = "do_out_of_band_command",
+		args = words_to_list(split_command_words(line)), argstr = line,
+	})
+	sync.mutex_unlock(&s.scheduler.big_lock)
+	values.free_var(v)
 }
 
 // words_to_owned_list builds a fresh MOO list of strings from a []string, cloning each word

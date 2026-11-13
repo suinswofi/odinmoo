@@ -56,7 +56,6 @@ parsed_command_destroy :: proc(pc: ^Parsed_Command) {
 // layers -- login-line parsing predates command parsing and there's no lower-level shared
 // package both already depend on); if the two ever drift, this one is the one to trust for
 // anything touching Parsed_Command.
-@(private = "file")
 parse_words :: proc(s: string) -> []string {
 	words: [dynamic]string
 	i := 0
@@ -167,6 +166,33 @@ find_prep :: proc(words: []string) -> (prep: int, first: int, last: int, found: 
 	return 0, 0, 0, false
 }
 
+// NPREPS is db_verbs.c's count of prepositions (prep_list's length).
+NPREPS :: 15
+
+// find_prep_exact is db_find_prep()'s exact-match mode (no first/last wanted): an alternative
+// must start at the first word and cover every word.
+find_prep_exact :: proc(words: []string) -> int {
+	if len(words) == 0 {
+		return PREP_NONE
+	}
+	for entry in prep_table {
+		if len(entry.words) != len(words) {
+			continue
+		}
+		matched := true
+		for w, k in entry.words {
+			if !values.strings_equal_fold(words[k], w) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return entry.prep
+		}
+	}
+	return PREP_NONE
+}
+
 // parse_command ports parse_cmd.c's parse_command(): splits a raw typed line into a verb
 // name plus dobj/prep/iobj structure, resolving dobj/iobj text against `user`'s surroundings
 // via match_object. The `"`/`:`/`;` first-character shorthands (say/emote/eval) are a real
@@ -272,8 +298,11 @@ match_object :: proc(db: ^dbfile.Database, player: values.Objid, name: string) -
 		return values.NOTHING
 	}
 	if name[0] == '#' {
-		n, ok := strconv.parse_int(name[1:])
-		if !ok || !valid(db, values.Objid(n)) {
+		// strtol(name + 1, &p, 10), then *p must be the end: leading blanks and a sign are
+		// accepted, anything after the digits is not, and no digits at all parses as 0 (so a
+		// bare "#" names #0, exactly as it does in the original).
+		n, rest := c_strtol(name[1:])
+		if rest != "" || !valid(db, values.Objid(n)) {
 			return FAILED_MATCH
 		}
 		return values.Objid(n)
@@ -430,4 +459,30 @@ find_verb_on :: proc(db: ^dbfile.Database, oid: values.Objid, pc: ^Parsed_Comman
 		iobj_spec = 0
 	}
 	return find_command_verb(db, oid, pc.verb, dobj_spec, pc.prep, iobj_spec)
+}
+
+// c_strtol is strtol(s, &end, 10) for an Objid-sized result: skip leading whitespace, take an
+// optional sign and the decimal digits that follow, and return the unparsed remainder. With no
+// digits the result is 0 and the remainder is all of `s`, as strtol leaves *end == s.
+c_strtol :: proc(s: string) -> (n: i64, rest: string) {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || (s[i] >= '\t' && s[i] <= '\r')) {
+		i += 1
+	}
+	neg := false
+	if i < len(s) && (s[i] == '+' || s[i] == '-') {
+		neg = s[i] == '-'
+		i += 1
+	}
+	start := i
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		if n < 1 << 40 {
+			n = n * 10 + i64(s[i] - '0')
+		}
+		i += 1
+	}
+	if i == start {
+		return 0, s
+	}
+	return neg ? -n : n, s[i:]
 }

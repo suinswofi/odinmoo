@@ -21,13 +21,13 @@ package vm
 // one executed STATEMENT (exec_stmt.odin charges exactly one per statement). That is coarser
 // than a bytecode op but has the property that actually matters -- every loop iteration and
 // every verb call costs at least one -- so no amount of MOO code can run unboundedly without
-// being charged. It also means the count is not comparable op-for-op with the original's;
-// MAX_TICKS is set to the original's 30000 anyway, on the grounds that core code compares
-// ticks_left() against thresholds picked for that number ($command_utils:suspend_if_needed
-// and its callers), and a budget generous enough to be invisible to correct code is the
-// right direction to err in.
+// being charged. It also means the count is not comparable op-for-op with the original's; the
+// limits are the original's numbers anyway (DEFAULT_FG_TICKS etc., overridden by
+// $server_options exactly as there), on the grounds that core code compares ticks_left()
+// against thresholds picked for them ($command_utils:suspend_if_needed and its callers), and
+// a statement costs at least one bytecode op, so the same number is never stricter here.
 //
-// MAX_SECONDS is the second half of the budget, and its limits must be stated honestly because
+// The seconds limit is the second half of the budget, and its limits must be stated honestly because
 // an earlier version of this comment overstated them. It is checked every CLOCK_CHECK_TICKS
 // charges -- and a charge only happens BETWEEN statements, so the deadline is unreachable while
 // a single built-in runs. It therefore bounds a task that executes many slow statements; it does
@@ -65,19 +65,42 @@ import "../values"
 import "core:strings"
 import "core:time"
 
-// MAX_TICKS/MAX_SECONDS are the original's DEFAULT_MAX_TICKS/DEFAULT_MAX_SECONDS
-// (options.h) for a foreground task. The original gives forked and resumed (background)
-// tasks the smaller DEFAULT_BG_TICKS/DEFAULT_BG_SECONDS; this port applies the foreground
-// pair to every task, which is the permissive direction and one fewer thing for the
-// scheduler to have to know about a task. The $server_options overrides those defaults can
-// be given in the original aren't supported here, same as MAX_VERB_DEPTH's aren't.
-MAX_TICKS :: 30_000
-MAX_SECONDS :: 5.0
+// DEFAULT_FG_TICKS/... are the original's options.h defaults. As in the original they are only
+// defaults: $server_options.fg_ticks/fg_seconds/bg_ticks/bg_seconds override them, looked up
+// anew every time a task begins or resumes (execute.c's run_interpreter), through
+// World.task_limits. "fg" is a task started by player input or by the server itself that has
+// never suspended; "bg" is a forked task, or any task resuming from suspend()/read().
+DEFAULT_FG_TICKS :: 30_000
+DEFAULT_BG_TICKS :: 15_000
+DEFAULT_FG_SECONDS :: 5
+DEFAULT_BG_SECONDS :: 3
+// DEFAULT_MAX_STACK_DEPTH is options.h's DEFAULT_MAX_STACK_DEPTH, overridable by
+// $server_options.max_stack_depth and fixed for a task when it is created.
+DEFAULT_MAX_STACK_DEPTH :: 50
+
+// MAX_TICKS/MAX_SECONDS are kept as names for the foreground defaults (tests and tools refer to
+// them).
+MAX_TICKS :: DEFAULT_FG_TICKS
+MAX_SECONDS :: f64(DEFAULT_FG_SECONDS)
+
+// Task_Limits is what World.task_limits answers: the allowance a task gets for one run.
+Task_Limits :: struct {
+	ticks:     int,
+	seconds:   f64,
+	max_depth: int,
+}
+
+default_limits :: proc(background: bool) -> Task_Limits {
+	if background {
+		return Task_Limits{DEFAULT_BG_TICKS, f64(DEFAULT_BG_SECONDS), DEFAULT_MAX_STACK_DEPTH}
+	}
+	return Task_Limits{DEFAULT_FG_TICKS, f64(DEFAULT_FG_SECONDS), DEFAULT_MAX_STACK_DEPTH}
+}
 
 // How many charges may happen between two wall-clock checks. Reading the clock is orders of
 // magnitude more expensive than decrementing a counter, and this runs on every statement and
 // every loop iteration; 256 keeps that cost negligible while still bounding how far past
-// MAX_SECONDS a task of pathologically slow individual statements can get.
+// the seconds limit a task of pathologically slow individual statements can get.
 @(private = "file")
 CLOCK_CHECK_TICKS :: 256
 
@@ -87,31 +110,79 @@ Budget_Exhaustion :: enum {
 	Seconds,
 }
 
+// Task_Budget is the per-task state every activation of one task shares (call_verb_from and
+// bf_eval copy the pointer): the tick/second allowance, the verb-depth ceiling, and the record
+// of where the most recent error was raised (see traceback.odin).
 Task_Budget :: struct {
 	ticks_left: int,
+	max_seconds: f64,
 	started:    time.Tick,
 	out_of:     Budget_Exhaustion, // sticky once set: the abort must not be retryable
+	max_depth:  int, // $server_options.max_stack_depth as of the task's creation
+
+	// killed is set when kill_task() ends this task while it is parked. The original simply
+	// frees a killed task's VM: nothing runs, nothing is reported. Here the parked thread has to
+	// unwind, so it does so uncatchably and the task's runner reports nothing.
+	killed: bool,
+
+	// world lets budget_renew look up the background limits a resumed task gets.
+	world: ^World,
+
+	// Where the most recent error raised in this task came from -- see traceback.odin.
+	err_serial: int,
+	err_frames: [dynamic]Frame,
 }
 
-budget_init :: proc(b: ^Task_Budget) {
-	b.ticks_left = MAX_TICKS
+// budget_open initializes a task's budget with the limits World.task_limits reports (or the
+// defaults if there is no such hook). Pair with budget_close.
+budget_open :: proc(b: ^Task_Budget, world: ^World, background: bool) {
+	b^ = {}
+	b.world = world
+	limits := default_limits(background)
+	if world != nil && world.task_limits != nil {
+		limits = world.task_limits(world, background)
+	}
+	b.max_depth = limits.max_depth
+	budget_set(b, limits)
+}
+
+budget_close :: proc(b: ^Task_Budget) {
+	frames_clear(&b.err_frames)
+	delete(b.err_frames)
+	b.err_frames = nil
+}
+
+@(private = "file")
+budget_set :: proc(b: ^Task_Budget, limits: Task_Limits) {
+	b.ticks_left = limits.ticks
+	b.max_seconds = limits.seconds
 	b.started = time.tick_now()
 	b.out_of = .None
 }
 
+// budget_init gives b the default foreground allowance with no World. Kept for callers that
+// drive the interpreter directly (tests).
+budget_init :: proc(b: ^Task_Budget) {
+	budget_set(b, default_limits(false))
+	if b.max_depth == 0 {
+		b.max_depth = DEFAULT_MAX_STACK_DEPTH
+	}
+}
+
 // budget_renew hands the task a fresh allowance. Called when a task comes back from
 // suspend()/read(): the time it spent parked was not spent holding big_lock, so charging it
-// against the budget would be charging the task for someone else's work -- and, more
-// practically, a resumed task would have 0 ticks and abort on its first statement, which
-// would break the one idiom the budget most needs to keep working (a long core loop calling
-// $command_utils:suspend_if_needed to continue in a fresh slice). The original does the same
-// thing from the other direction: a resumed task is re-queued as a new background task with
-// its own full budget.
+// against the budget would be charging the task for someone else's work. The original does the
+// same thing from the other direction: a resumed task is re-queued as a new BACKGROUND task, so
+// it gets the bg limits, looked up afresh.
 budget_renew :: proc(b: ^Task_Budget) {
 	if b == nil {
 		return
 	}
-	budget_init(b)
+	limits := default_limits(true)
+	if b.world != nil && b.world.task_limits != nil {
+		limits = b.world.task_limits(b.world, true)
+	}
+	budget_set(b, limits)
 }
 
 // budget_charge bills one statement and reports whether the task may continue. A nil budget
@@ -130,7 +201,7 @@ budget_charge :: proc(b: ^Task_Budget) -> bool {
 	}
 	b.ticks_left -= 1
 	if b.ticks_left % CLOCK_CHECK_TICKS == 0 {
-		if time.duration_seconds(time.tick_since(b.started)) > MAX_SECONDS {
+		if time.duration_seconds(time.tick_since(b.started)) > b.max_seconds {
 			b.out_of = .Seconds
 			return false
 		}
@@ -144,7 +215,7 @@ budget_seconds_left :: proc(b: ^Task_Budget) -> int {
 	if b == nil {
 		return int(MAX_SECONDS)
 	}
-	remaining := MAX_SECONDS - time.duration_seconds(time.tick_since(b.started))
+	remaining := b.max_seconds - time.duration_seconds(time.tick_since(b.started))
 	if remaining < 0 {
 		return 0
 	}
