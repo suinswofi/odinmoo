@@ -309,6 +309,20 @@ task_snapshot :: proc(s: ^Scheduler, id: int) -> (Task_Snapshot, bool) {
 //    thread has actually finished (thread.destroy joins first). Reaping on spawn keeps the
 //    list bounded without a dedicated reaper thread: anything finished is collected the next
 //    time any worker anywhere is started, and reap_workers() below covers shutdown.
+//
+// 3. Every worker releases its own context.temp_allocator arena when it finishes
+//    (worker_trampoline). core:thread does that for a thread only when it is started WITHOUT
+//    an init_context -- with one, as (1) requires, "it's entirely up to [the caller] to handle
+//    whatever allocators they're using" (thread.odin's _maybe_destroy_default_temp_allocator).
+//    The per-task free_all() calls elsewhere don't cover it: an arena's free_all keeps its
+//    first block (4MB by default) for reuse, and only destroying the arena returns it. So
+//    every exiting worker that had touched the temp allocator once -- a drain worker that
+//    formatted a float for tostr(), a fork worker that called queue_info(), the checkpoint
+//    writer on a database holding a float -- leaked a 4MB mapping. A drain worker lives for
+//    one burst of input, so that was 4MB per float-printing command: invisible in RSS (the
+//    block is calloc'd and mostly never touched) but a separate mmap each, so a long-lived
+//    server ran into vm.max_map_count after ~65k of them, and from then on every
+//    allocation could fail.
 @(private = "file")
 worker_lock: sync.Mutex
 @(private = "file")
@@ -329,12 +343,53 @@ spawn_worker :: proc(data: rawptr, fn: proc(data: rawptr)) -> (ok: bool) {
 	sync.mutex_lock(&worker_lock)
 	defer sync.mutex_unlock(&worker_lock)
 	reap_finished_locked()
-	t := thread.create_and_start_with_data(data, fn, init_context = body_context)
+	start := new(Worker_Start) // heap: see (1); freed by worker_trampoline
+	start^ = Worker_Start{data = data, fn = fn}
+	t := thread.create_and_start_with_data(start, worker_trampoline, init_context = body_context)
 	if t == nil {
+		free(start)
 		return false
 	}
 	append(&workers, t)
 	return true
+}
+
+@(private = "file")
+Worker_Start :: struct {
+	data: rawptr,
+	fn:   proc(data: rawptr),
+}
+
+// scratch_arenas_released counts workers that returned a temp-allocator arena on exit -- see
+// (3). Only tests read it; it is how they observe a cleanup that otherwise leaves no trace.
+scratch_arenas_released: int
+
+// worker_trampoline runs a worker's body, then destroys this thread's temp-allocator arena --
+// (3) above. _select_context_for_thread already pointed context.temp_allocator at THIS
+// thread's own thread-local arena, so the check below only ever destroys that, never the
+// spawning thread's.
+@(private = "file")
+worker_trampoline :: proc(raw: rawptr) {
+	start := (^Worker_Start)(raw)
+	data, fn := start.data, start.fn
+	free(start, runtime.heap_allocator())
+	fn(data)
+	release_thread_scratch()
+}
+
+// release_thread_scratch destroys the calling thread's default temp-allocator arena, if that is
+// what its context uses and it holds any memory.
+release_thread_scratch :: proc() {
+	when !runtime.NO_DEFAULT_TEMP_ALLOCATOR {
+		ta := context.temp_allocator
+		arena := &runtime.global_default_temp_allocator_data
+		if ta.procedure == runtime.default_temp_allocator_proc && ta.data == arena {
+			if arena.arena.curr_block != nil {
+				sync.atomic_add(&scratch_arenas_released, 1)
+			}
+			runtime.default_temp_allocator_destroy(arena)
+		}
+	}
 }
 
 // reap_workers joins and frees every worker thread that has finished. Called on spawn (so

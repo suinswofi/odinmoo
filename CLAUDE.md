@@ -163,6 +163,13 @@ Two structural points that are easy to violate by accident:
   silently lost 2113 of them; moving only the sleep into a timer then lost 2107 at the deadline
   instead, as 10000 threads queued on `big_lock`. Anything new that parks a task's thread must
   go through `park_wait`, or a parked fork stalls every fork queued behind it.
+
+  **Every thread must be started through `tasks.spawn_worker`**, which destroys the thread's
+  `context.temp_allocator` arena when it exits. core:thread does that only for threads started
+  *without* an `init_context`, and `free_all` keeps an arena's first 4MB block, so before
+  1.5.1 every exiting worker that had touched the temp allocator leaked a 4MB mapping —
+  one per float-printing command (`tostr(1.5)` on a drain worker), invisible in RSS, fatal
+  at `vm.max_map_count`. A thread started any other way needs the same cleanup.
 - **Every task runs under a tick/wall-clock budget (`vm/budget.odin`), and that is load-bearing
   here in a way it isn't upstream.** A running task holds `big_lock`, so an unterminating loop is
   not a slow task but a dead server — and nothing can preempt it (`kill_task()` only reaches

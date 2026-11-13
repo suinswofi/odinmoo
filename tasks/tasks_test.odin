@@ -590,3 +590,49 @@ test_parked_fork_does_not_block_the_run_queue :: proc(t: ^testing.T) {
 	testing.expect(t, counter == 1, "the fork queued behind a parked one still ran")
 	scheduler_shutdown(&s) // kills the parked one
 }
+
+// A worker started by spawn_worker must give back its temp-allocator arena when it exits.
+// core:thread skips that for a thread started with an init_context (which spawn_worker always
+// passes), and an arena's free_all keeps its first 4MB block -- so before the fix, every
+// exiting drain worker that had formatted a float leaked a 4MB mapping, and a long-lived
+// server eventually ran out of them (scheduler.odin's spawn_worker header, point 3).
+@(private = "file")
+scratch_worker :: proc(data: rawptr) {
+	use := (^bool)(data)^
+	if use {
+		s := strings.concatenate({"scratch ", "space"}, context.temp_allocator)
+		assert(len(s) == 13)
+		free_all(context.temp_allocator) // what the real workers do per task: keeps the block
+	}
+}
+
+@(private = "file")
+wait_for_released :: proc(target: int) -> bool {
+	deadline := time.tick_now()
+	for sync.atomic_load(&scratch_arenas_released) < target {
+		if time.tick_since(deadline) > 5 * time.Second {
+			return false
+		}
+		time.sleep(time.Millisecond)
+	}
+	return true
+}
+
+@(test)
+test_worker_releases_temp_arena :: proc(t: ^testing.T) {
+	sync.mutex_lock(&serial_tests)
+	defer sync.mutex_unlock(&serial_tests)
+
+	use_scratch, no_scratch := true, false
+	before := sync.atomic_load(&scratch_arenas_released)
+	for _ in 0 ..< 3 {
+		testing.expect(t, spawn_worker(&use_scratch, scratch_worker))
+	}
+	testing.expectf(t, wait_for_released(before + 3), "3 workers used scratch space, %d arenas released", sync.atomic_load(&scratch_arenas_released) - before)
+
+	// A worker that never touched its temp allocator has no arena to release.
+	testing.expect(t, spawn_worker(&no_scratch, scratch_worker))
+	time.sleep(50 * time.Millisecond)
+	reap_workers()
+	testing.expect_value(t, sync.atomic_load(&scratch_arenas_released), before + 3)
+}
