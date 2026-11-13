@@ -428,3 +428,38 @@ test_line_numbers_follow_listing :: proc(t: ^testing.T) {
 	testing.expect_value(t, tr.excepts[0].body[0].(^Stmt_Expr).line, 12)
 	testing.expect_value(t, r.body[3].(^Stmt_Return).line, 14)
 }
+
+// Built-in names match in any case, as number_func_by_name()'s mystrcasecmp does, and the call
+// is recorded under the canonical name -- so a stored verb that wrote `ToStr(x)` neither fails
+// to compile nor turns into a call_function("ToStr", ...) that raises E_INVARG at run time, and
+// it decompiles as the original's would: `tostr(x)`.
+@(test)
+test_parse_builtin_names_ignore_case :: proc(t: ^testing.T) {
+	for unknown_is_error in ([]bool{true, false}) { // freshly typed code, and a stored verb
+		r := parse_program("return ToStr(TOSTR(1), Add_Verb);", DBV_Float, unknown_builtin_is_error = unknown_is_error)
+		defer result_destroy(&r)
+		testing.expect_value(t, len(r.errors), 0)
+		outer := r.body[0].(^Stmt_Return).expr.(^Expr_Call)
+		testing.expect(t, outer.is_known)
+		testing.expect_value(t, outer.name, "tostr")
+		inner := outer.args[0].expr.(^Expr_Call)
+		testing.expect(t, inner.is_known)
+		testing.expect_value(t, inner.name, "tostr")
+		text := unparse_program(r.body, &r.names)
+		defer delete(text)
+		testing.expect_value(t, strings.trim_space(text), "return tostr(tostr(1), Add_Verb);")
+	}
+
+	// An unknown name keeps its spelling for the call_function() rewrite.
+	r := parse_program("Not_A_Builtin(1);", DBV_Float, unknown_builtin_is_error = false)
+	defer result_destroy(&r)
+	call := r.body[0].(^Stmt_Expr).expr.(^Expr_Call)
+	testing.expect(t, !call.is_known)
+	testing.expect_value(t, call.name, "Not_A_Builtin")
+
+	// canonical_builtin itself: nothing allocated for a miss, including an over-long name.
+	for name in ([]string{"", "nope", "tostrx", "TOSTR_", "tostrtostrtostrtostrtostrtostrtostr"}) {
+		_, ok := canonical_builtin(name)
+		testing.expectf(t, !ok, "%q must not be a built-in", name)
+	}
+}

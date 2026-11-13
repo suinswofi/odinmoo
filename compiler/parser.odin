@@ -907,8 +907,16 @@ parse_id_or_call :: proc(p: ^Parser) -> Expr {
 		args := parse_arglist(p)
 		expect(p, .RParen)
 		e := new(Expr_Call)
-		e.name = tok.str_val
-		e.is_known = is_known_builtin(tok.str_val)
+		// number_func_by_name(): any case matches, and the call is recorded under the
+		// canonical name, so `ToStr(x)` runs as and decompiles to `tostr(x)` -- see
+		// canonical_builtin. An unknown name keeps its spelling for the call_function rewrite.
+		if canon, ok := canonical_builtin(tok.str_val); ok {
+			delete(tok.str_val)
+			e.name = canon
+			e.is_known = true
+		} else {
+			e.name = tok.str_val
+		}
 		e.args = args
 		if !e.is_known && p.unknown_builtin_is_error {
 			parser_errorf(p, "Unknown built-in function: %s", tok.str_val)

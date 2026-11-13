@@ -78,7 +78,7 @@ Expr_Assign :: struct {
 // exactly as the C original does, so that forward-compatible/newer-builtin verb code
 // written for a different server build still parses.
 Expr_Call :: struct {
-	name:     string, // always the literal name as written, even when rewritten
+	name:     string, // known: the canonical (lower-case) name; unknown: the name as written
 	is_known: bool,
 	args:     []Arg,
 }

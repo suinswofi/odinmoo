@@ -316,6 +316,15 @@ Two structural points that are easy to violate by accident:
   function the server lacks fails to compile ("Unknown built-in function: foo"), while stored
   verbs still load (`parse_program`'s `unknown_builtin_is_error`); a syntax error is reported
   once ("syntax error") and stops the parse, as bison does with no error rules.
+- **Built-in names match in any case, and are canonicalized at the door.** The original
+  resolves a name to a function number once (`number_func_by_name`, `mystrcasecmp`) in the
+  parser, `call_function()` and `function_info()`; here those three call
+  `compiler.canonical_builtin`, and everything after them — the `protect_*` gate,
+  `bf_prototypes`, dispatch — is an exact-match map that only ever sees the lower-case name.
+  A new way for a name to reach `call_builtin` must canonicalize first: before 1.5.2 nothing
+  did, so `ToStr(x)` in a stored verb loaded as a `call_function` rewrite and raised E_INVARG
+  when run, and a canonicalization placed *after* the gate would let `ADD_VERB()` past a
+  wrapper keyed on `add_verb`.
 - **`resume()` and `kill_task()` are owner-or-wizard**, checked in `objdb`'s
   `task_control_denied` rather than in `tasks` — that package has no database access by design
   (same split `task_stack()` already uses). Task ids are small sequential integers, so without

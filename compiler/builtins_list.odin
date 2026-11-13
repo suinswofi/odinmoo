@@ -1,6 +1,8 @@
 #+feature dynamic-literals
 package compiler
 
+import "core:strings"
+
 // The set of built-in function names the C server registers, ported from grepping every
 // register_function()/register_function_with_read_write() call that a DEFAULT 1.8.3 build
 // compiles in (read_stdin, log_cache_stats and verb_cache_stats are behind #if EXAMPLE /
@@ -53,6 +55,45 @@ known_builtin_functions := map[string]bool {
 	"ansi_strip" = true, "ansi_len" = true, "ansify" = true, "notify_raw" = true,
 }
 
+// is_known_builtin is an EXACT lookup: true only for a name already in canonical (lower-case)
+// form. Anything that takes a name from MOO source or a MOO string must go through
+// canonical_builtin instead -- see below.
 is_known_builtin :: proc(name: string) -> bool {
 	return known_builtin_functions[name]
+}
+
+// MAX_BUILTIN_NAME is longer than every name in known_builtin_functions, so a name longer than
+// it can be rejected without a lookup.
+MAX_BUILTIN_NAME :: 32
+
+// canonical_builtin ports number_func_by_name(): built-in names match in ANY case
+// (mystrcasecmp), and what comes back is the table's own name -- every key above is lower
+// case, so that is the ASCII-lowered input. ok=false (and nothing allocated) for a name that
+// isn't a built-in. The result is owned.
+//
+// The original resolves a name to a function NUMBER once, in the parser, call_function() and
+// function_info(), and nothing after that ever sees the spelling: `ToStr(x)` compiles, runs
+// and decompiles as `tostr(x)`. This port keys everything downstream on the name instead --
+// the protect_* gate, the argument prototypes, dispatch -- with exact-match maps, so the same
+// guarantee needs every entry point to canonicalize before anything else looks at the name.
+// The order matters for more than compatibility: a protect_add_verb wrapper keyed on
+// "add_verb" must see "add_verb" whether the caller wrote ADD_VERB() or
+// call_function("Add_Verb", ...).
+canonical_builtin :: proc(name: string, allocator := context.allocator) -> (canonical: string, ok: bool) {
+	buf: [MAX_BUILTIN_NAME]byte
+	if len(name) > len(buf) {
+		return "", false
+	}
+	for i in 0 ..< len(name) {
+		c := name[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		buf[i] = c
+	}
+	lower := string(buf[:len(name)])
+	if !known_builtin_functions[lower] {
+		return "", false
+	}
+	return strings.clone(lower, allocator), true
 }

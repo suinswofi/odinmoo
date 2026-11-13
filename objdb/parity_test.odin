@@ -11,6 +11,7 @@ import "../tasks"
 import "../values"
 import "../vm"
 import "core:fmt"
+import "core:strconv"
 import "core:strings"
 import "core:testing"
 
@@ -194,4 +195,41 @@ test_parity_deep_nesting_is_an_error_not_a_crash :: proc(t: ^testing.T) {
 	body := strings.to_string(b)
 	src := strings.concatenate({`o = create(#1); add_verb(o, {#2, "rxd", "r"}, {"this", "none", "this"}); set_verb_code(o, "r", {"`, body, `"}); return o:r();`}, context.temp_allocator)
 	expect_moo(t, p, src, "!E_MAXREC")
+}
+
+// Built-in names match in any case (number_func_by_name), at every entry point the original
+// has -- the parser, call_function() and function_info() -- and resolve to the canonical name
+// BEFORE the protect_* gate, so a different spelling is the same function with the same
+// wrapper, never a way around it.
+@(test)
+test_parity_builtin_names_ignore_case :: proc(t: ^testing.T) {
+	p := parity_open(t)
+	defer parity_close(p)
+	expect_moo(t, p, `return {ToStr(1), LENGTH("abc"), call_function("TOSTR", 2), call_function("Call_Function", "toStr", 3)};`, `{"1", 3, "2", "3"}`)
+	expect_moo(t, p, `return function_info("StrSub");`, `{"strsub", 3, 4, {2, 2, 2, -1}}`)
+	expect_moo(t, p, `return function_info("strsubx");`, "!E_INVARG")
+	expect_moo(t, p, `try call_function("NoPe"); except e (ANY) return {e[1], e[3]}; endtry`, `{E_INVARG, "NoPe"}`)
+	// A decompiled verb shows the canonical spelling, as the original's does.
+	expect_moo(t, p, `o = create(#1); add_verb(o, {#2, "rxd", "v"}, {"this", "none", "this"}); set_verb_code(o, "v", {"return ToStr(1);"}); return verb_code(o, "v");`, `{"return tostr(1);"}`)
+
+	// LambdaCore protects add_verb: #0:bf_add_verb refuses a non-wizard adding a verb to an
+	// object it doesn't own, in every spelling.
+	nonwiz := moo(p, `return create($player);`)
+	n, parsed := strconv.parse_int(nonwiz[1:]) // toliteral of an object: "#N"
+	progr := values.Objid(n)
+	testing.expect(t, parsed, nonwiz)
+	testing.expect(t, progr > 0 && !is_wizard(&p.db, progr), "need a non-wizard to test with")
+	av := strings.concatenate({`#1, {`, nonwiz, `, "rxd", "zz"}, {"this", "none", "this"})`}, context.temp_allocator)
+	for call in ([]string{"add_verb(", "ADD_VERB(", `call_function("Add_Verb", `, `call_function("CALL_FUNCTION", "add_VERB", `}) {
+		src := strings.concatenate({"return ", call, av, ";"}, context.temp_allocator)
+		expect_moo(t, p, src, "!E_PERM", progr)
+	}
+	// And the wrapper is reached under the canonical name: a protected built-in whose
+	// #0:bf_ verb answers 42 answers 42 in any spelling.
+	setup := `add_property($server_options, "protect_length", 1, {#2, "r"});
+add_verb(#0, {#2, "rxd", "bf_length"}, {"this", "none", "this"});
+set_verb_code(#0, "bf_length", {"return 42;"});
+load_server_options();
+return {length("abc"), LENGTH("abc"), call_function("Length", "abc")};`
+	expect_moo(t, p, setup, "{42, 42, 42}")
 }

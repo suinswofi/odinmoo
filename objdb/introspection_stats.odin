@@ -164,8 +164,10 @@ bf_function_info :: proc(args: values.Var) -> vm.Call_Result {
 	if name_v.type != .Str {
 		return err_result_local(.E_TYPE, "Type mismatch")
 	}
-	p, ok := bf_proto(name_v.data.str.s)
-	if !ok {
+	canon, known := compiler.canonical_builtin(name_v.data.str.s) // any case, as number_func_by_name
+	defer delete(canon)
+	p, ok := bf_proto(canon)
+	if !known || !ok {
 		return err_result_local(.E_INVARG, "Invalid argument")
 	}
 	return ok_result(function_description(p))
@@ -191,17 +193,19 @@ bf_call_function :: proc(args: values.Var, ctx: ^vm.Eval_Context) -> vm.Call_Res
 			values.free_var(args)
 			return err_result_local(.E_TYPE, "Type mismatch")
 		}
-		// Exact comparison, not case-folded: built-in dispatch is an exact map lookup, so this
-		// is precisely the set of names that would have recursed.
-		if leading.data.str.s != "call_function" {
+		// Case-folded, because canonical_builtin below is: every spelling of call_function
+		// resolves back to this function, so every spelling would have recursed.
+		if !values.strings_equal_fold(leading.data.str.s, "call_function") {
 			break
 		}
 		first += 1
 	}
 	name_v := values.list_get(args, first)
-	fname := strings.clone(name_v.data.str.s)
+	// number_func_by_name(): any case, resolved to the canonical name BEFORE call_builtin's
+	// protect_* gate sees it -- call_function("Add_Verb", ...) is add_verb, wrapper included.
+	fname, known := compiler.canonical_builtin(name_v.data.str.s)
 	defer delete(fname)
-	if !compiler.is_known_builtin(fname) {
+	if !known {
 		name_ref := values.var_ref(name_v)
 		values.free_var(args)
 		return vm.Call_Result{raised = true, code = .E_INVARG, msg = strings.clone("Unknown built-in function"), rvalue = name_ref}
